@@ -50,7 +50,7 @@ func (suite *TestSuite) TestGetVersionStringFromNumber() {
 
 	for _, tt := range tests {
 		suite.Run(tt.name, func() {
-			result := GetVersionStringFromNumber(tt.versionNumber)
+			result := getVersionStringFromNumber(tt.versionNumber)
 			assert.Equal(suite.T(), tt.expectedResult, result, "They should be equal")
 		})
 	}
