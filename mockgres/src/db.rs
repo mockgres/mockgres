@@ -162,7 +162,7 @@ impl Db {
 
                     // float8: accept float or int (promote int -> float)
                     (DataType::Float8, Value::Float64Bits(bits)) => Value::Float64Bits(bits),
-                    (DataType::Float8, Value::Int64(_)) => anyhow::bail!("type mismatch at column {} (index {})", col.name, i),
+                    (DataType::Float8, Value::Int64(v)) => Value::from_f64(v as f64),
 
                     // anything else is a mismatch for now (e.g., float into int)
                     (dt, got) => {
