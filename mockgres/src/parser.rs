@@ -178,11 +178,21 @@ impl Planner {
                     parse_where_predicate(w)?
                 } else { None };
 
+                // remember how many columns the user explicitly requested
+                let requested_len = if let Selection::Columns(cols) = &selection {
+                    Some(cols.len())
+                } else {
+                    None
+                };
+
                 // if where uses a name not in selection and we're not doing star, include it
+                // and remember to project back to the original prefix afterwards
+                let mut project_prefix_len: Option<usize> = None;
                 if let Some(FilterPred::ByName { col, .. }) = &where_pred {
                     if let Selection::Columns(cols) = &mut selection {
                         if !cols.iter().any(|c| c == col) {
                             cols.push(col.clone());
+                            project_prefix_len = requested_len; // keep output shape as requested
                         }
                     }
                 }
@@ -192,7 +202,7 @@ impl Planner {
 
                 // where
                 if let Some(pred) = where_pred {
-                    plan = Plan::Filter { input: Box::new(plan), pred, project_prefix_len: None };
+                    plan = Plan::Filter { input: Box::new(plan), pred, project_prefix_len };
                 }
 
                 // order by: ordinals or column names
