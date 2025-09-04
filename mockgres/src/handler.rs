@@ -94,7 +94,7 @@ impl Mockgres {
             }
 
             // wrappers
-            Plan::Filter { input, pred } => {
+            Plan::Filter { input, pred, .. } => {
                 let (child, _tag, _cnt) = self.build_executor(input)?;
                 let (idx, op, rhs) = match pred {
                     FilterPred::ByIndex { idx, op, rhs } => (*idx, *op, rhs.clone()),

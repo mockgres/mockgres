@@ -192,7 +192,7 @@ impl Planner {
 
                 // where
                 if let Some(pred) = where_pred {
-                    plan = Plan::Filter { input: Box::new(plan), pred };
+                    plan = Plan::Filter { input: Box::new(plan), pred, project_prefix_len: None };
                 }
 
                 // order by: ordinals or column names

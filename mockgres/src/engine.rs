@@ -85,7 +85,7 @@ pub enum Plan {
     UnboundSeqScan { table: ObjName, selection: Selection },
 
     // wrappers (inherit child schema)
-    Filter { input: Box<Plan>, pred: FilterPred },
+    Filter { input: Box<Plan>, pred: FilterPred, project_prefix_len: Option<usize> },
     Order  { input: Box<Plan>, keys: Vec<SortKey> },
     Limit  { input: Box<Plan>, limit: usize },
 
@@ -223,27 +223,43 @@ impl FilterExec {
 
     fn cmp(lhs: &Value, rhs: &Value, op: CmpOp) -> bool {
         use std::cmp::Ordering;
-        // null semantics: comparisons with null are false
+        // null semantics: any comparison with null is false
         if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
             return false;
         }
-        // numeric comparisons; allow int/float mixing
+
         let ord = match (lhs, rhs) {
             (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+
             (Value::Float64Bits(ba), Value::Float64Bits(bb)) => {
                 let (a, b) = (f64::from_bits(*ba), f64::from_bits(*bb));
-                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+                if a.is_nan() && b.is_nan() { Ordering::Equal }
+                else if a.is_nan() { Ordering::Greater }
+                else if b.is_nan() { Ordering::Less }
+                else if a < b { Ordering::Less }
+                else if a > b { Ordering::Greater }
+                else { Ordering::Equal }
             }
+
             (Value::Int64(a), Value::Float64Bits(bb)) => {
                 let (a, b) = (*a as f64, f64::from_bits(*bb));
-                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+                if b.is_nan() { Ordering::Less } // int < NaN
+                else if a < b { Ordering::Less }
+                else if a > b { Ordering::Greater }
+                else { Ordering::Equal }
             }
+
             (Value::Float64Bits(ba), Value::Int64(bi)) => {
                 let (a, b) = (f64::from_bits(*ba), *bi as f64);
-                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+                if a.is_nan() { Ordering::Greater } // NaN > int
+                else if a < b { Ordering::Less }
+                else if a > b { Ordering::Greater }
+                else { Ordering::Equal }
             }
+
             _ => return false, // unsupported types compare false
         };
+
         match op {
             CmpOp::Eq  => ord == Ordering::Equal,
             CmpOp::Neq => ord != Ordering::Equal,
@@ -314,21 +330,40 @@ fn order_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
         (None, None) => Equal,
         (None, Some(_)) => Less,
         (Some(_), None) => Greater,
+
+        // nulls last (ASC); DESC achieved by caller via reverse()
         (Some(Value::Null), Some(Value::Null)) => Equal,
-        (Some(Value::Null), Some(_)) => Greater,  // nulls last
-        (Some(_), Some(Value::Null)) => Less,     // nulls last
+        (Some(Value::Null), Some(_)) => Greater,
+        (Some(_), Some(Value::Null)) => Less,
+
         (Some(Value::Int64(x)), Some(Value::Int64(y))) => x.cmp(y),
+
         (Some(Value::Float64Bits(bx)), Some(Value::Float64Bits(by))) => {
             let (x, y) = (f64::from_bits(*bx), f64::from_bits(*by));
-            if x < y { Less } else if x > y { Greater } else { Equal }
+            if x.is_nan() && y.is_nan() { Equal }
+            else if x.is_nan() { Greater }     // NaN > all
+            else if y.is_nan() { Less }
+            else if x < y { Less }
+            else if x > y { Greater }
+            else { Equal }
         }
+
         (Some(Value::Int64(x)), Some(Value::Float64Bits(by))) => {
-            let (x, y) = (*x as f64, f64::from_bits(*by));
-            if x < y { Less } else if x > y { Greater } else { Equal }
+            let y = f64::from_bits(*by);
+            if y.is_nan() { Less }
+            else {
+                let xf = *x as f64;
+                if xf < y { Less } else if xf > y { Greater } else { Equal }
+            }
         }
+
         (Some(Value::Float64Bits(bx)), Some(Value::Int64(y))) => {
-            let (x, y) = (f64::from_bits(*bx), *y as f64);
-            if x < y { Less } else if x > y { Greater } else { Equal }
+            let x = f64::from_bits(*bx);
+            if x.is_nan() { Greater }
+            else {
+                let yf = *y as f64;
+                if x < yf { Less } else if x > yf { Greater } else { Equal }
+            }
         }
     }
 }
