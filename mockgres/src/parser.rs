@@ -371,9 +371,10 @@ fn parse_order_clause(items: &Vec<pg_query::protobuf::Node>) -> pgwire::error::P
     let mut keys = Vec::new();
     for sb in items {
         let Some(NodeEnum::SortBy(s)) = sb.node.as_ref() else { return Err(fe("bad order by")); };
+        // matching on the SortByDir enum https://github.com/postgres/postgres/blob/master/src/include/nodes/parsenodes.h
         let asc = match s.sortby_dir {
-            0 | 1 => true,  // default/asc
-            2 => false,     // desc
+            0 | 2 => true,
+            1 => false,
             _ => true,
         };
         let Some(expr) = s.node.as_ref().and_then(|n| n.node.as_ref()) else { return Err(fe("bad order by expr")); };
