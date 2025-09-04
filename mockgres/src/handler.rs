@@ -94,7 +94,7 @@ impl Mockgres {
             }
 
             // wrappers
-            Plan::Filter { input, pred } => {
+            Plan::Filter { input, pred, project_prefix_len } => {
                 let (child, _tag, _cnt) = self.build_executor(input)?;
                 let (idx, op, rhs) = match pred {
                     FilterPred::ByIndex { idx, op, rhs } => (*idx, *op, rhs.clone()),
@@ -104,9 +104,24 @@ impl Mockgres {
                         (i, *op, rhs.clone())
                     }
                 };
-                let schema = child.schema().clone();
-                let exec = Box::new(FilterExec::new(schema, child, idx, op, rhs));
-                Ok((exec, None, None))
+
+                // build the filter exec
+                let child_schema = child.schema().clone();
+                let mut node: Box<dyn ExecNode> =
+                    Box::new(FilterExec::new(child_schema.clone(), child, idx, op, rhs));
+
+                // if parser widened selection for where, drop the extra columns here
+                if let Some(n) = *project_prefix_len {
+                    // project first n fields from the child schema
+                    let proj_fields = child_schema.fields[..n].to_vec();
+                    let proj_schema = Schema { fields: proj_fields.clone() };
+                    let exprs = (0..n)
+                        .map(|i| (Expr::Column(i), proj_fields[i].name.clone()))
+                        .collect();
+                    node = Box::new(ProjectExec::new(proj_schema, node, exprs));
+                }
+
+                Ok((node, None, None))
             }
 
             Plan::Order { input, keys } => {

@@ -30,9 +30,9 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
         }
 
         // wrappers: bind child; nothing else to do
-        Plan::Filter { input, pred } => {
+        Plan::Filter { input, pred, project_prefix_len } => {
             let child = bind(db, *input)?;
-            Ok(Plan::Filter { input: Box::new(child), pred })
+            Ok(Plan::Filter { input: Box::new(child), pred, project_prefix_len })
         }
         Plan::Order { input, keys } => {
             let child = bind(db, *input)?;
