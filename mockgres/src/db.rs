@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::catalog::{Catalog, TableMeta, TableId};
-use crate::engine::{Column, DataType};
+use crate::engine::{Column, DataType, Value};
 use crate::storage::{Row, RowKey, Table};
 
 #[derive(Debug)]
@@ -111,12 +111,6 @@ impl Db {
         name: &str,
         mut rows: Vec<Row>,
     ) -> anyhow::Result<usize> {
-        use parking_lot::Mutex;
-        use crate::engine::{DataType, Value};
-
-        // simple global counter for hidden rowid
-        static ROWID: Mutex<u64> = parking_lot::const_mutex(1);
-
         let (meta, tab) = self.resolve_table_mut(schema, name)?;
         let ncols = meta.columns.len();
         let mut count = 0usize;
@@ -193,12 +187,8 @@ impl Db {
                 }
                 RowKey::Pk(vals)
             } else {
-                let id = {
-                    let mut g = ROWID.lock();
-                    let v = *g;
-                    *g += 1;
-                    v
-                };
+                // use per-table allocator for hidden rowid
+                let id = tab.alloc_rowid();
                 RowKey::Hidden(id)
             };
 
