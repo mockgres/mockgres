@@ -1,0 +1,1958 @@
+FILE: src/engine.rs
+use std::{fmt, sync::Arc};
+use futures::{Stream, stream, StreamExt};
+use pgwire::api::{Type};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
+use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::data::DataRow;
+use crate::storage::Row;
+
+#[derive(Debug)]
+struct SimpleError(String);
+impl fmt::Display for SimpleError { fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result{f.write_str(&self.0)} }
+impl std::error::Error for SimpleError {}
+pub fn fe(msg: impl Into<String>) -> PgWireError { PgWireError::ApiError(Box::new(SimpleError(msg.into()))) }
+
+// ===== core types =====
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DataType { Int4, Int8, Float8 }
+
+impl DataType {
+    pub fn to_pg(&self) -> Type {
+        match self {
+            DataType::Int4 => Type::INT4,
+            DataType::Int8 => Type::INT8,
+            DataType::Float8 => Type::FLOAT8,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Column {
+    pub name: String,
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Field { pub name: String, pub data_type: DataType }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Schema { pub fields: Vec<Field> }
+impl Schema { pub fn field(&self,i:usize)->&Field{&self.fields[i]} pub fn len(&self)->usize{self.fields.len()} }
+
+// Values used in rows
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Value {
+    Null,
+    Int64(i64),
+    Float64Bits(u64), // store floats as bits for Eq/Hash; encode/decode via f64::from_bits
+}
+impl Value {
+    pub fn from_f64(f: f64) -> Self { Value::Float64Bits(f.to_bits()) }
+    pub fn as_f64(&self) -> Option<f64> { if let Value::Float64Bits(b)=self { Some(f64::from_bits(*b)) } else { None } }
+}
+
+// ===== expressions & logical plan =====
+
+// compare ops supported by filter
+#[derive(Clone, Copy, Debug)]
+pub enum CmpOp { Eq, Neq, Lt, Lte, Gt, Gte }
+
+
+#[derive(Clone, Debug)]
+pub enum Expr {
+    Literal(Value),
+    Column(usize),           // bound column position
+}
+
+#[derive(Clone, Debug)]
+pub enum Selection {
+    Star,
+    Columns(Vec<String>),    // unbound names
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjName { pub schema: Option<String>, pub name: String }
+
+// logical plan
+#[derive(Clone, Debug)]
+pub enum Plan {
+    // select 42 path: values + projection of named exprs
+    Values { rows: Vec<Vec<Expr>>, schema: Schema },
+
+    // parser output (unbound): table + selection (star or column names)
+    UnboundSeqScan { table: ObjName, selection: Selection },
+
+    // wrappers (inherit child schema)
+    Filter { input: Box<Plan>, pred: FilterPred },
+    Order  { input: Box<Plan>, keys: Vec<SortKey> },
+    Limit  { input: Box<Plan>, limit: usize },
+
+    // bound scan (executor-ready)
+    SeqScan { table: ObjName, cols: Vec<(usize, Field)>, schema: Schema },
+
+    // projection over input with named exprs
+    Projection { input: Box<Plan>, exprs: Vec<(Expr, String)>, schema: Schema },
+
+    // ddl/dml
+    CreateTable { table: ObjName, cols: Vec<(String, DataType, bool)>, pk: Option<Vec<String>> },
+    InsertValues { table: ObjName, rows: Vec<Vec<Expr>> },
+}
+
+// match simple "col op value" shape
+#[derive(Clone, Debug)]
+pub enum FilterPred {
+    ByName { col: String, op: crate::engine::CmpOp, rhs: Value },
+    ByIndex { idx: usize, op: crate::engine::CmpOp, rhs: Value },
+}
+
+// order by key; name or ordinal; asc=true means ascending
+#[derive(Clone, Debug)]
+pub enum SortKey {
+    ByName { col: String, asc: bool },
+    ByIndex { idx: usize, asc: bool },
+}
+
+impl Plan {
+    pub fn schema(&self) -> &Schema {
+        match self {
+            Plan::Values{schema,..} |
+            Plan::SeqScan{schema,..} |
+            Plan::Projection{schema,..} => schema,
+
+            // wrappers: same schema as child
+            Plan::Filter{input,..} |
+            Plan::Order {input,..} |
+            Plan::Limit {input,..} => input.schema(),
+
+            Plan::UnboundSeqScan{..} |
+            Plan::CreateTable{..} |
+            Plan::InsertValues{..} => {
+                static EMPTY: Schema = Schema { fields: vec![] }; &EMPTY
+            }
+        }
+    }
+}
+
+// ===== exec nodes & bridge =====
+
+pub trait ExecNode: Send {
+    fn open(&mut self) -> PgWireResult<()>;
+    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>>;
+    fn close(&mut self) -> PgWireResult<()>;
+    fn schema(&self) -> &Schema;
+}
+
+pub struct ValuesExec { schema: Schema, rows: Vec<Vec<Value>>, idx: usize }
+impl ValuesExec {
+    pub fn new(schema: Schema, rows_expr: Vec<Vec<Expr>>) -> PgWireResult<Self> {
+        let mut rows = Vec::with_capacity(rows_expr.len());
+        for r in rows_expr {
+            let mut out = Vec::with_capacity(r.len());
+            for e in r {
+                out.push(eval_const(&e)?);
+            }
+            rows.push(out);
+        }
+        Ok(Self { schema, rows, idx: 0 })
+    }
+}
+impl ExecNode for ValuesExec {
+    fn open(&mut self)->PgWireResult<()> { Ok(()) }
+    fn next(&mut self)->PgWireResult<Option<Vec<Value>>> {
+        if self.idx>=self.rows.len(){return Ok(None)}
+        let row = self.rows[self.idx].clone(); self.idx+=1; Ok(Some(row))
+    }
+    fn close(&mut self)->PgWireResult<()> { Ok(()) }
+    fn schema(&self)->&Schema { &self.schema }
+}
+
+pub struct ProjectExec { schema: Schema, input: Box<dyn ExecNode>, exprs: Vec<Expr> }
+impl ProjectExec {
+    pub fn new(schema: Schema, input: Box<dyn ExecNode>, exprs_named: Vec<(Expr,String)>) -> Self {
+        let exprs = exprs_named.into_iter().map(|(e,_)| e).collect();
+        Self{ schema, input, exprs }
+    }
+}
+impl ExecNode for ProjectExec {
+    fn open(&mut self)->PgWireResult<()> { self.input.open() }
+    fn next(&mut self)->PgWireResult<Option<Vec<Value>>> {
+        if let Some(in_row)=self.input.next()? {
+            let mut out=Vec::with_capacity(self.exprs.len());
+            for e in &self.exprs { out.push(eval(&in_row,e)?); }
+            Ok(Some(out))
+        } else { Ok(None) }
+    }
+    fn close(&mut self)->PgWireResult<()> { self.input.close() }
+    fn schema(&self)->&Schema { &self.schema }
+}
+
+pub struct SeqScanExec { schema: Schema, rows: Vec<Vec<Value>>, idx: usize }
+impl SeqScanExec {
+    // simple table scan that materializes all rows.
+    pub fn new(schema: Schema, rows: Vec<Vec<Value>>) -> Self {
+        Self { schema, rows, idx: 0 }
+    }
+}
+impl ExecNode for SeqScanExec {
+    fn open(&mut self)->PgWireResult<()> { Ok(()) }
+    fn next(&mut self)->PgWireResult<Option<Vec<Value>>> {
+        if self.idx>=self.rows.len(){return Ok(None)}
+        let row = self.rows[self.idx].clone();
+        self.idx+=1; Ok(Some(row))
+    }
+    fn close(&mut self)->PgWireResult<()> { Ok(()) }
+    fn schema(&self)->&Schema { &self.schema }
+}
+
+// filter exec: passes through rows where col <op> rhs holds
+
+pub struct FilterExec {
+    schema: Schema,
+    child: Box<dyn ExecNode>,
+    col_idx: usize,
+    op: CmpOp,
+    rhs: Value,
+}
+
+impl FilterExec {
+    pub fn new(schema: Schema, child: Box<dyn ExecNode>, col_idx: usize, op: CmpOp, rhs: Value) -> Self {
+        Self { schema, child, col_idx, op, rhs }
+    }
+
+    fn cmp(lhs: &Value, rhs: &Value, op: CmpOp) -> bool {
+        use std::cmp::Ordering;
+        // null semantics: comparisons with null are false
+        if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+            return false;
+        }
+        // numeric comparisons; allow int/float mixing
+        let ord = match (lhs, rhs) {
+            (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+            (Value::Float64Bits(ba), Value::Float64Bits(bb)) => {
+                let (a, b) = (f64::from_bits(*ba), f64::from_bits(*bb));
+                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+            }
+            (Value::Int64(a), Value::Float64Bits(bb)) => {
+                let (a, b) = (*a as f64, f64::from_bits(*bb));
+                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+            }
+            (Value::Float64Bits(ba), Value::Int64(bi)) => {
+                let (a, b) = (f64::from_bits(*ba), *bi as f64);
+                if a < b { Ordering::Less } else if a > b { Ordering::Greater } else { Ordering::Equal }
+            }
+            _ => return false, // unsupported types compare false
+        };
+        match op {
+            CmpOp::Eq  => ord == Ordering::Equal,
+            CmpOp::Neq => ord != Ordering::Equal,
+            CmpOp::Lt  => ord == Ordering::Less,
+            CmpOp::Lte => ord != Ordering::Greater,
+            CmpOp::Gt  => ord == Ordering::Greater,
+            CmpOp::Gte => ord != Ordering::Less,
+        }
+    }
+}
+
+impl ExecNode for FilterExec {
+    fn open(&mut self) -> PgWireResult<()> { self.child.open() }
+    fn next(&mut self) -> PgWireResult<Option<Row>> {
+        loop {
+            match self.child.next()? {
+                Some(row) => {
+                    let v = row.get(self.col_idx).ok_or_else(|| fe("filter index out of range"))?;
+                    if Self::cmp(v, &self.rhs, self.op) {
+                        return Ok(Some(row));
+                    }
+                    // else keep scanning
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+    fn close(&mut self) -> PgWireResult<()> { self.child.close() }
+    fn schema(&self) -> &Schema { &self.schema }
+}
+
+// order exec: materializes child rows, sorts them, then yields
+pub struct OrderExec {
+    schema: Schema,
+    rows: Vec<Row>,
+    pos: usize,
+    keys: Vec<(usize, bool)>, // (idx, asc)
+}
+
+impl OrderExec {
+    pub fn new(schema: Schema, mut child: Box<dyn ExecNode>, keys: Vec<(usize, bool)>) -> PgWireResult<Self> {
+        child.open()?;
+        let mut buf = Vec::new();
+        while let Some(r) = child.next()? { buf.push(r); }
+        child.close()?;
+
+        // stable sort by keys
+        buf.sort_by(|a, b| {
+            use std::cmp::Ordering;
+            for (idx, asc) in &keys {
+                let av = a.get(*idx);
+                let bv = b.get(*idx);
+                let ord = order_values(av, bv);
+                if ord != Ordering::Equal {
+                    return if *asc { ord } else { ord.reverse() };
+                }
+            }
+            Ordering::Equal
+        });
+
+        Ok(Self { schema, rows: buf, pos: 0, keys })
+    }
+}
+
+fn order_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (None, None) => Equal,
+        (None, Some(_)) => Less,
+        (Some(_), None) => Greater,
+        (Some(Value::Null), Some(Value::Null)) => Equal,
+        (Some(Value::Null), Some(_)) => Greater,  // nulls last
+        (Some(_), Some(Value::Null)) => Less,     // nulls last
+        (Some(Value::Int64(x)), Some(Value::Int64(y))) => x.cmp(y),
+        (Some(Value::Float64Bits(bx)), Some(Value::Float64Bits(by))) => {
+            let (x, y) = (f64::from_bits(*bx), f64::from_bits(*by));
+            if x < y { Less } else if x > y { Greater } else { Equal }
+        }
+        (Some(Value::Int64(x)), Some(Value::Float64Bits(by))) => {
+            let (x, y) = (*x as f64, f64::from_bits(*by));
+            if x < y { Less } else if x > y { Greater } else { Equal }
+        }
+        (Some(Value::Float64Bits(bx)), Some(Value::Int64(y))) => {
+            let (x, y) = (f64::from_bits(*bx), *y as f64);
+            if x < y { Less } else if x > y { Greater } else { Equal }
+        }
+    }
+}
+
+impl ExecNode for OrderExec {
+    fn open(&mut self) -> PgWireResult<()> { Ok(()) }
+    fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if self.pos >= self.rows.len() { return Ok(None); }
+        let r = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(r))
+    }
+    fn close(&mut self) -> PgWireResult<()> { Ok(()) }
+    fn schema(&self) -> &Schema { &self.schema }
+}
+
+// limit exec: forwards up to n rows from child
+pub struct LimitExec {
+    schema: Schema,
+    child: Box<dyn ExecNode>,
+    remaining: usize,
+}
+
+impl LimitExec {
+    pub fn new(schema: Schema, child: Box<dyn ExecNode>, n: usize) -> Self {
+        Self { schema, child, remaining: n }
+    }
+}
+
+impl ExecNode for LimitExec {
+    fn open(&mut self) -> PgWireResult<()> { self.child.open() }
+    fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if self.remaining == 0 { return Ok(None); }
+        match self.child.next()? {
+            Some(r) => { self.remaining -= 1; Ok(Some(r)) }
+            None => Ok(None),
+        }
+    }
+    fn close(&mut self) -> PgWireResult<()> { self.child.close() }
+    fn schema(&self) -> &Schema { &self.schema }
+}
+
+
+
+fn eval_const(e: &Expr)->PgWireResult<Value> {
+    match e {
+        Expr::Literal(v) => Ok(v.clone()),
+        Expr::Column(_) => Err(fe("column not allowed here")),
+    }
+}
+fn eval(row:&[Value], e:&Expr)->PgWireResult<Value>{
+    match e {
+        Expr::Literal(v)=>Ok(v.clone()),
+        Expr::Column(i)=>Ok(row[*i].clone()),
+    }
+}
+
+pub fn to_pgwire_stream(
+    mut node: Box<dyn ExecNode>,
+    fmt: FieldFormat,
+) -> PgWireResult<(Arc<Vec<FieldInfo>>, impl Stream<Item = PgWireResult<DataRow>> + Send + 'static)> {
+    node.open()?;
+    let schema = node.schema().clone();
+    let fields = Arc::new(schema.fields.iter().map(|f| {
+        FieldInfo::new(f.name.clone(), None, None, f.data_type.to_pg(), fmt)
+    }).collect::<Vec<_>>());
+
+    let s = stream::unfold((node, fields.clone(), schema), |(mut node, fields, schema)| async move {
+        let next = node.next();
+        match next {
+            Ok(Some(vals)) => {
+                let mut enc = DataRowEncoder::new(fields.clone());
+                for (i, v) in vals.into_iter().enumerate() {
+                    let dt = &schema.field(i).data_type;
+                    // encode by declared column type; allow null for any type
+                    let res = match (v, dt) {
+                        (Value::Null, DataType::Int4)   => enc.encode_field(&Option::<i32>::None),
+                        (Value::Null, DataType::Int8)   => enc.encode_field(&Option::<i64>::None),
+                        (Value::Null, DataType::Float8) => enc.encode_field(&Option::<f64>::None),
+
+                        (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
+                        (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
+                        (Value::Int64(i), DataType::Float8) => {
+                            let f = i as f64; enc.encode_field(&f)
+                        }
+                        (Value::Float64Bits(b), DataType::Float8) => {
+                            let f = f64::from_bits(b); enc.encode_field(&f)
+                        }
+                        _ => Err(PgWireError::ApiError("type mismatch".into())),
+                    };
+                    if let Err(e) = res { return Some((Err(e), (node, fields, schema))); }
+                }
+                match enc.finish() {
+                    Ok(dr) => Some((Ok(dr), (node, fields, schema))),
+                    Err(e) => Some((Err(e), (node, fields, schema))),
+                }
+            }
+            Ok(None) => { let _ = node.close(); None }
+            Err(e) => Some((Err(e), (node, fields, schema))),
+        }
+    }).boxed();
+
+    Ok((fields, s))
+}
+--- END OF FILE ---
+FILE: src/binder.rs
+use crate::engine::{Plan, Schema, Field, Selection, fe};
+use crate::db::Db;
+
+pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
+    match p {
+        Plan::UnboundSeqScan { table, selection } => {
+            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let tm = db
+                .resolve_table(schema_name, &table.name)
+                .map_err(|e| fe(e.to_string()))?;
+
+            // build (idx, Field) for executor + compose output schema
+            let cols: Vec<(usize, Field)> = match selection {
+                Selection::Star => tm.columns.iter().enumerate().map(|(i, c)| {
+                    (i, Field { name: c.name.clone(), data_type: c.data_type.clone() })
+                }).collect(),
+                Selection::Columns(names) => {
+                    let mut out = Vec::with_capacity(names.len());
+                    for n in names {
+                        let i = tm.columns.iter().position(|c| c.name == n)
+                            .ok_or_else(|| crate::engine::fe(format!("unknown column: {}", n)))?;
+                        out.push((i, Field { name: n, data_type: tm.columns[i].data_type.clone() }));
+                    }
+                    out
+                }
+            };
+            let schema = Schema { fields: cols.iter().map(|(_, f)| f.clone()).collect() };
+
+            Ok(Plan::SeqScan { table, cols, schema })
+        }
+
+        // wrappers: bind child; nothing else to do
+        Plan::Filter { input, pred } => {
+            let child = bind(db, *input)?;
+            Ok(Plan::Filter { input: Box::new(child), pred })
+        }
+        Plan::Order { input, keys } => {
+            let child = bind(db, *input)?;
+            Ok(Plan::Order { input: Box::new(child), keys })
+        }
+        Plan::Limit { input, limit } => {
+            let child = bind(db, *input)?;
+            Ok(Plan::Limit { input: Box::new(child), limit })
+        }
+
+        other => Ok(other),
+    }
+}
+--- END OF FILE ---
+FILE: src/handler.rs
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use futures::Sink;
+use parking_lot::RwLock;
+use pgwire::api::portal::Format;
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireServerHandlers,
+    auth::{StartupHandler, noop::NoopStartupHandler},
+    cancel::CancelHandler,
+    query::{ExtendedQueryHandler, SimpleQueryHandler},
+    results::{
+        DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse,
+        Response,
+    },
+    store::PortalStore,
+};
+use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+
+use crate::binder::bind;
+use crate::db::Db;
+use crate::engine::{ExecNode, Expr, Plan, Schema, SeqScanExec, to_pgwire_stream, SortKey, OrderExec, LimitExec, FilterPred, FilterExec, fe};
+use crate::engine::{ProjectExec, ValuesExec};
+use crate::parser::Planner;
+
+/// The single, stateful pgwire handler that owns the DB.
+#[derive(Clone)]
+pub struct Mockgres {
+    pub db: Arc<RwLock<Db>>,
+}
+
+impl Mockgres {
+    pub fn new(db: Arc<RwLock<Db>>) -> Self {
+        Self { db }
+    }
+
+    /// Run a pgwire server on `addr` using this handler.
+    /// Usage: `Arc::new(Mockgres::new(Arc::new(RwLock::new(Db::default())))).serve(addr).await`
+    pub async fn serve(
+        self: std::sync::Arc<Self>,
+        addr: std::net::SocketAddr,
+    ) -> anyhow::Result<()> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        loop {
+            let (socket, _peer) = listener.accept().await?;
+            let h = self.clone();
+            tokio::spawn(async move {
+                let _ = pgwire::tokio::process_socket(socket, None, h).await;
+            });
+        }
+    }
+
+    // default/fallback command tags used when the executor didn't provide one
+    // keep these conservative; we already set dynamic "INSERT 0 <n>" and "SELECT <n>" elsewhere
+    fn command_tag(plan: &Plan) -> &'static str {
+        match plan {
+            Plan::Values { .. } |
+            Plan::SeqScan { .. } |
+            Plan::Projection { .. } |
+            Plan::Filter { .. } |
+            Plan::Order { .. } |
+            Plan::Limit { .. } => "SELECT 0",
+
+            Plan::CreateTable { .. } => "CREATE TABLE",
+            Plan::InsertValues { .. } => "INSERT 0",
+            Plan::UnboundSeqScan { .. } => "SELECT 0",
+        }
+    }
+
+    /// build a physical plan from a bound logical plan into an ExecNode and/or apply mutations.
+    /// returns (exec, optional explicit command tag, optional row count for selects).
+    fn build_executor(&self, p: &Plan) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+        match p {
+            Plan::Values { rows, schema } => {
+                let cnt = rows.len();
+                Ok((Box::new(ValuesExec::new(schema.clone(), rows.clone())?), None, Some(cnt)))
+            }
+
+            Plan::Projection { input, exprs, schema } => {
+                let (child, _tag, cnt) = self.build_executor(input)?;
+                Ok((Box::new(ProjectExec::new(schema.clone(), child, exprs.clone())), None, cnt))
+            }
+
+            Plan::SeqScan { table, cols, schema } => {
+                let db = self.db.read();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                let _tm = db.resolve_table(schema_name, &table.name).map_err(|e| fe(e.to_string()))?;
+                let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
+                let (rows, _) = if positions.is_empty() && schema.fields.is_empty() {
+                    (vec![], vec![])
+                } else {
+                    db.scan_bound_positions(schema_name, &table.name, &positions)
+                        .map_err(|e| fe(e.to_string()))?
+                };
+                drop(db);
+                let cnt = rows.len();
+                Ok((Box::new(SeqScanExec::new(schema.clone(), rows)), None, Some(cnt)))
+            }
+
+            // wrappers
+            Plan::Filter { input, pred } => {
+                let (child, _tag, _cnt) = self.build_executor(input)?;
+                let (idx, op, rhs) = match pred {
+                    FilterPred::ByIndex { idx, op, rhs } => (*idx, *op, rhs.clone()),
+                    FilterPred::ByName  { col, op, rhs } => {
+                        let i = child.schema().fields.iter().position(|f| f.name == *col)
+                            .ok_or_else(|| fe(format!("unknown column in filter: {}", col)))?;
+                        (i, *op, rhs.clone())
+                    }
+                };
+                let schema = child.schema().clone();
+                let exec = Box::new(FilterExec::new(schema, child, idx, op, rhs));
+                Ok((exec, None, None))
+            }
+
+            Plan::Order { input, keys } => {
+                let (child, _tag, cnt) = self.build_executor(input)?;
+                let mut idx_keys = Vec::with_capacity(keys.len());
+                for k in keys {
+                    match k {
+                        SortKey::ByIndex { idx, asc } => idx_keys.push((*idx, *asc)),
+                        SortKey::ByName  { col, asc } => {
+                            let i = child.schema().fields.iter().position(|f| f.name == *col)
+                                .ok_or_else(|| fe(format!("unknown column in order by: {}", col)))?;
+                            idx_keys.push((i, *asc));
+                        }
+                    }
+                }
+                let schema = child.schema().clone();
+                let exec = Box::new(OrderExec::new(schema, child, idx_keys)?);
+                Ok((exec, None, cnt))
+            }
+
+            Plan::Limit { input, limit } => {
+                let (child, _tag, cnt) = self.build_executor(input)?;
+                let out_cnt = cnt.map(|c| c.min(*limit));
+                let schema = child.schema().clone();
+                Ok((Box::new(LimitExec::new(schema, child, *limit)), None, out_cnt))
+            }
+
+            Plan::CreateTable { table, cols, pk } => {
+                let mut db = self.db.write();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                db.create_table(schema_name, &table.name, cols.clone(), pk.clone())
+                    .map_err(|e| fe(e.to_string()))?;
+                drop(db);
+                Ok((Box::new(ValuesExec::new(Schema{fields:vec![]}, vec![])?), Some("CREATE TABLE".into()), None))
+            }
+
+            Plan::InsertValues { table, rows } => {
+                // realize constants only
+                let mut realized = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let mut rr = Vec::with_capacity(r.len());
+                    for e in r {
+                        match e {
+                            Expr::Literal(v) => rr.push(v.clone()),
+                            _ => return Err(fe("insert supports constants only")),
+                        }
+                    }
+                    realized.push(rr);
+                }
+                let mut db = self.db.write();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                let inserted = db.insert_full_rows(schema_name, &table.name, realized)
+                    .map_err(|e| fe(e.to_string()))?;
+                drop(db);
+                let tag = format!("INSERT 0 {}", inserted);
+                Ok((Box::new(ValuesExec::new(Schema{fields:vec![]}, vec![])?), Some(tag), None))
+            }
+            Plan::UnboundSeqScan { .. } => {
+                Err(fe("unbound plan; call binder first"))
+            }
+        }
+    }
+
+    fn describe_plan(&self, plan: &Plan) -> PgWireResult<Vec<FieldInfo>> {
+        let db = self.db.read();
+        let bound = bind(&db, plan.clone())?;
+        let fields = bound
+            .schema()
+            .fields
+            .iter()
+            .map(|f| {
+                FieldInfo::new(
+                    f.name.clone(),
+                    None,
+                    None,
+                    f.data_type.to_pg(),
+                    FieldFormat::Text,
+                )
+            })
+            .collect();
+        Ok(fields)
+    }
+}
+
+impl PgWireServerHandlers for Mockgres {
+    fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
+        Arc::new(self.clone())
+    }
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        Arc::new(self.clone())
+    }
+    fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        Arc::new(self.clone())
+    }
+    fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
+        Arc::new(NoopHandler)
+    }
+    fn error_handler(&self) -> Arc<impl ErrorHandler> {
+        Arc::new(NoopHandler)
+    }
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        Arc::new(NoopHandler)
+    }
+}
+
+#[async_trait::async_trait]
+impl NoopStartupHandler for Mockgres {
+    async fn post_startup<C>(
+        &self,
+        client: &mut C,
+        _message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        println!(
+            "Client connected: addr={}, tls={}, proto={:?}",
+            client.socket_addr(),
+            client.is_secure(),
+            client.protocol_version()
+        );
+        Ok(())
+    }
+}
+
+impl Default for Mockgres {
+    fn default() -> Self {
+        Self::new(Arc::new(RwLock::new(Db::default())))
+    }
+}
+
+#[async_trait::async_trait]
+impl SimpleQueryHandler for Mockgres {
+    async fn do_query<'a, C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match Planner::plan_sql(query) {
+            Ok(lp0) => {
+                // bind (names -> positions) using catalog
+                let db_read = self.db.read();
+                let bound = bind(&db_read, lp0)?;
+                drop(db_read);
+
+                let (exec, tag, row_count) = self.build_executor(&bound)?;
+                let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text)?;
+                let mut qr = QueryResponse::new(fields, rows);
+                if let Some(t) = tag {
+                    // explicit tag from executor (e.g., insert)
+                    qr.set_command_tag(&t);
+                } else if let Some(n) = row_count {
+                    // dynamic select row count
+                    qr.set_command_tag(&format!("SELECT {}", n));
+                } else {
+                    qr.set_command_tag(Self::command_tag(&bound));
+                }
+                Ok(vec![Response::Query(qr)])
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ExtendedQueryHandler for Mockgres {
+    type Statement = Plan;
+    type QueryParser = pgwire_parser::PgQueryParserAdapter;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(pgwire_parser::PgQueryParserAdapter::default())
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &pgwire::api::stmt::StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo
+        + ClientPortalStore
+        + Sink<PgWireBackendMessage>
+        + Unpin
+        + Send
+        + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let fields = self.describe_plan(&target.statement)?;
+        Ok(DescribeStatementResponse::new(vec![], fields))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        portal: &pgwire::api::portal::Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo
+        + ClientPortalStore
+        + Sink<PgWireBackendMessage>
+        + Unpin
+        + Send
+        + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let fields = self.describe_plan(&portal.statement.statement)?;
+        Ok(DescribePortalResponse::new(fields))
+    }
+    async fn do_query<'a, C>(
+        &self,
+        _client: &mut C,
+        portal: &pgwire::api::portal::Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let fmt = match portal.result_column_format {
+            Format::UnifiedBinary => FieldFormat::Binary,
+            _ => FieldFormat::Text,
+        };
+
+        let db = self.db.read();
+        let bound = bind(&db, portal.statement.statement.clone())?;
+        drop(db);
+
+        let (exec, tag, row_count) = self.build_executor(&bound)?;
+        let (fields, rows) = to_pgwire_stream(exec, fmt)?;
+        let mut qr = QueryResponse::new(fields, rows);
+        if let Some(t) = tag {
+            qr.set_command_tag(&t);
+        } else if let Some(n) = row_count {
+            qr.set_command_tag(&format!("SELECT {}", n));
+        } else {
+            qr.set_command_tag(Self::command_tag(&bound));
+        }
+        Ok(Response::Query(qr))
+    }
+}
+
+/// Pgwire adapter: parse -> our `Plan`
+pub mod pgwire_parser {
+    use async_trait::async_trait;
+    use pgwire::api::{ClientInfo, Type};
+    use pgwire::error::PgWireResult;
+
+    use crate::engine::Plan;
+    use crate::parser::Planner;
+
+    #[derive(Clone, Default)]
+    pub struct PgQueryParserAdapter;
+
+    #[async_trait]
+    impl pgwire::api::stmt::QueryParser for PgQueryParserAdapter {
+        type Statement = Plan;
+        async fn parse_sql<C>(
+            &self,
+            _client: &C,
+            sql: &str,
+            _types: &[Type],
+        ) -> PgWireResult<Self::Statement>
+        where
+            C: ClientInfo + Unpin + Send + Sync,
+        {
+            Planner::plan_sql(sql)
+        }
+    }
+}
+--- END OF FILE ---
+FILE: src/catalog.rs
+use std::collections::HashMap;
+use crate::engine::{Column};
+
+pub type SchemaName = String;
+pub type TableName = String;
+pub type TableId = u64;
+
+#[derive(Clone, Debug)]
+pub struct IndexMeta {
+    pub name: String,
+    pub columns: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TableMeta {
+    pub id: TableId,
+    pub name: TableName,
+    pub columns: Vec<Column>,
+    pub pk: Option<Vec<usize>>,    // column positions
+    pub indexes: Vec<IndexMeta>,   // recorded only
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Schema {
+    pub tables: HashMap<TableName, TableMeta>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Catalog {
+    pub schemas: HashMap<SchemaName, Schema>,
+}
+
+impl Catalog {
+    pub fn ensure_schema(&mut self, s: &str) {
+        self.schemas.entry(s.to_string()).or_default();
+    }
+    pub fn get_table(&self, schema: &str, name: &str) -> Option<&TableMeta> {
+        self.schemas.get(schema).and_then(|sc| sc.tables.get(name))
+    }
+}
+--- END OF FILE ---
+FILE: src/parser.rs
+use crate::engine::{fe, FilterPred, SortKey};
+use crate::engine::{DataType, Expr, Field, ObjName, Plan, Schema, Selection, Value};
+use pg_query::protobuf::AConst;
+use pg_query::protobuf::a_const::Val;
+use pg_query::{NodeEnum, parse};
+
+pub struct Planner;
+
+impl Planner {
+    pub fn plan_sql(sql: &str) -> pgwire::error::PgWireResult<Plan> {
+        let parsed = parse(sql).map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
+        // Filter out empty statements produced by trailing semicolons.
+        let stmts: Vec<_> = parsed
+            .protobuf
+            .stmts
+            .into_iter()
+            .filter(|s| s.stmt.is_some())
+            .collect();
+
+        // After filtering, ensure we have exactly one statement.
+        if stmts.len() > 1 {
+            return Err(fe("multiple statements not supported"));
+        }
+
+        let Some(stmt) = stmts.into_iter().next() else {
+            // This handles cases like a query with only a semicolon.
+            return Err(fe("empty query"));
+        };
+        match stmt.stmt.and_then(|n| n.node) {
+            // SELECT
+            Some(NodeEnum::SelectStmt(sel)) => {
+                // SELECT <literal>[, <literal>...]
+                if sel.from_clause.is_empty() {
+                    let tl = sel.target_list;
+                    if tl.is_empty() {
+                        return Err(fe("at least one column required"));
+                    }
+
+                    let mut out_fields = Vec::with_capacity(tl.len());
+                    let mut out_exprs = Vec::with_capacity(tl.len());
+
+                    for t in tl {
+                        let tgt = t.node.as_ref().ok_or_else(|| fe("unexpected target"))?;
+                        let NodeEnum::ResTarget(rt) = tgt else {
+                            return Err(fe("unexpected target"));
+                        };
+
+                        let expr_node = rt
+                            .val
+                            .as_ref()
+                            .and_then(|n| n.node.as_ref())
+                            .ok_or_else(|| fe("missing expr"))?;
+
+                        let lit = parse_numeric_const(expr_node)?;
+                        let (dt, expr) = match lit {
+                            Value::Int64(i) => {
+                                let dt = if (i32::MIN as i64..=i32::MAX as i64).contains(&i) {
+                                    DataType::Int4
+                                } else {
+                                    DataType::Int8
+                                };
+                                (dt, Expr::Literal(Value::Int64(i)))
+                            }
+                            Value::Float64Bits(b) => {
+                                (DataType::Float8, Expr::Literal(Value::Float64Bits(b)))
+                            }
+                            Value::Null => {
+                                // null has no inherent numeric type; bail in numeric-only contexts
+                                return Err(fe("null not allowed here"));
+                            }
+                        };
+                        // Postgres uses "?column?" for unlabeled expressions; duplicates are fine.
+                        let name = if rt.name.is_empty() {
+                            "?column?".to_string()
+                        } else {
+                            rt.name.clone()
+                        };
+                        out_fields.push(Field {
+                            name: name.clone(),
+                            data_type: dt,
+                        });
+                        out_exprs.push((expr, name));
+                    }
+
+                    let input = Plan::Values {
+                        rows: vec![vec![]],
+                        schema: Schema { fields: vec![] },
+                    };
+                    let out_schema = Schema { fields: out_fields };
+                    return Ok(Plan::Projection {
+                        input: Box::new(input),
+                        exprs: out_exprs,
+                        schema: out_schema,
+                    });
+                }
+
+                // SELECT FROM
+                if sel.from_clause.len() != 1 {
+                    return Err(fe("single table only"));
+                }
+                let from = sel.from_clause[0]
+                    .node
+                    .as_ref()
+                    .ok_or_else(|| fe("missing from"))?;
+                let (schemaname, relname) = if let NodeEnum::RangeVar(rv) = from {
+                    // FIX: `rv.schemaname` is a String, not an iterator. Convert to Option if not empty.
+                    (
+                        if rv.schemaname.is_empty() {
+                            None
+                        } else {
+                            Some(rv.schemaname.clone())
+                        },
+                        rv.relname.clone(),
+                    )
+                } else {
+                    return Err(fe("unsupported FROM"));
+                };
+                let table = ObjName {
+                    schema: schemaname,
+                    name: relname,
+                };
+
+                // star vs explicit columns
+                // star vs explicit columns
+                let mut selection = if sel.target_list.len() == 1 {
+                    let t = &sel.target_list[0];
+                    let node = t.node.as_ref().ok_or_else(|| fe("missing target node"))?;
+
+                    if let NodeEnum::ResTarget(rt) = node {
+                        // select * case
+                        if let Some(NodeEnum::ColumnRef(cr)) =
+                            rt.val.as_ref().and_then(|n| n.node.as_ref())
+                        {
+                            if let Some(NodeEnum::AStar(_)) =
+                                cr.fields.get(0).and_then(|f| f.node.as_ref())
+                            {
+                                Selection::Star
+                            } else {
+                                // single column, e.g., select a from ...
+                                let name = if rt.name.is_empty() {
+                                    extract_col_name(rt)?
+                                } else {
+                                    rt.name.clone()
+                                };
+                                Selection::Columns(vec![name])
+                            }
+                        } else {
+                            // treat as single column name
+                            let name = if rt.name.is_empty() {
+                                extract_col_name(rt)?
+                            } else {
+                                rt.name.clone()
+                            };
+                            Selection::Columns(vec![name])
+                        }
+                    } else {
+                        return Err(fe("unexpected target type for single column"));
+                    }
+                } else {
+                    // multiple columns (e.g., select a, b from ...)
+                    let mut cols = Vec::new();
+                    for t in sel.target_list {
+                        let node_enum = t.node.as_ref().map(|n| &*n).ok_or_else(|| fe("bad target"))?;
+                        if let NodeEnum::ResTarget(rt) = node_enum {
+                            let col_name = if rt.name.is_empty() {
+                                extract_col_name(&rt)?
+                            } else {
+                                rt.name.clone()
+                            };
+                            cols.push(col_name);
+                        } else {
+                            return Err(fe("bad target"));
+                        }
+                    }
+                    Selection::Columns(cols)
+                };
+
+                // parse where predicate now so we can add missing column to selection if needed
+                let where_pred = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+                    parse_where_predicate(w)?
+                } else { None };
+
+                // if where uses a name not in selection and we're not doing star, include it
+                if let Some(FilterPred::ByName { col, .. }) = &where_pred {
+                    if let Selection::Columns(cols) = &mut selection {
+                        if !cols.iter().any(|c| c == col) {
+                            cols.push(col.clone());
+                        }
+                    }
+                }
+
+                // start with unbound scan, then wrap in filter → order → limit
+                let mut plan = Plan::UnboundSeqScan { table, selection };
+
+                // where
+                if let Some(pred) = where_pred {
+                    plan = Plan::Filter { input: Box::new(plan), pred };
+                }
+
+                // order by: ordinals or column names
+                if !sel.sort_clause.is_empty() {
+                    let keys = parse_order_clause(&sel.sort_clause)?;
+                    plan = Plan::Order { input: Box::new(plan), keys };
+                }
+
+                // limit: integer constant
+                if let Some(limit_node) = sel.limit_count.as_ref().and_then(|n| n.node.as_ref()) {
+                    let lim = parse_limit_count(limit_node)?;
+                    plan = Plan::Limit { input: Box::new(plan), limit: lim };
+                }
+
+                Ok(plan)
+            }
+
+            // CREATE TABLE
+            Some(NodeEnum::CreateStmt(cs)) => {
+                let rv = cs.relation.ok_or_else(|| fe("missing table name"))?;
+                let table = ObjName {
+                    schema: if rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(rv.schemaname)
+                    },
+                    name: rv.relname,
+                };
+
+                let mut cols = Vec::new();
+                let mut pk: Option<Vec<String>> = None;
+
+                for elt in cs.table_elts {
+                    // FIX: Correctly unwrap the Node to get the NodeEnum.
+                    match elt.node.unwrap() {
+                        NodeEnum::ColumnDef(cd) => {
+                            let dt = map_type(&cd)?;
+                            let cname = cd.colname;
+                            let nullable = !cd.is_not_null;
+                            cols.push((cname, dt, nullable));
+                            // simple “col PRIMARY KEY” handling
+                            // FIX: Correctly access the NodeEnum.
+                            if cd.constraints.iter().any(|c| matches!(c.node.as_ref(), Some(NodeEnum::Constraint(cons)) if cons.contype==1)) {
+                                pk = Some(vec![cols.last().unwrap().0.clone()]);
+                            }
+                        }
+                        NodeEnum::Constraint(cons) => {
+                            // PRIMARY KEY (a,b)
+                            if cons.contype == 1 {
+                                let mut names = Vec::new();
+                                for n in cons.keys {
+                                    let NodeEnum::String(s) = n.node.unwrap() else {
+                                        continue;
+                                    };
+                                    names.push(s.sval);
+                                }
+                                pk = Some(names);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(Plan::CreateTable { table, cols, pk })
+            }
+
+            // INSERT VALUES
+            Some(NodeEnum::InsertStmt(ins)) => {
+                let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
+                let table = ObjName {
+                    schema: if rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(rv.schemaname)
+                    },
+                    name: rv.relname,
+                };
+                let sel = ins
+                    .select_stmt
+                    .and_then(|n| n.node)
+                    .ok_or_else(|| fe("INSERT needs VALUES"))?;
+                let NodeEnum::SelectStmt(sel2) = sel else {
+                    return Err(fe("only VALUES supported"));
+                };
+                let mut all_rows: Vec<Vec<Expr>> = Vec::new();
+                for v in sel2.values_lists {
+                    let NodeEnum::List(vlist) = v.node.unwrap() else {
+                        continue;
+                    };
+                    let mut row = Vec::new();
+                    for cell in vlist.items {
+                        let n = cell.node.unwrap();
+                        // FIX: Match directly on the NodeEnum `n`.
+                        match n {
+                            NodeEnum::AConst(c) => row.push(Expr::Literal(const_to_value(&c)?)),
+                            _ => return Err(fe("INSERT supports constants only")),
+                        }
+                    }
+                    all_rows.push(row);
+                }
+                Ok(Plan::InsertValues {
+                    table,
+                    rows: all_rows,
+                })
+            }
+
+            _ => Err(fe("unsupported statement")),
+        }
+    }
+}
+
+// returns schema for an existing plan; used to wrap with filter/order/limit
+fn plan_schema(p: &Plan) -> pgwire::error::PgWireResult<Schema> {
+    Ok(p.schema().clone())
+}
+
+// parse a where predicate supporting "col <op> const" only
+fn parse_where_predicate(node: &NodeEnum) -> pgwire::error::PgWireResult<Option<FilterPred>> {
+    use crate::engine::CmpOp;
+    if let NodeEnum::AExpr(ax) = node {
+        // parse operator text
+        let mut op_txt = None;
+        for n in &ax.name {
+            if let Some(NodeEnum::String(s)) = n.node.as_ref() {
+                op_txt = Some(s.sval.as_str());
+                break;
+            }
+        }
+        let op = match op_txt.unwrap_or("") {
+            "="  => CmpOp::Eq,
+            "!=" => CmpOp::Neq,
+            "<>" => CmpOp::Neq,
+            "<"  => CmpOp::Lt,
+            "<=" => CmpOp::Lte,
+            ">"  => CmpOp::Gt,
+            ">=" => CmpOp::Gte,
+            _ => return Err(fe("unsupported where operator")),
+        };
+
+        // expect left is column, right is const
+        let lexpr = ax.lexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad where aexpr"))?;
+        let rexpr = ax.rexpr.as_ref().and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad where aexpr"))?;
+
+        let col_name = match lexpr {
+            NodeEnum::ColumnRef(cr) => last_colref_name(cr)?,
+            _ => return Err(fe("where must be column op const")),
+        };
+        let rhs = match rexpr {
+            NodeEnum::AConst(c) => const_to_value(c)?,
+            _ => return Err(fe("where rhs must be const")),
+        };
+        return Ok(Some(FilterPred::ByName { col: col_name, op, rhs }));
+    }
+    Ok(None)
+}
+
+// get last identifier from a columnref
+fn last_colref_name(cr: &pg_query::protobuf::ColumnRef) -> pgwire::error::PgWireResult<String> {
+    for n in cr.fields.iter().rev() {
+        if let Some(NodeEnum::String(s)) = n.node.as_ref() {
+            return Ok(s.sval.clone());
+        }
+    }
+    Err(fe("bad columnref"))
+}
+
+fn parse_order_clause(items: &Vec<pg_query::protobuf::Node>) -> pgwire::error::PgWireResult<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for sb in items {
+        let Some(NodeEnum::SortBy(s)) = sb.node.as_ref() else { return Err(fe("bad order by")); };
+        let asc = match s.sortby_dir {
+            0 | 1 => true,  // default/asc
+            2 => false,     // desc
+            _ => true,
+        };
+        let Some(expr) = s.node.as_ref().and_then(|n| n.node.as_ref()) else { return Err(fe("bad order by expr")); };
+        let key = match expr {
+            // order by 1
+            NodeEnum::AConst(ac) => {
+                if let Some(Val::Ival(iv)) = ac.val.as_ref() {
+                    if iv.ival <= 0 { return Err(fe("order by position must be >= 1")); }
+                    SortKey::ByIndex { idx: (iv.ival as usize) - 1, asc }
+                } else { return Err(fe("order by const must be integer")); }
+            }
+            // order by column
+            NodeEnum::ColumnRef(cr) => {
+                let name = last_colref_name(cr)?; SortKey::ByName { col: name, asc }
+            }
+            _ => return Err(fe("unsupported order by expression")),
+        };
+        keys.push(key);
+    }
+    Ok(keys)
+}
+
+fn parse_limit_count(node: &NodeEnum) -> pgwire::error::PgWireResult<usize> {
+    match node {
+        NodeEnum::AConst(c) => {
+            if let Some(Val::Ival(iv)) = c.val.as_ref() {
+                if iv.ival < 0 { return Err(fe("limit must be non-negative")); }
+                Ok(iv.ival as usize)
+            } else {
+                Err(fe("limit must be integer"))
+            }
+        }
+        _ => Err(fe("unsupported limit expression")),
+    }
+}
+
+
+fn extract_col_name(rt: &pg_query::protobuf::ResTarget) -> pgwire::error::PgWireResult<String> {
+    // SELECT a FROM t  (val is ColumnRef)
+    let Some(v) = rt.val.as_ref().and_then(|n| n.node.as_ref()) else {
+        return Err(fe("bad column target"));
+    };
+    if let NodeEnum::ColumnRef(cr) = v {
+        let last = cr
+            .fields
+            .last()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad colref"))?;
+        if let NodeEnum::String(s) = last {
+            Ok(s.sval.clone())
+        } else {
+            Err(fe("bad colref"))
+        }
+    } else {
+        Err(fe("only simple column names supported"))
+    }
+}
+
+fn parse_numeric_const(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
+    match node {
+        NodeEnum::AConst(c) => {
+            let v = const_to_value(c)?;
+            match v {
+                Value::Int64(_) | Value::Float64Bits(_) => Ok(v),
+                Value::Null => Err(fe("null not allowed in numeric const")),
+            }
+        }
+        NodeEnum::AExpr(ax) => {
+            // support unary minus over numeric constants: -123 or -1.23
+            let is_minus = ax
+                .name
+                .iter()
+                .any(|nn| matches!(nn.node.as_ref(), Some(NodeEnum::String(s)) if s.sval=="-"));
+            if !is_minus {
+                return Err(fe("only numeric const supported"));
+            }
+            let rhs = ax
+                .rexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad unary minus"))?;
+            match rhs {
+                NodeEnum::AConst(c) => match const_to_value(c)? {
+                    Value::Int64(i) => Ok(Value::Int64(-i)),
+                    Value::Float64Bits(b) => Ok(Value::from_f64(-f64::from_bits(b))),
+                    Value::Null => Err(fe("minus over null")),
+                },
+                _ => Err(fe("minus over non-const")),
+            }
+        }
+        _ => Err(fe("only numeric const supported")),
+    }
+}
+
+fn const_to_value(c: &AConst) -> pgwire::error::PgWireResult<Value> {
+    // postgres encodes NULL as aconst with no val; treat it as null
+    if c.val.is_none() {
+        return Ok(Value::Null);
+    }
+    let v = c.val.as_ref().unwrap();
+    match v {
+        Val::Ival(i) => Ok(Value::Int64(i.ival as i64)),
+        Val::Fval(f) => {
+            Ok(Value::from_f64(f.fval.parse::<f64>().map_err(|e| {
+                pgwire::error::PgWireError::ApiError(Box::new(e))
+            })?))
+        }
+        Val::Boolval(_) => Err(fe("bool const not yet supported")),
+        Val::Sval(_) => Err(fe("string const not yet supported")),
+        Val::Bsval(_) => Err(fe("bitstring const not yet supported")),
+    }
+}
+
+fn map_type(cd: &pg_query::protobuf::ColumnDef) -> pgwire::error::PgWireResult<DataType> {
+    // subset: int/int4/integer, bigint/int8, float8/double precision
+    let typ = cd.type_name.as_ref().ok_or_else(|| fe("missing type"))?;
+
+    // collect tokens, keeping only string components, lowercased
+    let tokens: Vec<String> = typ.names.iter().filter_map(|n| {
+        n.node.as_ref().and_then(|nn| if let NodeEnum::String(s) = nn { Some(s.sval.to_ascii_lowercase()) } else { None })
+    }).collect();
+
+    if tokens.is_empty() {
+        return Err(fe("bad type name"));
+    }
+
+    // handle multi-word names like "double precision"
+    let last = tokens.last().unwrap().as_str();
+    let last_two = if tokens.len() >= 2 {
+        Some(format!("{} {}", tokens[tokens.len()-2], tokens[tokens.len()-1]))
+    } else { None };
+
+    let dt = if last_two.as_deref() == Some("double precision") {
+        DataType::Float8
+    } else {
+        match last {
+            "int" | "int4" | "integer" => DataType::Int4,
+            "bigint" | "int8"          => DataType::Int8,
+            "float8" | "double"        => DataType::Float8,
+            other => return Err(fe(format!("unsupported type: {other}"))),
+        }
+    };
+    Ok(dt)
+}
+--- END OF FILE ---
+FILE: src/lib.rs
+mod binder;
+mod catalog;
+mod db;
+mod engine;
+mod handler;
+mod parser;
+mod storage;
+
+pub use handler::Mockgres;
+--- END OF FILE ---
+FILE: src/db.rs
+use std::collections::HashMap;
+use crate::catalog::{Catalog, TableMeta, TableId};
+use crate::engine::{Column, DataType};
+use crate::storage::{Row, RowKey, Table};
+
+/// Top-level in-memory database:
+/// - `catalog`: pure metadata (schemas, tables, columns, pk, indexes)
+/// - `tables`: data payload keyed by TableId
+/// - `next_tid`: auto-increment table id for CREATE TABLE
+#[derive(Debug)]
+pub struct Db {
+    pub catalog: Catalog,                 // metadata only
+    pub tables: HashMap<TableId, Table>,  // data
+    pub next_tid: u64,                    // for assigning new table ids
+}
+
+impl Default for Db {
+    fn default() -> Self {
+        let mut catalog = Catalog::default();
+        catalog.ensure_schema("public");
+        Self {
+            catalog,
+            tables: HashMap::new(),
+            next_tid: 1,
+        }
+    }
+}
+
+impl Db {
+    /// CREATE TABLE schema.name (cols, pk?)
+    /// - cols: (name, type, nullable)
+    /// - pk_names: list of column names; None -> implicit hidden rowid
+    pub fn create_table(
+        &mut self,
+        schema: &str,
+        name: &str,
+        cols: Vec<(String, DataType, bool)>,
+        pk_names: Option<Vec<String>>,
+    ) -> anyhow::Result<TableId> {
+        self.catalog.ensure_schema(schema);
+        if self.catalog.get_table(schema, name).is_some() {
+            anyhow::bail!("table already exists: {schema}.{name}");
+        }
+
+        let id = self.next_tid;
+        self.next_tid += 1;
+
+        let columns: Vec<Column> = cols
+            .into_iter()
+            .map(|(n, t, nullable)| Column {
+                name: n,
+                data_type: t,
+                nullable,
+            })
+            .collect();
+
+        // map pk names -> positions
+        let pk: Option<Vec<usize>> = match pk_names {
+            None => None,
+            Some(ns) => {
+                let mut pos = Vec::with_capacity(ns.len());
+                for n in ns {
+                    let i = columns
+                        .iter()
+                        .position(|c| c.name == n)
+                        .ok_or_else(|| anyhow::anyhow!("unknown pk column: {n}"))?;
+                    pos.push(i);
+                }
+                Some(pos)
+            }
+        };
+
+        let tm = TableMeta {
+            id,
+            name: name.to_string(),
+            columns: columns.clone(),
+            pk,
+            indexes: vec![],
+        };
+
+        self.catalog
+            .schemas
+            .get_mut(schema)
+            .expect("schema exists after ensure")
+            .tables
+            .insert(name.to_string(), tm);
+
+        self.tables.insert(id, Table::default());
+        Ok(id)
+    }
+
+    pub fn resolve_table(&self, schema: &str, name: &str) -> anyhow::Result<&TableMeta> {
+        self.catalog
+            .get_table(schema, name)
+            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))
+    }
+
+    pub fn resolve_table_mut(
+        &mut self,
+        schema: &str,
+        name: &str,
+    ) -> anyhow::Result<(&TableMeta, &mut Table)> {
+        let tm = self
+            .catalog
+            .get_table(schema, name)
+            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?
+            .clone();
+        let t = self
+            .tables
+            .get_mut(&tm.id)
+            .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", tm.id))?;
+        Ok((self.catalog.get_table(schema, name).unwrap(), t))
+    }
+
+    /// INSERT full rows (no column list) — values already realized to `Value`.
+    /// checks: row length, per-col types, nullability, and pk non-null; enforces pk uniqueness
+    pub fn insert_full_rows(
+        &mut self,
+        schema: &str,
+        name: &str,
+        mut rows: Vec<Row>,
+    ) -> anyhow::Result<usize> {
+        use parking_lot::Mutex;
+        use crate::engine::{DataType, Value};
+
+        // simple global counter for hidden rowid
+        static ROWID: Mutex<u64> = parking_lot::const_mutex(1);
+
+        let (meta, tab) = self.resolve_table_mut(schema, name)?;
+        let ncols = meta.columns.len();
+        let mut count = 0usize;
+
+        for (ridx, r) in rows.drain(..).enumerate() {
+            // arity: number of values must match table columns
+            if r.len() != ncols {
+                anyhow::bail!(
+                    "insert has wrong number of values at row {}: expected {}, got {}",
+                    ridx + 1,
+                    ncols,
+                    r.len()
+                );
+            }
+
+            // coerce and validate each cell to the target column type
+            let mut out: Row = Vec::with_capacity(ncols);
+            for (i, (val, col)) in r.into_iter().zip(meta.columns.iter()).enumerate() {
+                // handle nulls first
+                if let Value::Null = val {
+                    // not null?
+                    if !col.nullable {
+                        anyhow::bail!("column {} is not null", col.name);
+                    }
+                    // pk columns cannot be null
+                    if let Some(pkpos) = &meta.pk {
+                        if pkpos.contains(&i) {
+                            anyhow::bail!("primary key column {} cannot be null", col.name);
+                        }
+                    }
+                    out.push(Value::Null);
+                    continue;
+                }
+
+                let coerced = match (&col.data_type, val) {
+                    // int4: keep as i64, but enforce i32 range
+                    (DataType::Int4, Value::Int64(v)) => {
+                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                            anyhow::bail!(
+                                "value out of range for int4 at column {} (index {})",
+                                col.name,
+                                i
+                            );
+                        }
+                        Value::Int64(v)
+                    }
+                    // int8: require an int64 value
+                    (DataType::Int8, Value::Int64(v)) => Value::Int64(v),
+
+                    // float8: accept float or int (promote int -> float)
+                    (DataType::Float8, Value::Float64Bits(bits)) => Value::Float64Bits(bits),
+                    (DataType::Float8, Value::Int64(_)) => anyhow::bail!("type mismatch at column {} (index {})", col.name, i),
+
+                    // anything else is a mismatch for now (e.g., float into int)
+                    (dt, got) => {
+                        anyhow::bail!(
+                            "type mismatch at column {} (index {}): expected {:?}, got {:?}",
+                            col.name,
+                            i,
+                            dt,
+                            got
+                        )
+                    }
+                };
+
+                out.push(coerced);
+            }
+
+            // build the row key (pk or hidden rowid)
+            let key = if let Some(pkpos) = &meta.pk {
+                let mut vals = Vec::with_capacity(pkpos.len());
+                for i in pkpos {
+                    vals.push(out[*i].clone());
+                }
+                RowKey::Pk(vals)
+            } else {
+                let id = {
+                    let mut g = ROWID.lock();
+                    let v = *g;
+                    *g += 1;
+                    v
+                };
+                RowKey::Hidden(id)
+            };
+
+            // enforce pk uniqueness when present
+            if tab.rows_by_key.contains_key(&key) {
+                anyhow::bail!("duplicate key value violates unique constraint");
+            }
+
+            // finally insert
+            tab.insert(key, out);
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    /// Return projected rows at the given column positions, plus resolved (pos, name).
+    pub fn scan_bound_positions(
+        &self,
+        schema: &str,
+        name: &str,
+        positions: &[usize],
+    ) -> anyhow::Result<(Vec<Row>, Vec<(usize, String)>)> {
+        let tm = self.resolve_table(schema, name)?;
+        let table = self
+            .tables
+            .get(&tm.id)
+            .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", tm.id))?;
+
+        let mut out_rows = Vec::new();
+        for (_k, r) in table.scan_all() {
+            out_rows.push(positions.iter().map(|i| r[*i].clone()).collect());
+        }
+        let cols = positions
+            .iter()
+            .map(|i| (*i, tm.columns[*i].name.clone()))
+            .collect();
+        Ok((out_rows, cols))
+    }
+}
+--- END OF FILE ---
+FILE: src/storage.rs
+use std::collections::HashMap;
+use crate::engine::Value;
+
+#[derive(Hash, Eq, PartialEq, Clone, Debug)]
+pub enum RowKey { Hidden(u64), Pk(Vec<Value>) }
+
+pub type Row = Vec<Value>;
+
+#[derive(Debug)]
+pub struct Table {
+    pub rows_by_key: HashMap<RowKey, Row>,
+    pub next_rowid: u64,
+}
+
+impl Default for Table {
+    fn default() -> Self {
+        Self { rows_by_key: HashMap::new(), next_rowid: 1 }
+    }
+}
+
+impl Table {
+    pub fn insert(&mut self, k: RowKey, r: Row) { self.rows_by_key.insert(k, r); }
+    pub fn scan_all(&self) -> impl Iterator<Item = (&RowKey, &Row)> { self.rows_by_key.iter() }
+
+    // simple per-table counter for hidden rowids
+    pub fn alloc_rowid(&mut self) -> u64 {
+        let id = self.next_rowid;
+        self.next_rowid += 1;
+        id
+    }
+}
+--- END OF FILE ---
+FILE: src/bin/mockgresd.rs
+use std::{net::SocketAddr, sync::Arc};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Addr from argv(1) or MOCKGRES_ADDR env or default.
+    let addr_str = std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("MOCKGRES_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:6543".to_string());
+
+    let addr: SocketAddr = addr_str.parse().expect("invalid listen address");
+
+    println!("mockgres listening on {addr}");
+    let handler = Arc::new(mockgres::Mockgres::default());
+
+    // Runs until process exit (Ctrl+C will terminate the program).
+    handler.serve(addr).await?;
+
+    Ok(())
+}
+--- END OF FILE ---
+FILE: tests/select_literals.rs
+mod common;
+
+use common::{start, simple_first_cell};
+use rand::Rng;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn simple_select_one() {
+    let ctx = start().await;
+    let v = simple_first_cell(&ctx.client, "select 1").await;
+    assert_eq!(v, "1");
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test]
+async fn extended_select_one() {
+    let ctx = start().await;
+    let rows = ctx.client.query("select 1", &[]).await.expect("query ok");
+    assert_eq!(rows.len(), 1);
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, 1);
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test]
+async fn extended_select_random() {
+    let ctx = start().await;
+    let n: i32 = rand::thread_rng().gen_range(1..=1000);
+    let rows = ctx.client.query(&*format!("select {n}"), &[]).await.expect("query ok");
+    assert_eq!(rows.len(), 1);
+    let v: i32 = rows[0].get(0);
+    assert_eq!(v, n);
+    let _ = ctx.shutdown.send(());
+}
+
+use tokio_postgres::SimpleQueryMessage;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn simple_select_two_literals() {
+    let ctx = common::start().await;
+
+    let msgs = ctx.client.simple_query("SELECT 4, 5").await.expect("query");
+    let row = msgs.into_iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(r) => Some(r),
+        _ => None,
+    }).expect("one row");
+
+    assert_eq!(row.get(0).unwrap(), "4");
+    assert_eq!(row.get(1).unwrap(), "5");
+
+    let _ = ctx.shutdown.send(());
+}
+--- END OF FILE ---
+FILE: tests/select_where_order_limit.rs
+mod common;
+use tokio_postgres::SimpleQueryMessage;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn where_order_limit_and_tags() {
+    let ctx = common::start().await;
+
+    // create
+    ctx.client.execute("create table t(a int4 not null, b int4)", &[]).await.expect("create");
+
+    // insert 4 rows, one null
+    ctx.client.execute("insert into t values (1,10),(2,20),(3,15),(4,null)", &[]).await.expect("insert");
+
+    // simple-query path
+    let msgs = ctx.client.simple_query("select b from t where a >= 2 order by 1 desc limit 2").await.expect("query");
+    let mut rows = Vec::new();
+    let mut rows_affected: Option<u64> = None;
+    for m in msgs {
+        match m {
+            SimpleQueryMessage::Row(r) => rows.push(r.get(0).map(|s| s.to_string())),
+            SimpleQueryMessage::CommandComplete(n) => rows_affected = Some(n),
+            _ => {}
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows_affected, Some(2));
+
+    // extended path
+    let rows = ctx.client.query("select b from t where a >= 2 order by 1 desc limit 2", &[]).await.expect("query");
+    assert_eq!(rows.len(), 2);
+
+    let _ = ctx.shutdown.send(());
+}
+--- END OF FILE ---
+FILE: tests/create_insert_select.rs
+mod common;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_insert_select_star_extended() {
+    let ctx = common::start().await;
+
+    // CREATE TABLE using the extended query protocol's `execute`
+    ctx.client
+        .execute("CREATE TABLE t(a INT, b INT, PRIMARY KEY(a));", &[])
+        .await
+        .expect("create table");
+
+    // INSERT rows using `execute`. This is a single statement with multiple values.
+    ctx.client
+        .execute("INSERT INTO t VALUES (2, 20), (1, 10);", &[])
+        .await
+        .expect("insert");
+
+    // SELECT using the extended query protocol's `query` method.
+    // The `&[]` specifies that there are no parameters.
+    let pg_rows = ctx
+        .client
+        .query("SELECT * FROM t;", &[])
+        .await
+        .expect("select");
+
+    // The result `pg_rows` is a `Vec<tokio_postgres::Row>`, which is much easier to work with.
+    // We can map over it and get typed values directly.
+    let mut rows: Vec<(i32, i32)> = pg_rows
+        .into_iter()
+        .map(|row| {
+            // Since the table columns are INT, we get them as i32.
+            let a: i32 = row.get(0);
+            let b: i32 = row.get(1);
+            (a, b)
+        })
+        .collect();
+
+    // The rest of the logic remains the same.
+    rows.sort_by_key(|(a, _)| *a);
+    assert_eq!(rows, vec![(1, 10), (2, 20)]);
+
+    let _ = ctx.shutdown.send(());
+}
+--- END OF FILE ---
+FILE: tests/common.rs
+use std::sync::Arc;
+
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+
+pub struct TestCtx {
+    pub client: Client,
+    pub _bg: JoinHandle<()>,
+    pub shutdown: tokio::sync::oneshot::Sender<()>,
+    pub addr: std::net::SocketAddr,
+}
+
+pub async fn start() -> TestCtx {
+    // Build a handler with a default in-memory DB
+    let handler = Arc::new(mockgres::Mockgres::default());
+
+    // Bind an ephemeral port so we know where to connect
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    // Shutdown channel for the accept loop
+    let (shutdown, mut rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Accept loop, forwarding sockets to pgwire with our handler
+    let h = handler.clone();
+    let _bg = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                Ok((socket, _peer)) = listener.accept() => {
+                    let h2 = h.clone();
+                    tokio::spawn(async move {
+                        let _ = pgwire::tokio::process_socket(socket, None, h2).await;
+                    });
+                }
+            }
+        }
+    });
+
+    // Connect a tokio-postgres client to our just-bound address
+    let conn_str = format!("host={} port={} user=postgres", addr.ip(), addr.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect");
+    let conn_task = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    TestCtx { client, _bg: conn_task, shutdown, addr }
+}
+
+// run a simple query and return the first cell as string
+pub async fn simple_first_cell(client: &Client, sql: &str) -> String {
+    let msgs = client.simple_query(sql).await.expect("simple query");
+    let row = msgs.iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(r) => Some(r),
+        _ => None,
+    }).expect("expected one row");
+    row.get(0).expect("one column").to_string()
+}
+--- END OF FILE ---

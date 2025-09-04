@@ -1,0 +1,27 @@
+[package]
+name = "mockgres"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "mockgres"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mockgresd"
+path = "src/bin/mockgresd.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
+anyhow = "1"
+pgwire = "0.32"
+async-trait = "0.1"
+futures = "0.3.31"
+pg_query = "6.1.1"
+parking_lot = "0.12.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio-postgres = "0.7"
+anyhow = "1"
+rand = "0.8.5"
