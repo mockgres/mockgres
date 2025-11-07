@@ -110,8 +110,8 @@ pub enum FilterPred {
 // order by key; name or ordinal; asc=true means ascending
 #[derive(Clone, Debug)]
 pub enum SortKey {
-    ByName { col: String, asc: bool },
-    ByIndex { idx: usize, asc: bool },
+    ByName { col: String, asc: bool, nulls_first: Option<bool> },
+    ByIndex { idx: usize, asc: bool, nulls_first: Option<bool> },
 }
 
 impl Plan {
@@ -296,74 +296,95 @@ pub struct OrderExec {
     schema: Schema,
     rows: Vec<Row>,
     pos: usize,
-    keys: Vec<(usize, bool)>,
+    keys: Vec<(usize, bool, bool)>,
 }
 
 impl OrderExec {
-    pub fn new(schema: Schema, mut child: Box<dyn ExecNode>, keys: Vec<(usize, bool)>) -> PgWireResult<Self> {
+    pub fn new(schema: Schema, mut child: Box<dyn ExecNode>, keys: Vec<(usize, bool, Option<bool>)>) -> PgWireResult<Self> {
         child.open()?;
         let mut buf = Vec::new();
         while let Some(r) = child.next()? { buf.push(r); }
         child.close()?;
 
-        // stable sort by keys
+        // resolve nulls policy up front: postgres default => asc => nulls last, desc => nulls first
+        let resolved_keys: Vec<(usize, bool, bool)> = keys.into_iter()
+            .map(|(idx, asc, nulls_first_opt)| {
+                let nulls_first_eff = nulls_first_opt.unwrap_or(!asc);
+                (idx, asc, nulls_first_eff)
+            })
+            .collect();
+
+        // stable sort by keys, honoring asc/desc and nulls_first per key
         buf.sort_by(|a, b| {
             use std::cmp::Ordering;
-            for (idx, asc) in &keys {
+            for (idx, asc, nulls_first) in &resolved_keys {
                 let av = a.get(*idx);
                 let bv = b.get(*idx);
-                let ord = order_values(av, bv);
+                let ord = order_values(av, bv, *asc, *nulls_first);
                 if ord != Ordering::Equal {
-                    return if *asc { ord } else { ord.reverse() };
+                    return ord;
                 }
             }
             Ordering::Equal
         });
 
-        Ok(Self { schema, rows: buf, pos: 0, keys })
-    }
-}
+        Ok(Self { schema, rows: buf, pos: 0, keys: resolved_keys })
+    }}
 
-fn order_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+// compares two values with explicit asc and nulls policy.
+// nulls_first=true => nulls before non-nulls; false => nulls after
+fn order_values(a: Option<&Value>, b: Option<&Value>, asc: bool, nulls_first: bool) -> std::cmp::Ordering {
     use std::cmp::Ordering::*;
+
+    // treat missing outer option like sql nulls
     match (a, b) {
-        (None, None) => Equal,
-        (None, Some(_)) => Less,
-        (Some(_), None) => Greater,
+        (None, None) => return Equal,
+        (None, Some(_)) => return if nulls_first { Less } else { Greater },
+        (Some(_), None) => return if nulls_first { Greater } else { Less },
+        _ => {}
+    }
 
-        // nulls last (ASC); DESC achieved by caller via reverse()
-        (Some(Value::Null), Some(Value::Null)) => Equal,
-        (Some(Value::Null), Some(_)) => Greater,
-        (Some(_), Some(Value::Null)) => Less,
+    // safe unwrap after early returns
+    match (a.unwrap(), b.unwrap()) {
+        // sql nulls obey nulls_first; do not flip by asc
+        (Value::Null, Value::Null) => Equal,
+        (Value::Null, _)           => if nulls_first { Less } else { Greater },
+        (_,           Value::Null) => if nulls_first { Greater } else { Less },
 
-        (Some(Value::Int64(x)), Some(Value::Int64(y))) => x.cmp(y),
+        // integers
+        (Value::Int64(x), Value::Int64(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
 
-        (Some(Value::Float64Bits(bx)), Some(Value::Float64Bits(by))) => {
+        // floats (NaN > all in ascending); desc handled by reversing ord
+        (Value::Float64Bits(bx), Value::Float64Bits(by)) => {
             let (x, y) = (f64::from_bits(*bx), f64::from_bits(*by));
-            if x.is_nan() && y.is_nan() { Equal }
-            else if x.is_nan() { Greater }     // NaN > all
+            let ord = if x.is_nan() && y.is_nan() { Equal }
+            else if x.is_nan() { Greater }   // NaN > all
             else if y.is_nan() { Less }
             else if x < y { Less }
             else if x > y { Greater }
-            else { Equal }
+            else { Equal };
+            if asc { ord } else { ord.reverse() }
         }
 
-        (Some(Value::Int64(x)), Some(Value::Float64Bits(by))) => {
+        // int vs float coercion
+        (Value::Int64(x), Value::Float64Bits(by)) => {
             let y = f64::from_bits(*by);
-            if y.is_nan() { Less }
-            else {
+            let ord = if y.is_nan() { Less } else {
                 let xf = *x as f64;
                 if xf < y { Less } else if xf > y { Greater } else { Equal }
-            }
+            };
+            if asc { ord } else { ord.reverse() }
         }
-
-        (Some(Value::Float64Bits(bx)), Some(Value::Int64(y))) => {
+        (Value::Float64Bits(bx), Value::Int64(y)) => {
             let x = f64::from_bits(*bx);
-            if x.is_nan() { Greater }
-            else {
+            let ord = if x.is_nan() { Greater } else {
                 let yf = *y as f64;
                 if x < yf { Less } else if x > yf { Greater } else { Equal }
-            }
+            };
+            if asc { ord } else { ord.reverse() }
         }
     }
 }

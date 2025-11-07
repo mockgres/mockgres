@@ -371,24 +371,35 @@ fn parse_order_clause(items: &Vec<pg_query::protobuf::Node>) -> pgwire::error::P
     let mut keys = Vec::new();
     for sb in items {
         let Some(NodeEnum::SortBy(s)) = sb.node.as_ref() else { return Err(fe("bad order by")); };
+
         // matching on the SortByDir enum https://github.com/postgres/postgres/blob/master/src/include/nodes/parsenodes.h
+        // pg_query shifts enum values up by 1, so 1 is default, 2 is asc, 3 is desc
         let asc = match s.sortby_dir {
-            0 | 2 => true,
-            1 => false,
+            1 | 2 => true,
+            3 => false,
             _ => true,
         };
+
+        // parse nulls policy: 1=default, 2=first, 3=last
+        let nulls_first = match s.sortby_nulls {
+            2 => Some(true),
+            3 => Some(false),
+            _ => None, // default resolved later: asc => last, desc => first
+        };
+
         let Some(expr) = s.node.as_ref().and_then(|n| n.node.as_ref()) else { return Err(fe("bad order by expr")); };
         let key = match expr {
             // order by 1
             NodeEnum::AConst(ac) => {
                 if let Some(Val::Ival(iv)) = ac.val.as_ref() {
                     if iv.ival <= 0 { return Err(fe("order by position must be >= 1")); }
-                    SortKey::ByIndex { idx: (iv.ival as usize) - 1, asc }
+                    SortKey::ByIndex { idx: (iv.ival as usize) - 1, asc, nulls_first }
                 } else { return Err(fe("order by const must be integer")); }
             }
             // order by column
             NodeEnum::ColumnRef(cr) => {
-                let name = last_colref_name(cr)?; SortKey::ByName { col: name, asc }
+                let name = last_colref_name(cr)?;
+                SortKey::ByName { col: name, asc, nulls_first }
             }
             _ => return Err(fe("unsupported order by expression")),
         };

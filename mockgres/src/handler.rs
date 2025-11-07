@@ -129,11 +129,11 @@ impl Mockgres {
                 let mut idx_keys = Vec::with_capacity(keys.len());
                 for k in keys {
                     match k {
-                        SortKey::ByIndex { idx, asc } => idx_keys.push((*idx, *asc)),
-                        SortKey::ByName  { col, asc } => {
+                        SortKey::ByIndex { idx, asc, nulls_first } => idx_keys.push((*idx, *asc, *nulls_first)),
+                        SortKey::ByName  { col, asc, nulls_first } => {
                             let i = child.schema().fields.iter().position(|f| f.name == *col)
                                 .ok_or_else(|| fe(format!("unknown column in order by: {}", col)))?;
-                            idx_keys.push((i, *asc));
+                            idx_keys.push((i, *asc, *nulls_first));
                         }
                     }
                 }
