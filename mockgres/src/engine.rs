@@ -243,7 +243,7 @@ pub enum BoolExpr {
 
 #[derive(Clone, Debug)]
 pub enum InsertSource {
-    Expr(Expr),
+    Expr(ScalarExpr),
     Default,
 }
 
@@ -339,6 +339,7 @@ pub enum Plan {
     },
     InsertValues {
         table: ObjName,
+        columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertSource>>,
     },
     Update {

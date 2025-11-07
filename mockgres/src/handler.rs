@@ -25,7 +25,7 @@ use crate::db::{CellInput, Db};
 use crate::engine::{
     BoolExpr, DataType, ExecNode, Expr, FilterExec, InsertSource, LimitExec, OrderExec, Plan,
     ProjectExec, ScalarExpr, Schema, SeqScanExec, SortKey, SqlError, UpdateSet, Value, ValuesExec,
-    fe, fe_code, to_pgwire_stream,
+    eval_scalar_expr, fe, fe_code, to_pgwire_stream,
 };
 use crate::parser::Planner;
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
@@ -294,24 +294,77 @@ impl Mockgres {
                 ))
             }
 
-            Plan::InsertValues { table, rows } => {
-                // realize constants only
+            Plan::InsertValues {
+                table,
+                columns,
+                rows,
+            } => {
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                let table_meta = {
+                    let db = self.db.read();
+                    db.resolve_table(schema_name, &table.name)
+                        .map_err(map_db_err)?
+                        .clone()
+                };
+                let column_map = if let Some(cols) = columns {
+                    let mut indexes = Vec::with_capacity(cols.len());
+                    for col in cols {
+                        let pos = table_meta
+                            .columns
+                            .iter()
+                            .position(|c| c.name == *col)
+                            .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
+                        if indexes.iter().any(|i| *i == pos) {
+                            return Err(fe_code("42701", format!("column {col} specified twice")));
+                        }
+                        indexes.push(pos);
+                    }
+                    Some(indexes)
+                } else {
+                    None
+                };
                 let mut realized = Vec::with_capacity(rows.len());
-                for r in rows {
-                    let mut rr = Vec::with_capacity(r.len());
-                    for e in r {
-                        match e {
-                            InsertSource::Expr(Expr::Literal(v)) => {
-                                rr.push(CellInput::Value(v.clone()))
+                for row in rows {
+                    match &column_map {
+                        Some(cols) if row.len() != cols.len() => {
+                            return Err(fe_code(
+                                "21P01",
+                                format!(
+                                    "INSERT has {} target columns but {} expressions",
+                                    cols.len(),
+                                    row.len()
+                                ),
+                            ));
+                        }
+                        None if row.len() != table_meta.columns.len() => {
+                            return Err(fe_code(
+                                "21P01",
+                                format!(
+                                    "INSERT expects {} expressions, got {}",
+                                    table_meta.columns.len(),
+                                    row.len()
+                                ),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    let mut full = vec![CellInput::Default; table_meta.columns.len()];
+                    match &column_map {
+                        Some(cols) => {
+                            for (idx, src) in row.iter().enumerate() {
+                                let value = evaluate_insert_source(src, &params)?;
+                                full[cols[idx]] = value;
                             }
-                            InsertSource::Default => rr.push(CellInput::Default),
-                            _ => return Err(fe("insert supports constants only")),
+                        }
+                        None => {
+                            for (idx, src) in row.iter().enumerate() {
+                                full[idx] = evaluate_insert_source(src, &params)?;
+                            }
                         }
                     }
-                    realized.push(rr);
+                    realized.push(full);
                 }
                 let mut db = self.db.write();
-                let schema_name = table.schema.as_deref().unwrap_or("public");
                 let inserted = db
                     .insert_full_rows(schema_name, &table.name, realized)
                     .map_err(map_db_err)?;
@@ -624,6 +677,15 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_bool(expr, out);
             }
         }
+        Plan::InsertValues { rows, .. } => {
+            for row in rows {
+                for src in row {
+                    if let InsertSource::Expr(expr) = src {
+                        collect_param_hints_from_scalar(expr, out);
+                    }
+                }
+            }
+        }
         Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
@@ -633,8 +695,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::ShowVariable { .. }
-        | Plan::SetVariable { .. }
-        | Plan::InsertValues { .. } => {}
+        | Plan::SetVariable { .. } => {}
     }
 }
 
@@ -710,6 +771,15 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_bool(expr, out);
             }
         }
+        Plan::InsertValues { rows, .. } => {
+            for row in rows {
+                for src in row {
+                    if let InsertSource::Expr(expr) = src {
+                        collect_param_indexes_from_scalar(expr, out);
+                    }
+                }
+            }
+        }
         Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
@@ -719,8 +789,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::ShowVariable { .. }
-        | Plan::SetVariable { .. }
-        | Plan::InsertValues { .. } => {}
+        | Plan::SetVariable { .. } => {}
     }
 }
 
@@ -810,6 +879,16 @@ fn map_db_err(err: anyhow::Error) -> PgWireError {
         fe_code(sql.code, sql.message.clone())
     } else {
         fe(err.to_string())
+    }
+}
+
+fn evaluate_insert_source(src: &InsertSource, params: &[Value]) -> PgWireResult<CellInput> {
+    match src {
+        InsertSource::Default => Ok(CellInput::Default),
+        InsertSource::Expr(expr) => {
+            let value = eval_scalar_expr(&[], expr, params)?;
+            Ok(CellInput::Value(value))
+        }
     }
 }
 

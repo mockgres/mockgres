@@ -1,7 +1,6 @@
 use crate::engine::{
-    BoolExpr, CmpOp, DataType, Expr, Field, InsertSource, ObjName, Plan, ScalarBinaryOp,
-    ScalarExpr, ScalarFunc, ScalarUnaryOp, Schema, Selection, SortKey, UpdateSet, Value, fe,
-    fe_code,
+    BoolExpr, CmpOp, DataType, Field, InsertSource, ObjName, Plan, ScalarBinaryOp, ScalarExpr,
+    ScalarFunc, ScalarUnaryOp, Schema, Selection, SortKey, UpdateSet, Value, fe, fe_code,
 };
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, AlterTableType, ConstrType, ObjectType, VariableSetKind};
@@ -485,6 +484,7 @@ impl Planner {
                     },
                     name: rv.relname,
                 };
+                let insert_columns = parse_insert_columns(&ins.cols)?;
                 let sel = ins
                     .select_stmt
                     .and_then(|n| n.node)
@@ -500,28 +500,18 @@ impl Planner {
                     let mut row = Vec::new();
                     for cell in vlist.items {
                         let n = cell.node.unwrap();
-                        match n {
-                            NodeEnum::AConst(c) => {
-                                row.push(InsertSource::Expr(Expr::Literal(const_to_value(&c)?)))
-                            }
-                            NodeEnum::ColumnRef(cr) => {
-                                let name = last_colref_name(&cr)?;
-                                if name.eq_ignore_ascii_case("nan") {
-                                    row.push(InsertSource::Expr(Expr::Literal(Value::from_f64(
-                                        f64::NAN,
-                                    ))))
-                                } else {
-                                    return Err(fe("INSERT supports constants only"));
-                                }
-                            }
-                            NodeEnum::SetToDefault(_) => row.push(InsertSource::Default),
-                            _ => return Err(fe("INSERT supports constants only")),
+                        if matches!(n, NodeEnum::SetToDefault(_)) {
+                            row.push(InsertSource::Default);
+                        } else {
+                            let expr = parse_insert_value_expr(&n)?;
+                            row.push(InsertSource::Expr(expr));
                         }
                     }
                     all_rows.push(row);
                 }
                 Ok(Plan::InsertValues {
                     table,
+                    columns: insert_columns,
                     rows: all_rows,
                 })
             }
@@ -874,6 +864,71 @@ fn collect_columns_from_bool_expr(expr: &BoolExpr, out: &mut Vec<String>) {
         }
         BoolExpr::Not(inner) => collect_columns_from_bool_expr(inner, out),
         BoolExpr::IsNull { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+    }
+}
+
+fn parse_insert_columns(
+    cols: &[pg_query::Node],
+) -> pgwire::error::PgWireResult<Option<Vec<String>>> {
+    if cols.is_empty() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(cols.len());
+    for c in cols {
+        let node = c.node.as_ref().ok_or_else(|| fe("bad insert column"))?;
+        let name = match node {
+            NodeEnum::ResTarget(rt) => {
+                if !rt.name.is_empty() {
+                    rt.name.clone()
+                } else {
+                    extract_col_name(rt)?
+                }
+            }
+            NodeEnum::String(s) => s.sval.clone(),
+            _ => return Err(fe("bad insert column")),
+        };
+        if out.iter().any(|existing| existing == &name) {
+            return Err(fe(format!("duplicate insert column: {name}")));
+        }
+        out.push(name);
+    }
+    Ok(Some(out))
+}
+
+fn parse_insert_value_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<ScalarExpr> {
+    let expr = parse_scalar_expr(node)?;
+    sanitize_insert_expr(expr)
+}
+
+fn sanitize_insert_expr(expr: ScalarExpr) -> pgwire::error::PgWireResult<ScalarExpr> {
+    match expr {
+        ScalarExpr::Column(name) => {
+            if name.eq_ignore_ascii_case("nan") {
+                Ok(ScalarExpr::Literal(Value::from_f64(f64::NAN)))
+            } else {
+                Err(fe("INSERT expressions cannot reference columns"))
+            }
+        }
+        ScalarExpr::BinaryOp { op, left, right } => Ok(ScalarExpr::BinaryOp {
+            op,
+            left: Box::new(sanitize_insert_expr(*left)?),
+            right: Box::new(sanitize_insert_expr(*right)?),
+        }),
+        ScalarExpr::UnaryOp { op, expr } => Ok(ScalarExpr::UnaryOp {
+            op,
+            expr: Box::new(sanitize_insert_expr(*expr)?),
+        }),
+        ScalarExpr::Func { func, args } => {
+            let new_args = args
+                .into_iter()
+                .map(sanitize_insert_expr)
+                .collect::<pgwire::error::PgWireResult<Vec<_>>>()?;
+            Ok(ScalarExpr::Func {
+                func,
+                args: new_args,
+            })
+        }
+        other => Ok(other),
     }
 }
 
@@ -1275,9 +1330,26 @@ mod tests {
         let plan =
             Planner::plan_sql("insert into things values (DEFAULT, 1)").expect("plan insert");
         match plan {
-            Plan::InsertValues { rows, .. } => {
+            Plan::InsertValues { columns, rows, .. } => {
+                assert!(columns.is_none());
                 assert_eq!(rows.len(), 1);
                 assert!(matches!(rows[0][0], InsertSource::Default));
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_column_list_and_expressions_parse() {
+        let plan =
+            Planner::plan_sql("insert into gadgets (id, qty, note) values (1, 2 + 3, upper('hi'))")
+                .expect("plan insert");
+        match plan {
+            Plan::InsertValues { columns, rows, .. } => {
+                let cols = columns.expect("columns");
+                assert_eq!(cols, vec!["id", "qty", "note"]);
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(rows[0][2], InsertSource::Expr(_)));
             }
             other => panic!("unexpected plan: {other:?}"),
         }
