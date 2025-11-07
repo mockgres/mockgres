@@ -1,5 +1,5 @@
+use crate::engine::Column;
 use std::collections::HashMap;
-use crate::engine::{Column};
 
 pub type SchemaName = String;
 pub type TableName = String;

@@ -24,7 +24,10 @@ async fn default_nulls_last_for_asc_first_for_desc() {
         .query("select x from t order by 1 asc", &[])
         .await
         .expect("asc ok");
-    let asc_vals: Vec<Option<i32>> = asc_rows.iter().map(|r| r.get::<_, Option<i32>>(0)).collect();
+    let asc_vals: Vec<Option<i32>> = asc_rows
+        .iter()
+        .map(|r| r.get::<_, Option<i32>>(0))
+        .collect();
     assert_eq!(asc_vals, vec![Some(1), Some(2), None]);
 
     // desc: nulls first
@@ -33,7 +36,10 @@ async fn default_nulls_last_for_asc_first_for_desc() {
         .query("select x from t order by 1 desc", &[])
         .await
         .expect("desc ok");
-    let desc_vals: Vec<Option<i32>> = desc_rows.iter().map(|r| r.get::<_, Option<i32>>(0)).collect();
+    let desc_vals: Vec<Option<i32>> = desc_rows
+        .iter()
+        .map(|r| r.get::<_, Option<i32>>(0))
+        .collect();
     assert_eq!(desc_vals, vec![None, Some(2), Some(1)]);
 
     let _ = ctx.shutdown.send(());

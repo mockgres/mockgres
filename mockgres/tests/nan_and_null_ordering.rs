@@ -20,20 +20,27 @@ async fn nan_equality_and_comparison_via_filters() {
     // v = v should be true even for NaN with our postgres-like rule
     let rows: Vec<Row> = ctx
         .client
-        .query("select count(*)::int8 from t where v = v", &[])
+        .query("select v from t where v = v", &[])
         .await
-        .expect("count v=v");
-    let cnt_v_eq_v: i64 = rows[0].get(0);
-    assert_eq!(cnt_v_eq_v, 5);
+        .expect("select v=v");
+    assert_eq!(rows.len(), 5);
 
     // compare against a param in where (extended protocol)
+    let stmt = ctx
+        .client
+        .prepare("select v from t where v > $1")
+        .await
+        .expect("prepare with param");
     let rows: Vec<Row> = ctx
         .client
-        .query("select count(*)::int8 from t where v > $1", &[&123.0_f64])
+        .query(&stmt, &[&123.0_f64])
         .await
-        .expect("count v>param");
-    let cnt_gt: i64 = rows[0].get(0);
-    assert_eq!(cnt_gt, 2, "only the two NaNs are > 123.0");
+        .expect("v > param");
+    assert_eq!(rows.len(), 2, "only the two NaNs are > 123.0");
+    for row in rows {
+        let v: Option<f64> = row.get(0);
+        assert!(v.map(|x| x.is_nan()).unwrap_or(false));
+    }
 
     let _ = ctx.shutdown.send(());
 }
@@ -59,7 +66,10 @@ async fn order_by_with_nan_and_nulls_extended() {
         .query("select v from t order by 1 asc", &[])
         .await
         .expect("asc");
-    let asc_vals: Vec<Option<f64>> = asc_rows.iter().map(|r| r.get::<_, Option<f64>>(0)).collect();
+    let asc_vals: Vec<Option<f64>> = asc_rows
+        .iter()
+        .map(|r| r.get::<_, Option<f64>>(0))
+        .collect();
 
     assert!(asc_vals[0] == Some(1.0));
     assert!(asc_vals[1] == Some(2.0));
@@ -72,7 +82,10 @@ async fn order_by_with_nan_and_nulls_extended() {
         .query("select v from t order by 1 desc", &[])
         .await
         .expect("desc");
-    let desc_vals: Vec<Option<f64>> = desc_rows.iter().map(|r| r.get::<_, Option<f64>>(0)).collect();
+    let desc_vals: Vec<Option<f64>> = desc_rows
+        .iter()
+        .map(|r| r.get::<_, Option<f64>>(0))
+        .collect();
 
     assert!(desc_vals[0].is_none());
     assert!(desc_vals[1].map(|x| x.is_nan()).unwrap_or(false));

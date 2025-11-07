@@ -1,7 +1,9 @@
-use std::collections::HashMap;
-use crate::catalog::{Catalog, TableMeta, TableId};
-use crate::engine::{Column, DataType, Value};
+use crate::catalog::{Catalog, TableId, TableMeta};
+use crate::engine::{
+    BoolExpr, Column, DataType, ScalarExpr, Value, eval_bool_expr, eval_scalar_expr,
+};
 use crate::storage::{Row, RowKey, Table};
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub struct Db {
@@ -129,53 +131,7 @@ impl Db {
             // coerce and validate each cell to the target column type
             let mut out: Row = Vec::with_capacity(ncols);
             for (i, (val, col)) in r.into_iter().zip(meta.columns.iter()).enumerate() {
-                // handle nulls first
-                if let Value::Null = val {
-                    // not null?
-                    if !col.nullable {
-                        anyhow::bail!("column {} is not null", col.name);
-                    }
-                    // pk columns cannot be null
-                    if let Some(pkpos) = &meta.pk {
-                        if pkpos.contains(&i) {
-                            anyhow::bail!("primary key column {} cannot be null", col.name);
-                        }
-                    }
-                    out.push(Value::Null);
-                    continue;
-                }
-
-                let coerced = match (&col.data_type, val) {
-                    // int4: keep as i64, but enforce i32 range
-                    (DataType::Int4, Value::Int64(v)) => {
-                        if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                            anyhow::bail!(
-                                "value out of range for int4 at column {} (index {})",
-                                col.name,
-                                i
-                            );
-                        }
-                        Value::Int64(v)
-                    }
-                    // int8: require an int64 value
-                    (DataType::Int8, Value::Int64(v)) => Value::Int64(v),
-
-                    // float8: accept float or int (promote int -> float)
-                    (DataType::Float8, Value::Float64Bits(bits)) => Value::Float64Bits(bits),
-                    (DataType::Float8, Value::Int64(v)) => Value::from_f64(v as f64),
-
-                    // anything else is a mismatch for now (e.g., float into int)
-                    (dt, got) => {
-                        anyhow::bail!(
-                            "type mismatch at column {} (index {}): expected {:?}, got {:?}",
-                            col.name,
-                            i,
-                            dt,
-                            got
-                        )
-                    }
-                };
-
+                let coerced = coerce_value_for_column(val, col, i, meta)?;
                 out.push(coerced);
             }
 
@@ -227,4 +183,120 @@ impl Db {
             .collect();
         Ok((out_rows, cols))
     }
+
+    pub fn update_rows(
+        &mut self,
+        schema: &str,
+        name: &str,
+        sets: &[(usize, ScalarExpr)],
+        filter: Option<&BoolExpr>,
+        params: &[Value],
+    ) -> anyhow::Result<usize> {
+        let (meta, table) = self.resolve_table_mut(schema, name)?;
+        if sets.is_empty() {
+            return Ok(0);
+        }
+        if let Some(pkpos) = &meta.pk {
+            for (idx, _) in sets {
+                if pkpos.iter().any(|pos| pos == idx) {
+                    anyhow::bail!("updating primary key columns is not supported");
+                }
+            }
+        }
+        let mut count = 0usize;
+        for row in table.rows_by_key.values_mut() {
+            let passes = if let Some(expr) = filter {
+                eval_bool_expr(row, expr, params)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            if !passes {
+                continue;
+            }
+            let original = row.clone();
+            let mut updated = original.clone();
+            for (idx, expr) in sets {
+                let value = eval_scalar_expr(&original, expr, params)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, meta)?;
+                updated[*idx] = coerced;
+            }
+            *row = updated;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub fn delete_rows(
+        &mut self,
+        schema: &str,
+        name: &str,
+        filter: Option<&BoolExpr>,
+        params: &[Value],
+    ) -> anyhow::Result<usize> {
+        let (_meta, table) = self.resolve_table_mut(schema, name)?;
+        let mut to_remove = Vec::new();
+        if let Some(expr) = filter {
+            for (key, row) in table.rows_by_key.iter() {
+                let passes = eval_bool_expr(row, expr, params)
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .unwrap_or(false);
+                if passes {
+                    to_remove.push(key.clone());
+                }
+            }
+        } else {
+            to_remove.extend(table.rows_by_key.keys().cloned());
+        }
+        let count = to_remove.len();
+        for key in to_remove {
+            table.rows_by_key.remove(&key);
+        }
+        Ok(count)
+    }
+}
+
+fn coerce_value_for_column(
+    val: Value,
+    col: &Column,
+    idx: usize,
+    meta: &TableMeta,
+) -> anyhow::Result<Value> {
+    if let Value::Null = val {
+        if !col.nullable {
+            anyhow::bail!("column {} is not null", col.name);
+        }
+        if let Some(pkpos) = &meta.pk {
+            if pkpos.contains(&idx) {
+                anyhow::bail!("primary key column {} cannot be null", col.name);
+            }
+        }
+        return Ok(Value::Null);
+    }
+
+    let coerced = match (&col.data_type, val) {
+        (DataType::Int4, Value::Int64(v)) => {
+            if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                anyhow::bail!("value out of range for int4 at column {}", col.name);
+            }
+            Value::Int64(v)
+        }
+        (DataType::Int8, Value::Int64(v)) => Value::Int64(v),
+        (DataType::Float8, Value::Float64Bits(bits)) => Value::Float64Bits(bits),
+        (DataType::Float8, Value::Int64(v)) => Value::from_f64(v as f64),
+        (DataType::Text, Value::Text(s)) => Value::Text(s),
+        (DataType::Bool, Value::Bool(b)) => Value::Bool(b),
+        (dt, got) => {
+            anyhow::bail!(
+                "type mismatch at column {} (index {}): expected {:?}, got {:?}",
+                col.name,
+                idx,
+                dt,
+                got
+            )
+        }
+    };
+    Ok(coerced)
 }

@@ -44,15 +44,23 @@ pub async fn start() -> TestCtx {
         }
     });
 
-    TestCtx { client, _bg: conn_task, shutdown, addr }
+    TestCtx {
+        client,
+        _bg: conn_task,
+        shutdown,
+        addr,
+    }
 }
 
 // run a simple query and return the first cell as string
 pub async fn simple_first_cell(client: &Client, sql: &str) -> String {
     let msgs = client.simple_query(sql).await.expect("simple query");
-    let row = msgs.iter().find_map(|m| match m {
-        SimpleQueryMessage::Row(r) => Some(r),
-        _ => None,
-    }).expect("expected one row");
+    let row = msgs
+        .iter()
+        .find_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .expect("expected one row");
     row.get(0).expect("one column").to_string()
 }

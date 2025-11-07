@@ -1,7 +1,9 @@
-use crate::engine::{fe, FilterPred, SortKey};
-use crate::engine::{DataType, Expr, Field, ObjName, Plan, Schema, Selection, Value};
-use pg_query::protobuf::AConst;
+use crate::engine::{
+    BoolExpr, CmpOp, DataType, Expr, Field, ObjName, Plan, ScalarExpr, Schema, Selection, SortKey,
+    Value, fe,
+};
 use pg_query::protobuf::a_const::Val;
+use pg_query::protobuf::{AConst, ConstrType};
 use pg_query::{NodeEnum, parse};
 
 pub struct Planner;
@@ -67,6 +69,9 @@ impl Planner {
                             Value::Null => {
                                 // null has no inherent numeric type; bail in numeric-only contexts
                                 return Err(fe("null not allowed here"));
+                            }
+                            Value::Text(_) | Value::Bool(_) => {
+                                return Err(fe("only numeric literals supported here"));
                             }
                         };
                         // postgres uses "?column?" for unlabeled expressions
@@ -155,10 +160,14 @@ impl Planner {
                         return Err(fe("unexpected target type for single column"));
                     }
                 } else {
-                    // multiple columns, ie select a, b from 
+                    // multiple columns, ie select a, b from
                     let mut cols = Vec::new();
                     for t in sel.target_list {
-                        let node_enum = t.node.as_ref().map(|n| &*n).ok_or_else(|| fe("bad target"))?;
+                        let node_enum = t
+                            .node
+                            .as_ref()
+                            .map(|n| &*n)
+                            .ok_or_else(|| fe("bad target"))?;
                         if let NodeEnum::ResTarget(rt) = node_enum {
                             let col_name = if rt.name.is_empty() {
                                 extract_col_name(&rt)?
@@ -174,25 +183,26 @@ impl Planner {
                 };
 
                 // parse where predicate now so we can add missing column to selection if needed
-                let where_pred = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
-                    parse_where_predicate(w)?
-                } else { None };
+                let where_expr =
+                    if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+                        Some(parse_bool_expr(w)?)
+                    } else {
+                        None
+                    };
 
-                // remember how many columns the user explicitly requested
-                let requested_len = if let Selection::Columns(cols) = &selection {
-                    Some(cols.len())
-                } else {
-                    None
-                };
-
-                // if where uses a name not in selection and we're not doing star, include it
-                // and remember to project back to the original prefix afterwards
+                // if WHERE references columns not in the projection, add them and remember to
+                // project them away post-filter to keep user-visible schema intact.
                 let mut project_prefix_len: Option<usize> = None;
-                if let Some(FilterPred::ByName { col, .. }) = &where_pred {
-                    if let Selection::Columns(cols) = &mut selection {
-                        if !cols.iter().any(|c| c == col) {
-                            cols.push(col.clone());
-                            project_prefix_len = requested_len; // keep output shape as requested
+                if let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
+                    let requested_len = cols.len();
+                    let mut needed = Vec::new();
+                    collect_columns_from_bool_expr(expr, &mut needed);
+                    for name in needed {
+                        if !cols.iter().any(|c| c == &name) {
+                            if project_prefix_len.is_none() {
+                                project_prefix_len = Some(requested_len);
+                            }
+                            cols.push(name);
                         }
                     }
                 }
@@ -201,20 +211,30 @@ impl Planner {
                 let mut plan = Plan::UnboundSeqScan { table, selection };
 
                 // where
-                if let Some(pred) = where_pred {
-                    plan = Plan::Filter { input: Box::new(plan), pred, project_prefix_len };
+                if let Some(pred) = where_expr {
+                    plan = Plan::Filter {
+                        input: Box::new(plan),
+                        expr: pred,
+                        project_prefix_len,
+                    };
                 }
 
                 // order by: ordinals or column names
                 if !sel.sort_clause.is_empty() {
                     let keys = parse_order_clause(&sel.sort_clause)?;
-                    plan = Plan::Order { input: Box::new(plan), keys };
+                    plan = Plan::Order {
+                        input: Box::new(plan),
+                        keys,
+                    };
                 }
 
                 // limit: integer constant
                 if let Some(limit_node) = sel.limit_count.as_ref().and_then(|n| n.node.as_ref()) {
                     let lim = parse_limit_count(limit_node)?;
-                    plan = Plan::Limit { input: Box::new(plan), limit: lim };
+                    plan = Plan::Limit {
+                        input: Box::new(plan),
+                        limit: lim,
+                    };
                 }
 
                 Ok(plan)
@@ -243,13 +263,20 @@ impl Planner {
                             let nullable = !cd.is_not_null;
                             cols.push((cname, dt, nullable));
                             // simple “col PRIMARY KEY” handling
-                            if cd.constraints.iter().any(|c| matches!(c.node.as_ref(), Some(NodeEnum::Constraint(cons)) if cons.contype==1)) {
+                            if cd.constraints.iter().any(|c| {
+                                matches!(
+                                    c.node.as_ref(),
+                                    Some(NodeEnum::Constraint(cons))
+                                        if cons.contype
+                                            == ConstrType::ConstrPrimary as i32
+                                )
+                            }) {
                                 pk = Some(vec![cols.last().unwrap().0.clone()]);
                             }
                         }
                         NodeEnum::Constraint(cons) => {
                             // PRIMARY KEY (a,b)
-                            if cons.contype == 1 {
+                            if cons.contype == ConstrType::ConstrPrimary as i32 {
                                 let mut names = Vec::new();
                                 for n in cons.keys {
                                     let NodeEnum::String(s) = n.node.unwrap() else {
@@ -295,6 +322,14 @@ impl Planner {
                         let n = cell.node.unwrap();
                         match n {
                             NodeEnum::AConst(c) => row.push(Expr::Literal(const_to_value(&c)?)),
+                            NodeEnum::ColumnRef(cr) => {
+                                let name = last_colref_name(&cr)?;
+                                if name.eq_ignore_ascii_case("nan") {
+                                    row.push(Expr::Literal(Value::from_f64(f64::NAN)));
+                                } else {
+                                    return Err(fe("INSERT supports constants only"));
+                                }
+                            }
                             _ => return Err(fe("INSERT supports constants only")),
                         }
                     }
@@ -306,6 +341,72 @@ impl Planner {
                 })
             }
 
+            Some(NodeEnum::UpdateStmt(upd)) => {
+                let rv = upd.relation.ok_or_else(|| fe("missing target table"))?;
+                let table = ObjName {
+                    schema: if rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(rv.schemaname)
+                    },
+                    name: rv.relname,
+                };
+
+                let mut sets = Vec::new();
+                for tgt in upd.target_list {
+                    let NodeEnum::ResTarget(rt) = tgt.node.unwrap() else {
+                        return Err(fe("bad update target"));
+                    };
+                    let col_name = if !rt.name.is_empty() {
+                        rt.name.clone()
+                    } else {
+                        extract_col_name(&rt)?
+                    };
+                    let expr_node = rt
+                        .val
+                        .as_ref()
+                        .and_then(|n| n.node.as_ref())
+                        .ok_or_else(|| fe("missing update value"))?;
+                    let expr = parse_scalar_expr(expr_node)?;
+                    sets.push(crate::engine::UpdateSet::ByName(col_name, expr));
+                }
+                if sets.is_empty() {
+                    return Err(fe("UPDATE requires SET clauses"));
+                }
+
+                let filter =
+                    if let Some(w) = upd.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+                        Some(parse_bool_expr(w)?)
+                    } else {
+                        None
+                    };
+
+                Ok(Plan::Update {
+                    table,
+                    sets,
+                    filter,
+                })
+            }
+
+            Some(NodeEnum::DeleteStmt(del)) => {
+                let rv = del.relation.ok_or_else(|| fe("missing target table"))?;
+                let table = ObjName {
+                    schema: if rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(rv.schemaname)
+                    },
+                    name: rv.relname,
+                };
+                let filter =
+                    if let Some(w) = del.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+                        Some(parse_bool_expr(w)?)
+                    } else {
+                        None
+                    };
+                Ok(Plan::Delete { table, filter })
+            }
+
             _ => Err(fe("unsupported statement")),
         }
     }
@@ -315,46 +416,177 @@ fn plan_schema(p: &Plan) -> pgwire::error::PgWireResult<Schema> {
     Ok(p.schema().clone())
 }
 
-// parse a where predicate supporting "col <op> const" only
-fn parse_where_predicate(node: &NodeEnum) -> pgwire::error::PgWireResult<Option<FilterPred>> {
-    use crate::engine::CmpOp;
-    if let NodeEnum::AExpr(ax) = node {
-        // parse operator text
-        let mut op_txt = None;
-        for n in &ax.name {
-            if let Some(NodeEnum::String(s)) = n.node.as_ref() {
-                op_txt = Some(s.sval.as_str());
-                break;
+fn parse_bool_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<BoolExpr> {
+    use pg_query::protobuf::{BoolExprType, NullTestType};
+    match node {
+        NodeEnum::BoolExpr(be) => {
+            let op = BoolExprType::from_i32(be.boolop).ok_or_else(|| fe("bad bool expr op"))?;
+            let mut args = Vec::new();
+            for a in &be.args {
+                let n = a.node.as_ref().ok_or_else(|| fe("bad bool arg"))?;
+                args.push(parse_bool_expr(n)?);
+            }
+            match op {
+                BoolExprType::AndExpr => Ok(BoolExpr::And(args)),
+                BoolExprType::OrExpr => Ok(BoolExpr::Or(args)),
+                BoolExprType::NotExpr => {
+                    if args.len() != 1 {
+                        return Err(fe("NOT expects single operand"));
+                    }
+                    Ok(BoolExpr::Not(Box::new(args.into_iter().next().unwrap())))
+                }
+                BoolExprType::Undefined => Err(fe("unsupported bool op")),
             }
         }
-        let op = match op_txt.unwrap_or("") {
-            "="  => CmpOp::Eq,
-            "!=" => CmpOp::Neq,
-            "<>" => CmpOp::Neq,
-            "<"  => CmpOp::Lt,
-            "<=" => CmpOp::Lte,
-            ">"  => CmpOp::Gt,
-            ">=" => CmpOp::Gte,
-            _ => return Err(fe("unsupported where operator")),
-        };
-
-        // expect left is column, right is const
-        let lexpr = ax.lexpr.as_ref().and_then(|n| n.node.as_ref())
-            .ok_or_else(|| fe("bad where aexpr"))?;
-        let rexpr = ax.rexpr.as_ref().and_then(|n| n.node.as_ref())
-            .ok_or_else(|| fe("bad where aexpr"))?;
-
-        let col_name = match lexpr {
-            NodeEnum::ColumnRef(cr) => last_colref_name(cr)?,
-            _ => return Err(fe("where must be column op const")),
-        };
-        let rhs = match rexpr {
-            NodeEnum::AConst(c) => const_to_value(c)?,
-            _ => return Err(fe("where rhs must be const")),
-        };
-        return Ok(Some(FilterPred::ByName { col: col_name, op, rhs }));
+        NodeEnum::AExpr(ax) => {
+            if ax.name.is_empty() {
+                if let Some(inner) = ax.lexpr.as_ref().and_then(|n| n.node.as_ref()) {
+                    return parse_bool_expr(inner);
+                }
+                return Err(fe("bad parenthesized expression"));
+            }
+            let op = parse_cmp_op(&ax.name)?;
+            let lexpr = ax
+                .lexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad where lhs"))?;
+            let rexpr = ax
+                .rexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad where rhs"))?;
+            let lhs = parse_scalar_expr(lexpr)?;
+            let rhs = parse_scalar_expr(rexpr)?;
+            Ok(BoolExpr::Comparison { lhs, op, rhs })
+        }
+        NodeEnum::NullTest(nt) => {
+            let nt_type =
+                NullTestType::from_i32(nt.nulltesttype).ok_or_else(|| fe("bad nulltest"))?;
+            let arg = nt
+                .arg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad nulltest arg"))?;
+            let expr = parse_scalar_expr(arg)?;
+            Ok(BoolExpr::IsNull {
+                expr,
+                negated: matches!(nt_type, NullTestType::IsNotNull),
+            })
+        }
+        NodeEnum::AConst(c) => match const_to_value(c)? {
+            Value::Bool(b) => Ok(BoolExpr::Literal(b)),
+            _ => Err(fe("boolean literal expected")),
+        },
+        NodeEnum::ColumnRef(_) => {
+            let col = parse_scalar_expr(node)?;
+            Ok(BoolExpr::Comparison {
+                lhs: col,
+                op: CmpOp::Eq,
+                rhs: ScalarExpr::Literal(Value::Bool(true)),
+            })
+        }
+        _ => Err(fe("unsupported WHERE expression")),
     }
-    Ok(None)
+}
+
+fn parse_cmp_op(nodes: &[pg_query::protobuf::Node]) -> pgwire::error::PgWireResult<CmpOp> {
+    for n in nodes {
+        if let Some(NodeEnum::String(s)) = n.node.as_ref() {
+            return Ok(match s.sval.as_str() {
+                "=" => CmpOp::Eq,
+                "!=" | "<>" => CmpOp::Neq,
+                "<" => CmpOp::Lt,
+                "<=" => CmpOp::Lte,
+                ">" => CmpOp::Gt,
+                ">=" => CmpOp::Gte,
+                other => return Err(fe(format!("unsupported where operator: {other}"))),
+            });
+        }
+    }
+    Err(fe("missing operator"))
+}
+
+fn parse_scalar_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<ScalarExpr> {
+    match node {
+        NodeEnum::ColumnRef(cr) => Ok(ScalarExpr::Column(last_colref_name(cr)?)),
+        NodeEnum::ParamRef(pr) => {
+            if pr.number <= 0 {
+                return Err(fe("parameter numbers start at 1"));
+            }
+            Ok(ScalarExpr::Param {
+                idx: (pr.number as usize) - 1,
+                ty: None,
+            })
+        }
+        _ => {
+            if let Some(v) = try_parse_literal(node)? {
+                Ok(ScalarExpr::Literal(v))
+            } else {
+                Err(fe("unsupported scalar expression"))
+            }
+        }
+    }
+}
+
+fn try_parse_literal(node: &NodeEnum) -> pgwire::error::PgWireResult<Option<Value>> {
+    match node {
+        NodeEnum::AConst(c) => Ok(Some(const_to_value(c)?)),
+        NodeEnum::AExpr(ax) => {
+            let is_minus = ax.name.iter().any(|nn| {
+                matches!(
+                    nn.node.as_ref(),
+                    Some(NodeEnum::String(s)) if s.sval == "-"
+                )
+            });
+            if is_minus {
+                let rhs = ax
+                    .rexpr
+                    .as_ref()
+                    .and_then(|n| n.node.as_ref())
+                    .ok_or_else(|| fe("bad unary minus"))?;
+                match rhs {
+                    NodeEnum::AConst(c) => match const_to_value(c)? {
+                        Value::Int64(i) => Ok(Some(Value::Int64(-i))),
+                        Value::Float64Bits(b) => Ok(Some(Value::from_f64(-f64::from_bits(b)))),
+                        Value::Null => Err(fe("minus over null")),
+                        Value::Text(_) | Value::Bool(_) => {
+                            Err(fe("minus over non-numeric literal"))
+                        }
+                    },
+                    _ => Err(fe("minus over non-const")),
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn collect_columns_from_bool_expr(expr: &BoolExpr, out: &mut Vec<String>) {
+    match expr {
+        BoolExpr::Literal(_) => {}
+        BoolExpr::Comparison { lhs, rhs, .. } => {
+            collect_columns_from_scalar_expr(lhs, out);
+            collect_columns_from_scalar_expr(rhs, out);
+        }
+        BoolExpr::And(parts) | BoolExpr::Or(parts) => {
+            for p in parts {
+                collect_columns_from_bool_expr(p, out);
+            }
+        }
+        BoolExpr::Not(inner) => collect_columns_from_bool_expr(inner, out),
+        BoolExpr::IsNull { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+    }
+}
+
+fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
+    if let ScalarExpr::Column(name) = expr {
+        if !out.iter().any(|c| c == name) {
+            out.push(name.clone());
+        }
+    }
 }
 
 // get last identifier from a columnref
@@ -367,10 +599,14 @@ fn last_colref_name(cr: &pg_query::protobuf::ColumnRef) -> pgwire::error::PgWire
     Err(fe("bad columnref"))
 }
 
-fn parse_order_clause(items: &Vec<pg_query::protobuf::Node>) -> pgwire::error::PgWireResult<Vec<SortKey>> {
+fn parse_order_clause(
+    items: &Vec<pg_query::protobuf::Node>,
+) -> pgwire::error::PgWireResult<Vec<SortKey>> {
     let mut keys = Vec::new();
     for sb in items {
-        let Some(NodeEnum::SortBy(s)) = sb.node.as_ref() else { return Err(fe("bad order by")); };
+        let Some(NodeEnum::SortBy(s)) = sb.node.as_ref() else {
+            return Err(fe("bad order by"));
+        };
 
         // matching on the SortByDir enum https://github.com/postgres/postgres/blob/master/src/include/nodes/parsenodes.h
         // pg_query shifts enum values up by 1, so 1 is default, 2 is asc, 3 is desc
@@ -387,19 +623,33 @@ fn parse_order_clause(items: &Vec<pg_query::protobuf::Node>) -> pgwire::error::P
             _ => None, // default resolved later: asc => last, desc => first
         };
 
-        let Some(expr) = s.node.as_ref().and_then(|n| n.node.as_ref()) else { return Err(fe("bad order by expr")); };
+        let Some(expr) = s.node.as_ref().and_then(|n| n.node.as_ref()) else {
+            return Err(fe("bad order by expr"));
+        };
         let key = match expr {
             // order by 1
             NodeEnum::AConst(ac) => {
                 if let Some(Val::Ival(iv)) = ac.val.as_ref() {
-                    if iv.ival <= 0 { return Err(fe("order by position must be >= 1")); }
-                    SortKey::ByIndex { idx: (iv.ival as usize) - 1, asc, nulls_first }
-                } else { return Err(fe("order by const must be integer")); }
+                    if iv.ival <= 0 {
+                        return Err(fe("order by position must be >= 1"));
+                    }
+                    SortKey::ByIndex {
+                        idx: (iv.ival as usize) - 1,
+                        asc,
+                        nulls_first,
+                    }
+                } else {
+                    return Err(fe("order by const must be integer"));
+                }
             }
             // order by column
             NodeEnum::ColumnRef(cr) => {
                 let name = last_colref_name(cr)?;
-                SortKey::ByName { col: name, asc, nulls_first }
+                SortKey::ByName {
+                    col: name,
+                    asc,
+                    nulls_first,
+                }
             }
             _ => return Err(fe("unsupported order by expression")),
         };
@@ -412,7 +662,9 @@ fn parse_limit_count(node: &NodeEnum) -> pgwire::error::PgWireResult<usize> {
     match node {
         NodeEnum::AConst(c) => {
             if let Some(Val::Ival(iv)) = c.val.as_ref() {
-                if iv.ival < 0 { return Err(fe("limit must be non-negative")); }
+                if iv.ival < 0 {
+                    return Err(fe("limit must be non-negative"));
+                }
                 Ok(iv.ival as usize)
             } else {
                 Err(fe("limit must be integer"))
@@ -421,7 +673,6 @@ fn parse_limit_count(node: &NodeEnum) -> pgwire::error::PgWireResult<usize> {
         _ => Err(fe("unsupported limit expression")),
     }
 }
-
 
 fn extract_col_name(rt: &pg_query::protobuf::ResTarget) -> pgwire::error::PgWireResult<String> {
     // SELECT a FROM t  (val is ColumnRef)
@@ -451,6 +702,7 @@ fn parse_numeric_const(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
             match v {
                 Value::Int64(_) | Value::Float64Bits(_) => Ok(v),
                 Value::Null => Err(fe("null not allowed in numeric const")),
+                Value::Text(_) | Value::Bool(_) => Err(fe("numeric const expected")),
             }
         }
         NodeEnum::AExpr(ax) => {
@@ -472,6 +724,7 @@ fn parse_numeric_const(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
                     Value::Int64(i) => Ok(Value::Int64(-i)),
                     Value::Float64Bits(b) => Ok(Value::from_f64(-f64::from_bits(b))),
                     Value::Null => Err(fe("minus over null")),
+                    Value::Text(_) | Value::Bool(_) => Err(fe("numeric const expected")),
                 },
                 _ => Err(fe("minus over non-const")),
             }
@@ -493,8 +746,8 @@ fn const_to_value(c: &AConst) -> pgwire::error::PgWireResult<Value> {
                 pgwire::error::PgWireError::ApiError(Box::new(e))
             })?))
         }
-        Val::Boolval(_) => Err(fe("bool const not yet supported")),
-        Val::Sval(_) => Err(fe("string const not yet supported")),
+        Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
+        Val::Sval(s) => Ok(Value::Text(s.sval.clone())),
         Val::Bsval(_) => Err(fe("bitstring const not yet supported")),
     }
 }
@@ -504,9 +757,19 @@ fn map_type(cd: &pg_query::protobuf::ColumnDef) -> pgwire::error::PgWireResult<D
     let typ = cd.type_name.as_ref().ok_or_else(|| fe("missing type"))?;
 
     // collect tokens, keeping only string components, lowercased
-    let tokens: Vec<String> = typ.names.iter().filter_map(|n| {
-        n.node.as_ref().and_then(|nn| if let NodeEnum::String(s) = nn { Some(s.sval.to_ascii_lowercase()) } else { None })
-    }).collect();
+    let tokens: Vec<String> = typ
+        .names
+        .iter()
+        .filter_map(|n| {
+            n.node.as_ref().and_then(|nn| {
+                if let NodeEnum::String(s) = nn {
+                    Some(s.sval.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
 
     if tokens.is_empty() {
         return Err(fe("bad type name"));
@@ -515,16 +778,25 @@ fn map_type(cd: &pg_query::protobuf::ColumnDef) -> pgwire::error::PgWireResult<D
     // handle multi-word names like "double precision"
     let last = tokens.last().unwrap().as_str();
     let last_two = if tokens.len() >= 2 {
-        Some(format!("{} {}", tokens[tokens.len()-2], tokens[tokens.len()-1]))
-    } else { None };
+        Some(format!(
+            "{} {}",
+            tokens[tokens.len() - 2],
+            tokens[tokens.len() - 1]
+        ))
+    } else {
+        None
+    };
 
     let dt = if last_two.as_deref() == Some("double precision") {
         DataType::Float8
     } else {
         match last {
             "int" | "int4" | "integer" => DataType::Int4,
-            "bigint" | "int8"          => DataType::Int8,
-            "float8" | "double"        => DataType::Float8,
+            "bigint" | "int8" => DataType::Int8,
+            "float8" | "double" => DataType::Float8,
+            "text" => DataType::Text,
+            "varchar" => DataType::Text,
+            "bool" | "boolean" => DataType::Bool,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
     };
