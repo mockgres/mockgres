@@ -21,13 +21,14 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::binder::bind;
-use crate::db::Db;
+use crate::db::{CellInput, Db};
 use crate::engine::{
-    BoolExpr, DataType, ExecNode, Expr, FilterExec, LimitExec, OrderExec, Plan, ScalarExpr, Schema,
-    SeqScanExec, SortKey, UpdateSet, Value, fe, to_pgwire_stream,
+    BoolExpr, DataType, ExecNode, Expr, FilterExec, InsertSource, LimitExec, OrderExec, Plan,
+    ScalarExpr, Schema, SeqScanExec, SortKey, UpdateSet, Value, fe, to_pgwire_stream,
 };
 use crate::engine::{ProjectExec, ValuesExec};
 use crate::parser::Planner;
+use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 
 #[derive(Clone)]
 pub struct Mockgres {
@@ -61,6 +62,7 @@ impl Mockgres {
             | Plan::Limit { .. } => "SELECT 0",
 
             Plan::CreateTable { .. } => "CREATE TABLE",
+            Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
             Plan::InsertValues { .. } => "INSERT 0",
             Plan::Update { .. } => "UPDATE 0",
             Plan::Delete { .. } => "DELETE 0",
@@ -210,6 +212,45 @@ impl Mockgres {
                 ))
             }
 
+            Plan::AlterTableAddColumn {
+                table,
+                column,
+                if_not_exists,
+            } => {
+                let mut db = self.db.write();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                db.alter_table_add_column(
+                    schema_name,
+                    &table.name,
+                    column.clone(),
+                    *if_not_exists,
+                )
+                .map_err(|e| fe(e.to_string()))?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("ALTER TABLE".into()),
+                    None,
+                ))
+            }
+
+            Plan::AlterTableDropColumn {
+                table,
+                column,
+                if_exists,
+            } => {
+                let mut db = self.db.write();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                db.alter_table_drop_column(schema_name, &table.name, column, *if_exists)
+                    .map_err(|e| fe(e.to_string()))?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("ALTER TABLE".into()),
+                    None,
+                ))
+            }
+
             Plan::InsertValues { table, rows } => {
                 // realize constants only
                 let mut realized = Vec::with_capacity(rows.len());
@@ -217,7 +258,10 @@ impl Mockgres {
                     let mut rr = Vec::with_capacity(r.len());
                     for e in r {
                         match e {
-                            Expr::Literal(v) => rr.push(v.clone()),
+                            InsertSource::Expr(Expr::Literal(v)) => {
+                                rr.push(CellInput::Value(v.clone()))
+                            }
+                            InsertSource::Default => rr.push(CellInput::Default),
                             _ => return Err(fe("insert supports constants only")),
                         }
                     }
@@ -244,8 +288,8 @@ impl Mockgres {
                 let assignments = sets
                     .iter()
                     .map(|set| match set {
-                        crate::engine::UpdateSet::ByIndex(idx, expr) => Ok((*idx, expr.clone())),
-                        crate::engine::UpdateSet::ByName(name, _) => {
+                        UpdateSet::ByIndex(idx, expr) => Ok((*idx, expr.clone())),
+                        UpdateSet::ByName(name, _) => {
                             Err(fe(format!("unbound assignment target: {name}")))
                         }
                     })
@@ -516,6 +560,8 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }
+        | Plan::AlterTableAddColumn { .. }
+        | Plan::AlterTableDropColumn { .. }
         | Plan::InsertValues { .. } => {}
     }
 }
@@ -579,6 +625,8 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }
+        | Plan::AlterTableAddColumn { .. }
+        | Plan::AlterTableDropColumn { .. }
         | Plan::InsertValues { .. } => {}
     }
 }
@@ -623,6 +671,9 @@ fn map_pg_type_to_datatype(t: &Type) -> Option<DataType> {
         Type::FLOAT8 => Some(DataType::Float8),
         Type::TEXT | Type::VARCHAR => Some(DataType::Text),
         Type::BOOL => Some(DataType::Bool),
+        Type::DATE => Some(DataType::Date),
+        Type::TIMESTAMP => Some(DataType::Timestamp),
+        Type::BYTEA => Some(DataType::Bytea),
         _ => None,
     }
 }
@@ -634,6 +685,9 @@ fn map_datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Float8 => Type::FLOAT8,
         DataType::Text => Type::TEXT,
         DataType::Bool => Type::BOOL,
+        DataType::Date => Type::DATE,
+        DataType::Timestamp => Type::TIMESTAMP,
+        DataType::Bytea => Type::BYTEA,
     }
 }
 
@@ -695,6 +749,18 @@ fn parse_text_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
                 other => Err(fe(format!("bad bool param: {other}"))),
             }
         }
+        DataType::Date => {
+            let days = parse_date_str(s).map_err(|e| fe(e))?;
+            Ok(Value::Date(days))
+        }
+        DataType::Timestamp => {
+            let micros = parse_timestamp_str(s).map_err(|e| fe(e))?;
+            Ok(Value::TimestampMicros(micros))
+        }
+        DataType::Bytea => {
+            let bytes = parse_bytea_text(s).map_err(|e| fe(e))?;
+            Ok(Value::Bytes(bytes))
+        }
     }
 }
 
@@ -728,6 +794,10 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))
+        }
+        DataType::Bytea => Ok(Value::Bytes(bytes.to_vec())),
+        DataType::Date | DataType::Timestamp => {
+            Err(fe("binary parameters for date/timestamp not supported"))
         }
     }
 }

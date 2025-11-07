@@ -1,0 +1,139 @@
+mod common;
+
+use chrono::{NaiveDate, NaiveDateTime};
+use tokio_postgres::Row;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn date_timestamp_bytea_roundtrip() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute(
+            "create table events(
+                id int primary key,
+                occurred date default '2024-01-01',
+                created_at timestamp default '2024-01-01 12:00:00',
+                payload bytea,
+                note text default 'n/a'
+            )",
+            &[],
+        )
+        .await
+        .expect("create events");
+
+    ctx.client
+        .execute(
+            "insert into events values (1, '2023-12-31', '2023-12-31 23:59:00', '\\x616263', 'first')",
+            &[],
+        )
+        .await
+        .expect("insert explicit");
+
+    ctx.client
+        .execute(
+            "insert into events values (2, DEFAULT, DEFAULT, '\\x646566', DEFAULT)",
+            &[],
+        )
+        .await
+        .expect("insert defaults");
+
+    let rows: Vec<Row> = ctx
+        .client
+        .query(
+            "select id, occurred, created_at, payload, note from events order by id",
+            &[],
+        )
+        .await
+        .expect("select events");
+
+    assert_eq!(rows.len(), 2);
+    let first_date: NaiveDate = rows[0].get(1);
+    let first_ts: NaiveDateTime = rows[0].get(2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(first_date.to_string(), "2023-12-31");
+    assert_eq!(first_ts.to_string(), "2023-12-31 23:59:00");
+    assert_eq!(rows[0].get::<_, Vec<u8>>(3), b"abc");
+    assert_eq!(rows[0].get::<_, String>(4), "first");
+
+    let second_date: NaiveDate = rows[1].get(1);
+    let second_ts: NaiveDateTime = rows[1].get(2);
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+    assert_eq!(second_date.to_string(), "2024-01-01");
+    assert_eq!(second_ts.to_string(), "2024-01-01 12:00:00");
+    assert_eq!(rows[1].get::<_, Vec<u8>>(3), b"def");
+    assert_eq!(rows[1].get::<_, String>(4), "n/a");
+
+    let stmt = ctx
+        .client
+        .prepare("insert into events values ($1, $2, $3, $4, $5)")
+        .await
+        .expect("prepare");
+    ctx.client
+        .execute(
+            &stmt,
+            &[
+                &3,
+                &"2024-05-05",
+                &"2024-05-05 05:05:05",
+                &"\\x313233",
+                &"param",
+            ],
+        )
+        .await
+        .expect("insert via params");
+
+    let row = ctx
+        .client
+        .query_one(
+            "select occurred, created_at, payload from events where id = 3",
+            &[],
+        )
+        .await
+        .expect("select param row");
+    let occurred: NaiveDate = row.get(0);
+    let created: NaiveDateTime = row.get(1);
+    assert_eq!(occurred.to_string(), "2024-05-05");
+    assert_eq!(created.to_string(), "2024-05-05 05:05:05");
+    assert_eq!(row.get::<_, Vec<u8>>(2), b"123");
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_default_keyword() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute(
+            "create table defaults_demo(
+                id int primary key,
+                description text not null default 'pending',
+                active bool not null default true
+            )",
+            &[],
+        )
+        .await
+        .expect("create defaults table");
+
+    ctx.client
+        .execute(
+            "insert into defaults_demo values (1, DEFAULT, DEFAULT)",
+            &[],
+        )
+        .await
+        .expect("insert default row");
+
+    let row = ctx
+        .client
+        .query_one(
+            "select description, active from defaults_demo where id = 1",
+            &[],
+        )
+        .await
+        .expect("select defaults");
+    let desc: Option<String> = row.get(0);
+    assert_eq!(desc.as_deref(), Some("pending"));
+    assert!(row.get::<_, bool>(1));
+
+    let _ = ctx.shutdown.send(());
+}

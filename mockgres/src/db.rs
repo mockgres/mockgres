@@ -3,7 +3,14 @@ use crate::engine::{
     BoolExpr, Column, DataType, ScalarExpr, Value, eval_bool_expr, eval_scalar_expr,
 };
 use crate::storage::{Row, RowKey, Table};
+use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 use std::collections::HashMap;
+
+#[derive(Clone, Debug)]
+pub enum CellInput {
+    Value(Value),
+    Default,
+}
 
 #[derive(Debug)]
 pub struct Db {
@@ -29,7 +36,7 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        cols: Vec<(String, DataType, bool)>,
+        cols: Vec<(String, DataType, bool, Option<Value>)>,
         pk_names: Option<Vec<String>>,
     ) -> anyhow::Result<TableId> {
         self.catalog.ensure_schema(schema);
@@ -40,14 +47,24 @@ impl Db {
         let id = self.next_tid;
         self.next_tid += 1;
 
-        let columns: Vec<Column> = cols
-            .into_iter()
-            .map(|(n, t, nullable)| Column {
+        let mut columns: Vec<Column> = Vec::with_capacity(cols.len());
+        for (n, t, nullable, default_raw) in cols.into_iter() {
+            let mut default_value = None;
+            if let Some(def) = default_raw {
+                let cast =
+                    cast_value_to_type(def, &t).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                if matches!(cast, Value::Null) && !nullable {
+                    anyhow::bail!("default NULL not allowed for NOT NULL column {}", n);
+                }
+                default_value = Some(cast);
+            }
+            columns.push(Column {
                 name: n,
                 data_type: t,
                 nullable,
-            })
-            .collect();
+                default: default_value,
+            });
+        }
 
         // map pk names -> positions
         let pk: Option<Vec<usize>> = match pk_names {
@@ -84,6 +101,122 @@ impl Db {
         Ok(id)
     }
 
+    pub fn alter_table_add_column(
+        &mut self,
+        schema: &str,
+        name: &str,
+        column: (String, DataType, bool, Option<Value>),
+        if_not_exists: bool,
+    ) -> anyhow::Result<()> {
+        let (col_name, data_type, nullable, default_raw) = column;
+        let mut default_value = None;
+        if let Some(def) = default_raw {
+            let cast =
+                cast_value_to_type(def, &data_type).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            if matches!(cast, Value::Null) && !nullable {
+                anyhow::bail!("default NULL not allowed for NOT NULL column {}", col_name);
+            }
+            default_value = Some(cast);
+        } else if !nullable {
+            anyhow::bail!("column {} must have a default or allow NULLs", col_name);
+        }
+        let (table_id, column_exists) = {
+            let meta = self
+                .catalog
+                .get_table(schema, name)
+                .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+            let exists = meta.columns.iter().any(|c| c.name == col_name);
+            (meta.id, exists)
+        };
+        if column_exists {
+            if if_not_exists {
+                return Ok(());
+            }
+            anyhow::bail!("column {} already exists", col_name);
+        }
+        let append_value = default_value.clone().unwrap_or(Value::Null);
+        {
+            let table = self
+                .tables
+                .get_mut(&table_id)
+                .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", table_id))?;
+            for row in table.rows_by_key.values_mut() {
+                row.push(append_value.clone());
+            }
+        }
+        let schema_entry = self
+            .catalog
+            .schemas
+            .get_mut(schema)
+            .ok_or_else(|| anyhow::anyhow!("no such schema {schema}"))?;
+        let table_meta = schema_entry
+            .tables
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+        table_meta.columns.push(Column {
+            name: col_name,
+            data_type,
+            nullable,
+            default: default_value,
+        });
+        Ok(())
+    }
+
+    pub fn alter_table_drop_column(
+        &mut self,
+        schema: &str,
+        name: &str,
+        column: &str,
+        if_exists: bool,
+    ) -> anyhow::Result<()> {
+        let (table_id, drop_idx) = {
+            let meta = self
+                .catalog
+                .get_table(schema, name)
+                .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+            let Some(idx) = meta.columns.iter().position(|c| c.name == column) else {
+                if if_exists {
+                    return Ok(());
+                } else {
+                    anyhow::bail!("column {} does not exist", column);
+                }
+            };
+            if idx != meta.columns.len() - 1 {
+                anyhow::bail!("can only drop the last column ({} is at position {})", column, idx);
+            }
+            if meta
+                .pk
+                .as_ref()
+                .map(|pk| pk.contains(&idx))
+                .unwrap_or(false)
+            {
+                anyhow::bail!("cannot drop primary key column {}", column);
+            }
+            (meta.id, idx)
+        };
+        if let Some(table) = self.tables.get_mut(&table_id) {
+            for row in table.rows_by_key.values_mut() {
+                if row.len() != drop_idx + 1 {
+                    anyhow::bail!("row length mismatch while dropping column {}", column);
+                }
+                row.pop();
+            }
+        } else {
+            anyhow::bail!("missing storage for table id {}", table_id);
+        }
+        let schema_entry = self
+            .catalog
+            .schemas
+            .get_mut(schema)
+            .ok_or_else(|| anyhow::anyhow!("no such schema {schema}"))?;
+        let table_meta = schema_entry
+            .tables
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+        table_meta.columns.pop();
+        Ok(())
+    }
+
     pub fn resolve_table(&self, schema: &str, name: &str) -> anyhow::Result<&TableMeta> {
         self.catalog
             .get_table(schema, name)
@@ -111,7 +244,7 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        mut rows: Vec<Row>,
+        mut rows: Vec<Vec<CellInput>>,
     ) -> anyhow::Result<usize> {
         let (meta, tab) = self.resolve_table_mut(schema, name)?;
         let ncols = meta.columns.len();
@@ -130,8 +263,13 @@ impl Db {
 
             // coerce and validate each cell to the target column type
             let mut out: Row = Vec::with_capacity(ncols);
-            for (i, (val, col)) in r.into_iter().zip(meta.columns.iter()).enumerate() {
-                let coerced = coerce_value_for_column(val, col, i, meta)?;
+            for (i, cell) in r.into_iter().enumerate() {
+                let col = &meta.columns[i];
+                let value = match cell {
+                    CellInput::Value(v) => v,
+                    CellInput::Default => col.default.clone().unwrap_or(Value::Null),
+                };
+                let coerced = coerce_value_for_column(value, col, i, meta)?;
                 out.push(coerced);
             }
 
@@ -275,28 +413,45 @@ fn coerce_value_for_column(
         }
         return Ok(Value::Null);
     }
+    let coerced = cast_value_to_type(val, &col.data_type)
+        .map_err(|e| anyhow::anyhow!("column {} (index {}): {}", col.name, idx, e))?;
+    Ok(coerced)
+}
 
-    let coerced = match (&col.data_type, val) {
+fn cast_value_to_type(val: Value, target: &DataType) -> anyhow::Result<Value> {
+    match (target, val) {
         (DataType::Int4, Value::Int64(v)) => {
             if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                anyhow::bail!("value out of range for int4 at column {}", col.name);
+                anyhow::bail!("value out of range for int4");
             }
-            Value::Int64(v)
+            Ok(Value::Int64(v))
         }
-        (DataType::Int8, Value::Int64(v)) => Value::Int64(v),
-        (DataType::Float8, Value::Float64Bits(bits)) => Value::Float64Bits(bits),
-        (DataType::Float8, Value::Int64(v)) => Value::from_f64(v as f64),
-        (DataType::Text, Value::Text(s)) => Value::Text(s),
-        (DataType::Bool, Value::Bool(b)) => Value::Bool(b),
-        (dt, got) => {
-            anyhow::bail!(
-                "type mismatch at column {} (index {}): expected {:?}, got {:?}",
-                col.name,
-                idx,
-                dt,
-                got
-            )
+        (DataType::Int8, Value::Int64(v)) => Ok(Value::Int64(v)),
+        (DataType::Float8, Value::Float64Bits(bits)) => Ok(Value::Float64Bits(bits)),
+        (DataType::Float8, Value::Int64(v)) => Ok(Value::from_f64(v as f64)),
+        (DataType::Text, Value::Text(s)) => Ok(Value::Text(s)),
+        (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),
+        (DataType::Date, Value::Date(d)) => Ok(Value::Date(d)),
+        (DataType::Date, Value::Text(s)) => {
+            let days = parse_date_str(&s).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Value::Date(days))
         }
-    };
-    Ok(coerced)
+        (DataType::Timestamp, Value::TimestampMicros(m)) => Ok(Value::TimestampMicros(m)),
+        (DataType::Timestamp, Value::Text(s)) => {
+            let micros = parse_timestamp_str(&s).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Value::TimestampMicros(micros))
+        }
+        (DataType::Bytea, Value::Bytes(bytes)) => Ok(Value::Bytes(bytes)),
+        (DataType::Bytea, Value::Text(s)) => {
+            let bytes = parse_bytea_text(&s).map_err(|e| anyhow::anyhow!(e))?;
+            Ok(Value::Bytes(bytes))
+        }
+        (DataType::Text, Value::Bool(b)) => Ok(Value::Text(if b { "t" } else { "f" }.into())),
+        (DataType::Text, Value::Int64(i)) => Ok(Value::Text(i.to_string())),
+        (DataType::Text, Value::Float64Bits(bits)) => {
+            let f = f64::from_bits(bits);
+            Ok(Value::Text(f.to_string()))
+        }
+        (dt, got) => anyhow::bail!("type mismatch: expected {:?}, got {:?}", dt, got),
+    }
 }

@@ -1,10 +1,11 @@
 use crate::engine::{
-    BoolExpr, CmpOp, DataType, Expr, Field, ObjName, Plan, ScalarExpr, Schema, Selection, SortKey,
-    Value, fe,
+    BoolExpr, CmpOp, DataType, Expr, Field, InsertSource, ObjName, Plan, ScalarExpr, Schema,
+    Selection, SortKey, UpdateSet, Value, fe,
 };
 use pg_query::protobuf::a_const::Val;
-use pg_query::protobuf::{AConst, ConstrType};
+use pg_query::protobuf::{AConst, AlterTableType, ConstrType};
 use pg_query::{NodeEnum, parse};
+use std::convert::TryFrom;
 
 pub struct Planner;
 
@@ -70,7 +71,11 @@ impl Planner {
                                 // null has no inherent numeric type; bail in numeric-only contexts
                                 return Err(fe("null not allowed here"));
                             }
-                            Value::Text(_) | Value::Bool(_) => {
+                            Value::Text(_)
+                            | Value::Bool(_)
+                            | Value::Date(_)
+                            | Value::TimestampMicros(_)
+                            | Value::Bytes(_) => {
                                 return Err(fe("only numeric literals supported here"));
                             }
                         };
@@ -258,10 +263,9 @@ impl Planner {
                 for elt in cs.table_elts {
                     match elt.node.unwrap() {
                         NodeEnum::ColumnDef(cd) => {
-                            let dt = map_type(&cd)?;
-                            let cname = cd.colname;
-                            let nullable = !cd.is_not_null;
-                            cols.push((cname, dt, nullable));
+                            let (cname, dt, nullable, default) = parse_column_def(&cd)?;
+                            let col_name_clone = cname.clone();
+                            cols.push((cname, dt, nullable, default));
                             // simple “col PRIMARY KEY” handling
                             if cd.constraints.iter().any(|c| {
                                 matches!(
@@ -271,7 +275,7 @@ impl Planner {
                                             == ConstrType::ConstrPrimary as i32
                                 )
                             }) {
-                                pk = Some(vec![cols.last().unwrap().0.clone()]);
+                                pk = Some(vec![col_name_clone]);
                             }
                         }
                         NodeEnum::Constraint(cons) => {
@@ -294,6 +298,59 @@ impl Planner {
                 Ok(Plan::CreateTable { table, cols, pk })
             }
 
+            Some(NodeEnum::AlterTableStmt(at)) => {
+                let rv = at.relation.ok_or_else(|| fe("missing table name"))?;
+                let table = ObjName {
+                    schema: if rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(rv.schemaname)
+                    },
+                    name: rv.relname,
+                };
+                if at.cmds.len() != 1 {
+                    return Err(fe("one ALTER TABLE command at a time"));
+                }
+                let cmd_node = at.cmds.into_iter().next().unwrap();
+                let cmd = cmd_node
+                    .node
+                    .ok_or_else(|| fe("bad ALTER TABLE command"))?;
+                let NodeEnum::AlterTableCmd(cmd) = cmd else {
+                    return Err(fe("bad ALTER TABLE command"));
+                };
+                let subtype =
+                    AlterTableType::try_from(cmd.subtype).map_err(|_| fe("bad ALTER TABLE type"))?;
+                match subtype {
+                    AlterTableType::AtAddColumn => {
+                        let col_node = cmd
+                            .def
+                            .as_ref()
+                            .and_then(|n| n.node.as_ref())
+                            .ok_or_else(|| fe("ADD COLUMN requires column definition"))?;
+                        let NodeEnum::ColumnDef(cd) = col_node else {
+                            return Err(fe("ADD COLUMN expects column definition"));
+                        };
+                        let column = parse_column_def(cd)?;
+                        Ok(Plan::AlterTableAddColumn {
+                            table,
+                            column,
+                            if_not_exists: cmd.missing_ok,
+                        })
+                    }
+                    AlterTableType::AtDropColumn => {
+                        if cmd.name.is_empty() {
+                            return Err(fe("DROP COLUMN requires name"));
+                        }
+                        Ok(Plan::AlterTableDropColumn {
+                            table,
+                            column: cmd.name,
+                            if_exists: cmd.missing_ok,
+                        })
+                    }
+                    _ => Err(fe("unsupported ALTER TABLE command")),
+                }
+            }
+
             // INSERT VALUES
             Some(NodeEnum::InsertStmt(ins)) => {
                 let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
@@ -312,7 +369,7 @@ impl Planner {
                 let NodeEnum::SelectStmt(sel2) = sel else {
                     return Err(fe("only VALUES supported"));
                 };
-                let mut all_rows: Vec<Vec<Expr>> = Vec::new();
+                let mut all_rows: Vec<Vec<InsertSource>> = Vec::new();
                 for v in sel2.values_lists {
                     let NodeEnum::List(vlist) = v.node.unwrap() else {
                         continue;
@@ -321,15 +378,20 @@ impl Planner {
                     for cell in vlist.items {
                         let n = cell.node.unwrap();
                         match n {
-                            NodeEnum::AConst(c) => row.push(Expr::Literal(const_to_value(&c)?)),
+                            NodeEnum::AConst(c) => {
+                                row.push(InsertSource::Expr(Expr::Literal(const_to_value(&c)?)))
+                            }
                             NodeEnum::ColumnRef(cr) => {
                                 let name = last_colref_name(&cr)?;
                                 if name.eq_ignore_ascii_case("nan") {
-                                    row.push(Expr::Literal(Value::from_f64(f64::NAN)));
+                                    row.push(InsertSource::Expr(Expr::Literal(Value::from_f64(
+                                        f64::NAN,
+                                    ))))
                                 } else {
                                     return Err(fe("INSERT supports constants only"));
                                 }
                             }
+                            NodeEnum::SetToDefault(_) => row.push(InsertSource::Default),
                             _ => return Err(fe("INSERT supports constants only")),
                         }
                     }
@@ -368,7 +430,7 @@ impl Planner {
                         .and_then(|n| n.node.as_ref())
                         .ok_or_else(|| fe("missing update value"))?;
                     let expr = parse_scalar_expr(expr_node)?;
-                    sets.push(crate::engine::UpdateSet::ByName(col_name, expr));
+                    sets.push(UpdateSet::ByName(col_name, expr));
                 }
                 if sets.is_empty() {
                     return Err(fe("UPDATE requires SET clauses"));
@@ -412,15 +474,11 @@ impl Planner {
     }
 }
 
-fn plan_schema(p: &Plan) -> pgwire::error::PgWireResult<Schema> {
-    Ok(p.schema().clone())
-}
-
 fn parse_bool_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<BoolExpr> {
     use pg_query::protobuf::{BoolExprType, NullTestType};
     match node {
         NodeEnum::BoolExpr(be) => {
-            let op = BoolExprType::from_i32(be.boolop).ok_or_else(|| fe("bad bool expr op"))?;
+            let op = BoolExprType::try_from(be.boolop).map_err(|_| fe("bad bool expr op"))?;
             let mut args = Vec::new();
             for a in &be.args {
                 let n = a.node.as_ref().ok_or_else(|| fe("bad bool arg"))?;
@@ -462,7 +520,7 @@ fn parse_bool_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<BoolExpr> {
         }
         NodeEnum::NullTest(nt) => {
             let nt_type =
-                NullTestType::from_i32(nt.nulltesttype).ok_or_else(|| fe("bad nulltest"))?;
+                NullTestType::try_from(nt.nulltesttype).map_err(|_| fe("bad nulltest"))?;
             let arg = nt
                 .arg
                 .as_ref()
@@ -550,9 +608,11 @@ fn try_parse_literal(node: &NodeEnum) -> pgwire::error::PgWireResult<Option<Valu
                         Value::Int64(i) => Ok(Some(Value::Int64(-i))),
                         Value::Float64Bits(b) => Ok(Some(Value::from_f64(-f64::from_bits(b)))),
                         Value::Null => Err(fe("minus over null")),
-                        Value::Text(_) | Value::Bool(_) => {
-                            Err(fe("minus over non-numeric literal"))
-                        }
+                        Value::Text(_)
+                        | Value::Bool(_)
+                        | Value::Date(_)
+                        | Value::TimestampMicros(_)
+                        | Value::Bytes(_) => Err(fe("minus over non-numeric literal")),
                     },
                     _ => Err(fe("minus over non-const")),
                 }
@@ -702,7 +762,11 @@ fn parse_numeric_const(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
             match v {
                 Value::Int64(_) | Value::Float64Bits(_) => Ok(v),
                 Value::Null => Err(fe("null not allowed in numeric const")),
-                Value::Text(_) | Value::Bool(_) => Err(fe("numeric const expected")),
+                Value::Text(_)
+                | Value::Bool(_)
+                | Value::Date(_)
+                | Value::TimestampMicros(_)
+                | Value::Bytes(_) => Err(fe("numeric const expected")),
             }
         }
         NodeEnum::AExpr(ax) => {
@@ -724,7 +788,11 @@ fn parse_numeric_const(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
                     Value::Int64(i) => Ok(Value::Int64(-i)),
                     Value::Float64Bits(b) => Ok(Value::from_f64(-f64::from_bits(b))),
                     Value::Null => Err(fe("minus over null")),
-                    Value::Text(_) | Value::Bool(_) => Err(fe("numeric const expected")),
+                    Value::Text(_)
+                    | Value::Bool(_)
+                    | Value::Date(_)
+                    | Value::TimestampMicros(_)
+                    | Value::Bytes(_) => Err(fe("numeric const expected")),
                 },
                 _ => Err(fe("minus over non-const")),
             }
@@ -757,7 +825,7 @@ fn map_type(cd: &pg_query::protobuf::ColumnDef) -> pgwire::error::PgWireResult<D
     let typ = cd.type_name.as_ref().ok_or_else(|| fe("missing type"))?;
 
     // collect tokens, keeping only string components, lowercased
-    let tokens: Vec<String> = typ
+    let mut tokens: Vec<String> = typ
         .names
         .iter()
         .filter_map(|n| {
@@ -771,34 +839,107 @@ fn map_type(cd: &pg_query::protobuf::ColumnDef) -> pgwire::error::PgWireResult<D
         })
         .collect();
 
+    tokens.retain(|t| t != "pg_catalog" && t != "public");
+
     if tokens.is_empty() {
         return Err(fe("bad type name"));
     }
 
-    // handle multi-word names like "double precision"
     let last = tokens.last().unwrap().as_str();
-    let last_two = if tokens.len() >= 2 {
-        Some(format!(
-            "{} {}",
-            tokens[tokens.len() - 2],
-            tokens[tokens.len() - 1]
-        ))
-    } else {
-        None
-    };
-
-    let dt = if last_two.as_deref() == Some("double precision") {
+    let dt = if tokens.len() >= 2
+        && tokens[tokens.len() - 2] == "double"
+        && tokens[tokens.len() - 1] == "precision"
+    {
         DataType::Float8
+    } else if tokens.len() >= 4
+        && tokens[tokens.len() - 4] == "timestamp"
+        && tokens[tokens.len() - 3] == "without"
+        && tokens[tokens.len() - 2] == "time"
+        && tokens[tokens.len() - 1] == "zone"
+    {
+        DataType::Timestamp
     } else {
         match last {
             "int" | "int4" | "integer" => DataType::Int4,
             "bigint" | "int8" => DataType::Int8,
             "float8" | "double" => DataType::Float8,
-            "text" => DataType::Text,
-            "varchar" => DataType::Text,
+            "text" | "varchar" => DataType::Text,
             "bool" | "boolean" => DataType::Bool,
+            "date" => DataType::Date,
+            "timestamp" => DataType::Timestamp,
+            "bytea" => DataType::Bytea,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
     };
     Ok(dt)
+}
+
+fn parse_column_def(
+    cd: &pg_query::protobuf::ColumnDef,
+) -> pgwire::error::PgWireResult<(String, DataType, bool, Option<Value>)> {
+    let dt = map_type(cd)?;
+    let default_node = cd
+        .raw_default
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .or_else(|| cd.cooked_default.as_ref().and_then(|n| n.node.as_ref()))
+        .or_else(|| {
+            cd.constraints.iter().find_map(|c| {
+                let Some(NodeEnum::Constraint(cons)) = c.node.as_ref() else {
+                    return None;
+                };
+                if cons.contype == ConstrType::ConstrDefault as i32 {
+                    cons.raw_expr
+                        .as_ref()
+                        .and_then(|expr| expr.node.as_ref())
+                } else {
+                    None
+                }
+            })
+        });
+    let default = if let Some(def) = default_node {
+        Some(parse_default_literal(def)?)
+    } else {
+        None
+    };
+    Ok((cd.colname.clone(), dt, !cd.is_not_null, default))
+}
+
+fn parse_default_literal(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> {
+    match node {
+        NodeEnum::AConst(c) => const_to_value(c),
+        NodeEnum::TypeCast(tc) => {
+            let inner = tc
+                .arg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad default expression"))?;
+            parse_default_literal(inner)
+        }
+        _ => Err(fe("default must be a constant expression")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_alter_table_add_column_default() {
+        let plan = Planner::plan_sql(
+            "alter table items add column note text default 'pending'",
+        )
+        .expect("plan sql");
+        match plan {
+            Plan::AlterTableAddColumn { column, .. } => {
+                let (name, _ty, _nullable, default) = column;
+                assert_eq!(name, "note");
+                match default {
+                    Some(Value::Text(s)) => assert_eq!(s, "pending"),
+                    other => panic!("expected text default, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
 }

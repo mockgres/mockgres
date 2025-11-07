@@ -1,10 +1,15 @@
 use crate::storage::Row;
+use crate::types::{format_bytea, format_date, format_timestamp};
 use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 #[derive(Debug)]
 struct SimpleError(String);
@@ -27,6 +32,9 @@ pub enum DataType {
     Float8,
     Text,
     Bool,
+    Date,
+    Timestamp,
+    Bytea,
 }
 
 impl DataType {
@@ -37,6 +45,9 @@ impl DataType {
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
             DataType::Bool => Type::BOOL,
+            DataType::Date => Type::DATE,
+            DataType::Timestamp => Type::TIMESTAMP,
+            DataType::Bytea => Type::BYTEA,
         }
     }
 }
@@ -46,6 +57,7 @@ pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    pub default: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -68,13 +80,52 @@ impl Schema {
 }
 
 // Values used in rows
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum Value {
     Null,
     Int64(i64),
     Float64Bits(u64), // store floats as bits for Eq/Hash; encode/decode via f64::from_bits
     Text(String),
     Bool(bool),
+    Date(i32),
+    TimestampMicros(i64),
+    Bytes(Vec<u8>),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Null, Null) => true,
+            (Int64(a), Int64(b)) => a == b,
+            (Float64Bits(a), Float64Bits(b)) => a == b,
+            (Text(a), Text(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (Date(a), Date(b)) => a == b,
+            (TimestampMicros(a), TimestampMicros(b)) => a == b,
+            (Bytes(a), Bytes(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        use Value::*;
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Null => {}
+            Int64(v) => v.hash(state),
+            Float64Bits(v) => v.hash(state),
+            Text(s) => s.hash(state),
+            Bool(b) => b.hash(state),
+            Date(d) => d.hash(state),
+            TimestampMicros(t) => t.hash(state),
+            Bytes(b) => b.hash(state),
+        }
+    }
 }
 impl Value {
     pub fn from_f64(f: f64) -> Self {
@@ -131,6 +182,12 @@ pub enum BoolExpr {
         expr: ScalarExpr,
         negated: bool,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum InsertSource {
+    Expr(Expr),
+    Default,
 }
 
 #[derive(Clone, Debug)]
@@ -192,12 +249,22 @@ pub enum Plan {
     // ddl/dml
     CreateTable {
         table: ObjName,
-        cols: Vec<(String, DataType, bool)>,
+        cols: Vec<(String, DataType, bool, Option<Value>)>,
         pk: Option<Vec<String>>,
+    },
+    AlterTableAddColumn {
+        table: ObjName,
+        column: (String, DataType, bool, Option<Value>),
+        if_not_exists: bool,
+    },
+    AlterTableDropColumn {
+        table: ObjName,
+        column: String,
+        if_exists: bool,
     },
     InsertValues {
         table: ObjName,
-        rows: Vec<Vec<Expr>>,
+        rows: Vec<Vec<InsertSource>>,
     },
     Update {
         table: ObjName,
@@ -245,6 +312,8 @@ impl Plan {
 
             Plan::UnboundSeqScan { .. }
             | Plan::CreateTable { .. }
+            | Plan::AlterTableAddColumn { .. }
+            | Plan::AlterTableDropColumn { .. }
             | Plan::InsertValues { .. }
             | Plan::Update { .. }
             | Plan::Delete { .. } => {
@@ -432,7 +501,6 @@ pub struct OrderExec {
     schema: Schema,
     rows: Vec<Row>,
     pos: usize,
-    keys: Vec<(usize, bool, bool)>,
 }
 
 impl OrderExec {
@@ -475,7 +543,6 @@ impl OrderExec {
             schema,
             rows: buf,
             pos: 0,
-            keys: resolved_keys,
         })
     }
 }
@@ -584,6 +651,21 @@ fn order_values(
         }
 
         (Value::Bool(x), Value::Bool(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::Date(x), Value::Date(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::TimestampMicros(x), Value::TimestampMicros(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::Bytes(x), Value::Bytes(y)) => {
             let ord = x.cmp(y);
             if asc { ord } else { ord.reverse() }
         }
@@ -787,6 +869,9 @@ fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::TimestampMicros(a), Value::TimestampMicros(b)) => a.cmp(b),
+        (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
         _ => return None,
     })
 }
@@ -810,7 +895,7 @@ pub fn to_pgwire_stream(
 
     let s = stream::unfold(
         (node, fields.clone(), schema),
-        |(mut node, fields, schema)| async move {
+        move |(mut node, fields, schema)| async move {
             let next = node.next();
             match next {
                 Ok(Some(vals)) => {
@@ -830,6 +915,15 @@ pub fn to_pgwire_stream(
                             (Value::Null, DataType::Bool) => {
                                 enc.encode_field(&Option::<bool>::None)
                             }
+                            (Value::Null, DataType::Date) => {
+                                enc.encode_field(&Option::<String>::None)
+                            }
+                            (Value::Null, DataType::Timestamp) => {
+                                enc.encode_field(&Option::<String>::None)
+                            }
+                            (Value::Null, DataType::Bytea) => {
+                                enc.encode_field(&Option::<Vec<u8>>::None)
+                            }
 
                             (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
                             (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
@@ -846,6 +940,44 @@ pub fn to_pgwire_stream(
                                 enc.encode_field(&owned)
                             }
                             (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
+                            (Value::Date(days), DataType::Date) => {
+                                if fmt == FieldFormat::Binary {
+                                    return Some((
+                                        Err(fe("binary date format not supported yet")),
+                                        (node, fields, schema),
+                                    ));
+                                }
+                                let text = match format_date(days) {
+                                    Ok(t) => t,
+                                    Err(e) => return Some((Err(fe(e)), (node, fields, schema))),
+                                };
+                                enc.encode_field(&text)
+                            }
+                            (Value::TimestampMicros(micros), DataType::Timestamp) => {
+                                if fmt == FieldFormat::Binary {
+                                    return Some((
+                                        Err(fe("binary timestamp format not supported yet")),
+                                        (node, fields, schema),
+                                    ));
+                                }
+                                let text = match format_timestamp(micros) {
+                                    Ok(t) => t,
+                                    Err(e) => return Some((Err(fe(e)), (node, fields, schema))),
+                                };
+                                enc.encode_field(&text)
+                            }
+                            (Value::Bytes(bytes), DataType::Bytea) => {
+                                if fmt == FieldFormat::Binary {
+                                    enc.encode_field_with_type_and_format(
+                                        &bytes,
+                                        &Type::BYTEA,
+                                        FieldFormat::Binary,
+                                    )
+                                } else {
+                                    let text = format_bytea(bytes.as_slice());
+                                    enc.encode_field(&text)
+                                }
+                            }
                             _ => Err(PgWireError::ApiError("type mismatch".into())),
                         };
                         if let Err(e) = res {
