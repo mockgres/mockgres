@@ -97,7 +97,12 @@ impl Mockgres {
             } => {
                 let (child, _tag, cnt) = self.build_executor(input, params.clone())?;
                 Ok((
-                    Box::new(ProjectExec::new(schema.clone(), child, exprs.clone())),
+                    Box::new(ProjectExec::new(
+                        schema.clone(),
+                        child,
+                        exprs.clone(),
+                        params.clone(),
+                    )),
                     None,
                     cnt,
                 ))
@@ -151,10 +156,10 @@ impl Mockgres {
                     let proj_schema = Schema {
                         fields: proj_fields.clone(),
                     };
-                    let exprs = (0..n)
-                        .map(|i| (Expr::Column(i), proj_fields[i].name.clone()))
+                    let exprs: Vec<(ScalarExpr, String)> = (0..n)
+                        .map(|i| (ScalarExpr::ColumnIdx(i), proj_fields[i].name.clone()))
                         .collect();
-                    node = Box::new(ProjectExec::new(proj_schema, node, exprs));
+                    node = Box::new(ProjectExec::new(proj_schema, node, exprs, params.clone()));
                 }
 
                 Ok((node, None, None))
@@ -599,8 +604,14 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             collect_param_hints_from_plan(input, out);
             collect_param_hints_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::Projection { input, .. } => {
+        Plan::Order { input, .. } | Plan::Limit { input, .. } => {
             collect_param_hints_from_plan(input, out)
+        }
+        Plan::Projection { input, exprs, .. } => {
+            collect_param_hints_from_plan(input, out);
+            for (expr, _) in exprs {
+                collect_param_hints_from_scalar(expr, out);
+            }
         }
         Plan::Update { sets, filter, .. } => {
             collect_param_hints_from_update_sets(sets, out);
@@ -645,10 +656,23 @@ fn collect_param_hints_from_bool(expr: &BoolExpr, out: &mut HashMap<usize, DataT
 }
 
 fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, DataType>) {
-    if let ScalarExpr::Param { idx, ty } = expr {
-        if let Some(dt) = ty {
-            out.entry(*idx).or_insert(dt.clone());
+    match expr {
+        ScalarExpr::Param { idx, ty } => {
+            if let Some(dt) = ty {
+                out.entry(*idx).or_insert(dt.clone());
+            }
         }
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            collect_param_hints_from_scalar(left, out);
+            collect_param_hints_from_scalar(right, out);
+        }
+        ScalarExpr::UnaryOp { expr, .. } => collect_param_hints_from_scalar(expr, out),
+        ScalarExpr::Func { args, .. } => {
+            for arg in args {
+                collect_param_hints_from_scalar(arg, out);
+            }
+        }
+        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(..) | ScalarExpr::Literal(_) => {}
     }
 }
 
@@ -668,8 +692,12 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             collect_param_indexes(input, out);
             collect_param_indexes_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::Projection { input, .. } => {
-            collect_param_indexes(input, out)
+        Plan::Order { input, .. } | Plan::Limit { input, .. } => collect_param_indexes(input, out),
+        Plan::Projection { input, exprs, .. } => {
+            collect_param_indexes(input, out);
+            for (expr, _) in exprs {
+                collect_param_indexes_from_scalar(expr, out);
+            }
         }
         Plan::Update { sets, filter, .. } => {
             collect_param_indexes_from_update_sets(sets, out);
@@ -714,8 +742,21 @@ fn collect_param_indexes_from_bool(expr: &BoolExpr, out: &mut BTreeSet<usize>) {
 }
 
 fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize>) {
-    if let ScalarExpr::Param { idx, .. } = expr {
-        out.insert(*idx);
+    match expr {
+        ScalarExpr::Param { idx, .. } => {
+            out.insert(*idx);
+        }
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            collect_param_indexes_from_scalar(left, out);
+            collect_param_indexes_from_scalar(right, out);
+        }
+        ScalarExpr::UnaryOp { expr, .. } => collect_param_indexes_from_scalar(expr, out),
+        ScalarExpr::Func { args, .. } => {
+            for arg in args {
+                collect_param_indexes_from_scalar(arg, out);
+            }
+        }
+        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(..) | ScalarExpr::Literal(_) => {}
     }
 }
 

@@ -183,7 +183,45 @@ pub enum ScalarExpr {
     Literal(Value),
     Column(String),   // unbound name
     ColumnIdx(usize), // bound column position
-    Param { idx: usize, ty: Option<DataType> },
+    Param {
+        idx: usize,
+        ty: Option<DataType>,
+    },
+    BinaryOp {
+        op: ScalarBinaryOp,
+        left: Box<ScalarExpr>,
+        right: Box<ScalarExpr>,
+    },
+    UnaryOp {
+        op: ScalarUnaryOp,
+        expr: Box<ScalarExpr>,
+    },
+    Func {
+        func: ScalarFunc,
+        args: Vec<ScalarExpr>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Concat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarUnaryOp {
+    Negate,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ScalarFunc {
+    Coalesce,
+    Upper,
+    Lower,
+    Length,
 }
 
 #[derive(Clone, Debug)]
@@ -261,7 +299,7 @@ pub enum Plan {
     // projection over input with named exprs
     Projection {
         input: Box<Plan>,
-        exprs: Vec<(Expr, String)>,
+        exprs: Vec<(ScalarExpr, String)>,
         schema: Schema,
     },
 
@@ -419,15 +457,22 @@ impl ExecNode for ValuesExec {
 pub struct ProjectExec {
     schema: Schema,
     input: Box<dyn ExecNode>,
-    exprs: Vec<Expr>,
+    exprs: Vec<ScalarExpr>,
+    params: Arc<Vec<Value>>,
 }
 impl ProjectExec {
-    pub fn new(schema: Schema, input: Box<dyn ExecNode>, exprs_named: Vec<(Expr, String)>) -> Self {
+    pub fn new(
+        schema: Schema,
+        input: Box<dyn ExecNode>,
+        exprs_named: Vec<(ScalarExpr, String)>,
+        params: Arc<Vec<Value>>,
+    ) -> Self {
         let exprs = exprs_named.into_iter().map(|(e, _)| e).collect();
         Self {
             schema,
             input,
             exprs,
+            params,
         }
     }
 }
@@ -439,7 +484,7 @@ impl ExecNode for ProjectExec {
         if let Some(in_row) = self.input.next()? {
             let mut out = Vec::with_capacity(self.exprs.len());
             for e in &self.exprs {
-                out.push(eval(&in_row, e)?);
+                out.push(eval_scalar_expr(&in_row, e, &self.params)?);
             }
             Ok(Some(out))
         } else {
@@ -782,12 +827,6 @@ fn eval_const(e: &Expr) -> PgWireResult<Value> {
         Expr::Column(_) => Err(fe("column not allowed here")),
     }
 }
-fn eval(row: &[Value], e: &Expr) -> PgWireResult<Value> {
-    match e {
-        Expr::Literal(v) => Ok(v.clone()),
-        Expr::Column(i) => Ok(row[*i].clone()),
-    }
-}
 
 pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> PgWireResult<Value> {
     match expr {
@@ -801,7 +840,183 @@ pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> P
             .get(*idx)
             .cloned()
             .ok_or_else(|| fe("parameter index out of range")),
+        ScalarExpr::BinaryOp { op, left, right } => {
+            let lv = eval_scalar_expr(row, left, params)?;
+            let rv = eval_scalar_expr(row, right, params)?;
+            eval_binary_op(*op, lv, rv)
+        }
+        ScalarExpr::UnaryOp { op, expr } => {
+            let v = eval_scalar_expr(row, expr, params)?;
+            eval_unary_op(*op, v)
+        }
+        ScalarExpr::Func { func, args } => {
+            let mut evaluated = Vec::with_capacity(args.len());
+            for arg in args {
+                evaluated.push(eval_scalar_expr(row, arg, params)?);
+            }
+            eval_function(*func, evaluated)
+        }
     }
+}
+
+fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult<Value> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match op {
+        ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul => {
+            let (l_val, r_val, use_float) = coerce_numeric_pair(left, right)?;
+            if !use_float {
+                if let (NumericValue::Int(a), NumericValue::Int(b)) = (&l_val, &r_val) {
+                    return Ok(match op {
+                        ScalarBinaryOp::Add => Value::Int64(*a + *b),
+                        ScalarBinaryOp::Sub => Value::Int64(*a - *b),
+                        ScalarBinaryOp::Mul => Value::Int64(*a * *b),
+                        _ => unreachable!(),
+                    });
+                }
+            }
+            let lf = l_val
+                .to_f64()
+                .ok_or_else(|| fe("numeric evaluation failed"))?;
+            let rf = r_val
+                .to_f64()
+                .ok_or_else(|| fe("numeric evaluation failed"))?;
+            let res = match op {
+                ScalarBinaryOp::Add => lf + rf,
+                ScalarBinaryOp::Sub => lf - rf,
+                ScalarBinaryOp::Mul => lf * rf,
+                _ => unreachable!(),
+            };
+            Ok(Value::from_f64(res))
+        }
+        ScalarBinaryOp::Div => {
+            let right_is_zero = match &right {
+                Value::Int64(0) => true,
+                Value::Float64Bits(bits) => f64::from_bits(*bits) == 0.0,
+                _ => false,
+            };
+            if right_is_zero {
+                return Err(fe_code("22012", "division by zero"));
+            }
+            let (l, r, _) = coerce_numeric_pair(left, right)?;
+            let lf = l
+                .to_f64()
+                .ok_or_else(|| fe("cannot convert lhs to float"))?;
+            let rf = r
+                .to_f64()
+                .ok_or_else(|| fe("cannot convert rhs to float"))?;
+            Ok(Value::from_f64(lf / rf))
+        }
+        ScalarBinaryOp::Concat => {
+            let ltxt = value_to_text(left)?;
+            let rtxt = value_to_text(right)?;
+            Ok(match (ltxt, rtxt) {
+                (Some(l), Some(r)) => Value::Text(format!("{l}{r}")),
+                _ => Value::Null,
+            })
+        }
+    }
+}
+
+fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match op {
+        ScalarUnaryOp::Negate => match value {
+            Value::Int64(v) => Ok(Value::Int64(-v)),
+            Value::Float64Bits(bits) => {
+                let f = f64::from_bits(bits);
+                Ok(Value::from_f64(-f))
+            }
+            other => Err(fe(format!("cannot negate value {:?}", other))),
+        },
+    }
+}
+
+fn eval_function(func: ScalarFunc, args: Vec<Value>) -> PgWireResult<Value> {
+    match func {
+        ScalarFunc::Coalesce => {
+            for arg in args {
+                if !matches!(arg, Value::Null) {
+                    return Ok(arg);
+                }
+            }
+            Ok(Value::Null)
+        }
+        ScalarFunc::Upper => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s.to_uppercase())),
+            Some(Value::Null) | None => Ok(Value::Null),
+            _ => Err(fe("upper() expects text")),
+        },
+        ScalarFunc::Lower => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s.to_lowercase())),
+            Some(Value::Null) | None => Ok(Value::Null),
+            _ => Err(fe("lower() expects text")),
+        },
+        ScalarFunc::Length => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Int64(s.chars().count() as i64)),
+            Some(Value::Bytes(b)) => Ok(Value::Int64(b.len() as i64)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(other) => Err(fe(format!("length() unsupported for {:?}", other))),
+        },
+    }
+}
+
+#[derive(Clone)]
+enum NumericValue {
+    Int(i64),
+    Float(f64),
+}
+
+impl NumericValue {
+    fn to_f64(&self) -> Option<f64> {
+        match self {
+            NumericValue::Int(i) => Some(*i as f64),
+            NumericValue::Float(f) => Some(*f),
+        }
+    }
+}
+
+fn coerce_numeric_pair(
+    left: Value,
+    right: Value,
+) -> PgWireResult<(NumericValue, NumericValue, bool)> {
+    let l = value_to_numeric(left)?;
+    let r = value_to_numeric(right)?;
+    let use_float = matches!(l, NumericValue::Float(_)) || matches!(r, NumericValue::Float(_));
+    Ok(if use_float {
+        (
+            NumericValue::Float(l.to_f64().unwrap()),
+            NumericValue::Float(r.to_f64().unwrap()),
+            true,
+        )
+    } else {
+        (l, r, false)
+    })
+}
+
+fn value_to_numeric(v: Value) -> PgWireResult<NumericValue> {
+    match v {
+        Value::Int64(i) => Ok(NumericValue::Int(i)),
+        Value::Float64Bits(bits) => Ok(NumericValue::Float(f64::from_bits(bits))),
+        other => Err(fe(format!("numeric value expected, got {:?}", other))),
+    }
+}
+
+fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
+    Ok(match v {
+        Value::Null => None,
+        Value::Text(s) => Some(s),
+        Value::Int64(i) => Some(i.to_string()),
+        Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
+        Value::Bool(b) => Some(if b { "t" } else { "f" }.into()),
+        Value::Bytes(bytes) => Some(String::from_utf8_lossy(&bytes).into()),
+        Value::Date(_) | Value::TimestampMicros(_) => {
+            return Err(fe("text conversion not supported for date/timestamp"));
+        }
+    })
 }
 
 pub fn eval_bool_expr(

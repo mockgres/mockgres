@@ -1,6 +1,7 @@
 use crate::engine::{
-    BoolExpr, CmpOp, DataType, Expr, Field, InsertSource, ObjName, Plan, ScalarExpr, Schema,
-    Selection, SortKey, UpdateSet, Value, fe, fe_code,
+    BoolExpr, CmpOp, DataType, Expr, Field, InsertSource, ObjName, Plan, ScalarBinaryOp,
+    ScalarExpr, ScalarFunc, ScalarUnaryOp, Schema, Selection, SortKey, UpdateSet, Value, fe,
+    fe_code,
 };
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, AlterTableType, ConstrType, ObjectType, VariableSetKind};
@@ -62,10 +63,10 @@ impl Planner {
                                 } else {
                                     DataType::Int8
                                 };
-                                (dt, Expr::Literal(Value::Int64(i)))
+                                (dt, ScalarExpr::Literal(Value::Int64(i)))
                             }
                             Value::Float64Bits(b) => {
-                                (DataType::Float8, Expr::Literal(Value::Float64Bits(b)))
+                                (DataType::Float8, ScalarExpr::Literal(Value::Float64Bits(b)))
                             }
                             Value::Null => {
                                 // null has no inherent numeric type; bail in numeric-only contexts
@@ -129,61 +130,89 @@ impl Planner {
                     name: relname,
                 };
 
-                // star vs explicit columns
+                let mut projection_items: Option<Vec<(ScalarExpr, String)>> = None;
                 let mut selection = if sel.target_list.len() == 1 {
                     let t = &sel.target_list[0];
                     let node = t.node.as_ref().ok_or_else(|| fe("missing target node"))?;
-
                     if let NodeEnum::ResTarget(rt) = node {
-                        // select * case
                         if let Some(NodeEnum::ColumnRef(cr)) =
                             rt.val.as_ref().and_then(|n| n.node.as_ref())
                         {
-                            if let Some(NodeEnum::AStar(_)) =
-                                cr.fields.get(0).and_then(|f| f.node.as_ref())
+                            if cr
+                                .fields
+                                .get(0)
+                                .and_then(|f| f.node.as_ref())
+                                .map(|n| matches!(n, NodeEnum::AStar(_)))
+                                .unwrap_or(false)
                             {
                                 Selection::Star
                             } else {
-                                // single column, ie select a from ...
-                                let name = if rt.name.is_empty() {
-                                    extract_col_name(rt)?
+                                let expr_node = rt
+                                    .val
+                                    .as_ref()
+                                    .and_then(|n| n.node.as_ref())
+                                    .ok_or_else(|| fe("bad target expr"))?;
+                                let expr = parse_scalar_expr(expr_node)?;
+                                let mut cols = Vec::new();
+                                collect_columns_from_scalar_expr(&expr, &mut cols);
+                                let alias = if rt.name.is_empty() {
+                                    derive_expr_name(&expr)
                                 } else {
                                     rt.name.clone()
                                 };
-                                Selection::Columns(vec![name])
+                                projection_items = Some(vec![(expr, alias)]);
+                                Selection::Columns(cols)
                             }
                         } else {
-                            // treat as single column name
-                            let name = if rt.name.is_empty() {
-                                extract_col_name(rt)?
+                            let expr_node = rt
+                                .val
+                                .as_ref()
+                                .and_then(|n| n.node.as_ref())
+                                .ok_or_else(|| fe("bad target expr"))?;
+                            let expr = parse_scalar_expr(expr_node)?;
+                            let alias = if rt.name.is_empty() {
+                                derive_expr_name(&expr)
                             } else {
                                 rt.name.clone()
                             };
-                            Selection::Columns(vec![name])
+                            let mut cols = Vec::new();
+                            collect_columns_from_scalar_expr(&expr, &mut cols);
+                            projection_items = Some(vec![(expr, alias)]);
+                            Selection::Columns(cols)
                         }
                     } else {
                         return Err(fe("unexpected target type for single column"));
                     }
                 } else {
-                    // multiple columns, ie select a, b from
                     let mut cols = Vec::new();
+                    let mut exprs = Vec::new();
                     for t in sel.target_list {
-                        let node_enum = t
+                        let rt = t
                             .node
                             .as_ref()
-                            .map(|n| &*n)
+                            .and_then(|n| {
+                                if let NodeEnum::ResTarget(rt) = n {
+                                    Some(rt)
+                                } else {
+                                    None
+                                }
+                            })
                             .ok_or_else(|| fe("bad target"))?;
-                        if let NodeEnum::ResTarget(rt) = node_enum {
-                            let col_name = if rt.name.is_empty() {
-                                extract_col_name(&rt)?
-                            } else {
-                                rt.name.clone()
-                            };
-                            cols.push(col_name);
+                        let expr_node = rt
+                            .val
+                            .as_ref()
+                            .and_then(|n| n.node.as_ref())
+                            .ok_or_else(|| fe("bad target expr"))?;
+                        let expr = parse_scalar_expr(expr_node)?;
+                        collect_columns_from_scalar_expr(&expr, &mut cols);
+                        let alias = if rt.name.is_empty() {
+                            derive_expr_name(&expr)
                         } else {
-                            return Err(fe("bad target"));
-                        }
+                            rt.name.clone()
+                        };
+                        exprs.push((expr, alias));
                     }
+                    projection_items = Some(exprs);
                     Selection::Columns(cols)
                 };
 
@@ -239,6 +268,23 @@ impl Planner {
                     plan = Plan::Limit {
                         input: Box::new(plan),
                         limit: lim,
+                    };
+                }
+
+                if let Some(exprs) = projection_items {
+                    let schema = Schema {
+                        fields: exprs
+                            .iter()
+                            .map(|(_, name)| Field {
+                                name: name.clone(),
+                                data_type: DataType::Text,
+                            })
+                            .collect(),
+                    };
+                    plan = Plan::Projection {
+                        input: Box::new(plan),
+                        exprs,
+                        schema,
                     };
                 }
 
@@ -654,6 +700,16 @@ fn parse_scalar_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<ScalarExpr>
                 ty: None,
             })
         }
+        NodeEnum::AExpr(ax) => parse_arithmetic_expr(ax),
+        NodeEnum::FuncCall(fc) => parse_function_call(fc),
+        NodeEnum::TypeCast(tc) => {
+            let inner = tc
+                .arg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad type cast"))?;
+            parse_scalar_expr(inner)
+        }
         _ => {
             if let Some(v) = try_parse_literal(node)? {
                 Ok(ScalarExpr::Literal(v))
@@ -662,6 +718,109 @@ fn parse_scalar_expr(node: &NodeEnum) -> pgwire::error::PgWireResult<ScalarExpr>
             }
         }
     }
+}
+
+fn parse_arithmetic_expr(
+    ax: &pg_query::protobuf::AExpr,
+) -> pgwire::error::PgWireResult<ScalarExpr> {
+    let op = ax
+        .name
+        .iter()
+        .find_map(|n| {
+            n.node.as_ref().and_then(|nn| {
+                if let NodeEnum::String(s) = nn {
+                    Some(s.sval.clone())
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| fe("missing operator"))?;
+    if ax.lexpr.is_none() {
+        if op == "-" {
+            let rhs = ax
+                .rexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad unary minus"))?;
+            let expr = parse_scalar_expr(rhs)?;
+            return Ok(ScalarExpr::UnaryOp {
+                op: ScalarUnaryOp::Negate,
+                expr: Box::new(expr),
+            });
+        }
+    }
+    let lexpr = ax
+        .lexpr
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("bad lhs"))?;
+    let rexpr = ax
+        .rexpr
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("bad rhs"))?;
+    let left = parse_scalar_expr(lexpr)?;
+    let right = parse_scalar_expr(rexpr)?;
+    let bin_op = match op.as_str() {
+        "+" => ScalarBinaryOp::Add,
+        "-" => ScalarBinaryOp::Sub,
+        "*" => ScalarBinaryOp::Mul,
+        "/" => ScalarBinaryOp::Div,
+        "||" => ScalarBinaryOp::Concat,
+        other => return Err(fe(format!("unsupported operator: {other}"))),
+    };
+    Ok(ScalarExpr::BinaryOp {
+        op: bin_op,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
+}
+
+fn parse_function_call(
+    fc: &pg_query::protobuf::FuncCall,
+) -> pgwire::error::PgWireResult<ScalarExpr> {
+    let name = fc
+        .funcname
+        .iter()
+        .find_map(|n| {
+            n.node.as_ref().and_then(|nn| {
+                if let NodeEnum::String(s) = nn {
+                    Some(s.sval.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| fe("bad function name"))?;
+    let mut args = Vec::new();
+    for arg in &fc.args {
+        let node = arg
+            .node
+            .as_ref()
+            .ok_or_else(|| fe("bad function argument"))?;
+        args.push(parse_scalar_expr(node)?);
+    }
+    let func = match name.as_str() {
+        "coalesce" => ScalarFunc::Coalesce,
+        "upper" => ScalarFunc::Upper,
+        "lower" => ScalarFunc::Lower,
+        "length" | "char_length" => ScalarFunc::Length,
+        other => return Err(fe(format!("unsupported function: {other}"))),
+    };
+    match func {
+        ScalarFunc::Coalesce => {
+            if args.is_empty() {
+                return Err(fe("coalesce requires at least one argument"));
+            }
+        }
+        ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length => {
+            if args.len() != 1 {
+                return Err(fe("function expects exactly one argument"));
+            }
+        }
+    }
+    Ok(ScalarExpr::Func { func, args })
 }
 
 fn try_parse_literal(node: &NodeEnum) -> pgwire::error::PgWireResult<Option<Value>> {
@@ -719,10 +878,32 @@ fn collect_columns_from_bool_expr(expr: &BoolExpr, out: &mut Vec<String>) {
 }
 
 fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
-    if let ScalarExpr::Column(name) = expr {
-        if !out.iter().any(|c| c == name) {
-            out.push(name.clone());
+    match expr {
+        ScalarExpr::Column(name) => {
+            if !out.iter().any(|c| c == name) {
+                out.push(name.clone());
+            }
         }
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            collect_columns_from_scalar_expr(left, out);
+            collect_columns_from_scalar_expr(right, out);
+        }
+        ScalarExpr::UnaryOp { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+        ScalarExpr::Func { args, .. } => {
+            for arg in args {
+                collect_columns_from_scalar_expr(arg, out);
+            }
+        }
+        ScalarExpr::ColumnIdx(_) | ScalarExpr::Literal(_) | ScalarExpr::Param { .. } => {}
+    }
+}
+
+fn derive_expr_name(expr: &ScalarExpr) -> String {
+    match expr {
+        ScalarExpr::Column(name) => name.clone(),
+        ScalarExpr::ColumnIdx(_) => "?column?".into(),
+        ScalarExpr::Literal(_) => "?column?".into(),
+        _ => "?column?".into(),
     }
 }
 

@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Expr, Field, Plan, ScalarExpr, Schema, Selection, SqlError, UpdateSet,
-    Value, fe, fe_code,
+    BoolExpr, DataType, Field, Plan, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection,
+    SqlError, UpdateSet, Value, fe, fe_code,
 };
 use anyhow::Error;
 use pgwire::error::PgWireError;
@@ -60,6 +60,30 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
 
+        Plan::Projection {
+            input,
+            exprs,
+            schema: _,
+        } => {
+            let child = bind(db, *input)?;
+            let mut bound_exprs = Vec::with_capacity(exprs.len());
+            let mut fields = Vec::with_capacity(exprs.len());
+            for (expr, name) in exprs {
+                let bound = bind_scalar_expr(&expr, child.schema(), None)?;
+                let dt = scalar_expr_type(&bound, child.schema()).unwrap_or(DataType::Text);
+                fields.push(Field {
+                    name: name.clone(),
+                    data_type: dt,
+                });
+                bound_exprs.push((bound, name.clone()));
+            }
+            Ok(Plan::Projection {
+                input: Box::new(child),
+                exprs: bound_exprs,
+                schema: Schema { fields },
+            })
+        }
+
         // wrappers: bind child; nothing else to do
         Plan::Filter {
             input,
@@ -77,7 +101,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 let schema = plan.schema().clone();
                 let fields = schema.fields[..n].to_vec();
                 let proj_exprs = (0..n)
-                    .map(|i| (Expr::Column(i), fields[i].name.clone()))
+                    .map(|i| (ScalarExpr::ColumnIdx(i), fields[i].name.clone()))
                     .collect();
                 plan = Plan::Projection {
                     input: Box::new(plan),
@@ -235,6 +259,22 @@ fn bind_scalar_expr(
             idx: *idx,
             ty: ty.clone().or_else(|| hint.cloned()),
         },
+        ScalarExpr::BinaryOp { op, left, right } => ScalarExpr::BinaryOp {
+            op: *op,
+            left: Box::new(bind_scalar_expr(left, schema, hint)?),
+            right: Box::new(bind_scalar_expr(right, schema, hint)?),
+        },
+        ScalarExpr::UnaryOp { op, expr } => ScalarExpr::UnaryOp {
+            op: *op,
+            expr: Box::new(bind_scalar_expr(expr, schema, hint)?),
+        },
+        ScalarExpr::Func { func, args } => ScalarExpr::Func {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| bind_scalar_expr(a, schema, hint))
+                .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
+        },
     })
 }
 
@@ -251,6 +291,34 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
             Value::TimestampMicros(_) => Some(DataType::Timestamp),
             Value::Bytes(_) => Some(DataType::Bytea),
             Value::Null => None,
+        },
+        ScalarExpr::BinaryOp { op, left, right } => match op {
+            ScalarBinaryOp::Concat => Some(DataType::Text),
+            ScalarBinaryOp::Add
+            | ScalarBinaryOp::Sub
+            | ScalarBinaryOp::Mul
+            | ScalarBinaryOp::Div => {
+                let l = scalar_expr_type(left.as_ref(), schema);
+                let r = scalar_expr_type(right.as_ref(), schema);
+                match (l, r) {
+                    (Some(DataType::Float8), _) | (_, Some(DataType::Float8)) => {
+                        Some(DataType::Float8)
+                    }
+                    (Some(DataType::Int4), _) => Some(DataType::Int8),
+                    (_, Some(DataType::Int4)) => Some(DataType::Int8),
+                    (Some(DataType::Int8), Some(DataType::Int8)) => Some(DataType::Int8),
+                    _ => Some(DataType::Float8),
+                }
+            }
+        },
+        ScalarExpr::UnaryOp { expr, .. } => scalar_expr_type(expr.as_ref(), schema),
+        ScalarExpr::Func { func, args } => match func {
+            ScalarFunc::Upper | ScalarFunc::Lower => Some(DataType::Text),
+            ScalarFunc::Length => Some(DataType::Int8),
+            ScalarFunc::Coalesce => args
+                .iter()
+                .filter_map(|a| scalar_expr_type(a, schema))
+                .next(),
         },
         _ => None,
     }
