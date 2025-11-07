@@ -12,15 +12,34 @@ use std::{
 };
 
 #[derive(Debug)]
-struct SimpleError(String);
-impl fmt::Display for SimpleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+pub struct SqlError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl SqlError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
-impl std::error::Error for SimpleError {}
+
+impl fmt::Display for SqlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SqlError {}
+
 pub fn fe(msg: impl Into<String>) -> PgWireError {
-    PgWireError::ApiError(Box::new(SimpleError(msg.into())))
+    PgWireError::ApiError(Box::new(SqlError::new("XX000", msg.into())))
+}
+
+pub fn fe_code(code: &'static str, msg: impl Into<String>) -> PgWireError {
+    PgWireError::ApiError(Box::new(SqlError::new(code, msg.into())))
 }
 
 // ===== core types =====
@@ -262,6 +281,24 @@ pub enum Plan {
         column: String,
         if_exists: bool,
     },
+    CreateIndex {
+        name: String,
+        table: ObjName,
+        columns: Vec<String>,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        indexes: Vec<ObjName>,
+        if_exists: bool,
+    },
+    ShowVariable {
+        name: String,
+        schema: Schema,
+    },
+    SetVariable {
+        name: String,
+        value: Option<String>,
+    },
     InsertValues {
         table: ObjName,
         rows: Vec<Vec<InsertSource>>,
@@ -304,6 +341,7 @@ impl Plan {
             Plan::Values { schema, .. }
             | Plan::SeqScan { schema, .. }
             | Plan::Projection { schema, .. } => schema,
+            Plan::ShowVariable { schema, .. } => schema,
 
             // wrappers: same schema as child
             Plan::Filter { input, .. } | Plan::Order { input, .. } | Plan::Limit { input, .. } => {
@@ -314,6 +352,9 @@ impl Plan {
             | Plan::CreateTable { .. }
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
+            | Plan::CreateIndex { .. }
+            | Plan::DropIndex { .. }
+            | Plan::SetVariable { .. }
             | Plan::InsertValues { .. }
             | Plan::Update { .. }
             | Plan::Delete { .. } => {

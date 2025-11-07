@@ -1,6 +1,6 @@
 use crate::catalog::{Catalog, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, ScalarExpr, Value, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, ScalarExpr, SqlError, Value, eval_bool_expr, eval_scalar_expr,
 };
 use crate::storage::{Row, RowKey, Table};
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
@@ -10,6 +10,10 @@ use std::collections::HashMap;
 pub enum CellInput {
     Value(Value),
     Default,
+}
+
+fn sql_err(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(SqlError::new(code, msg.into()))
 }
 
 #[derive(Debug)]
@@ -41,7 +45,10 @@ impl Db {
     ) -> anyhow::Result<TableId> {
         self.catalog.ensure_schema(schema);
         if self.catalog.get_table(schema, name).is_some() {
-            anyhow::bail!("table already exists: {schema}.{name}");
+            return Err(sql_err(
+                "42P07",
+                format!("table already exists: {schema}.{name}"),
+            ));
         }
 
         let id = self.next_tid;
@@ -51,10 +58,12 @@ impl Db {
         for (n, t, nullable, default_raw) in cols.into_iter() {
             let mut default_value = None;
             if let Some(def) = default_raw {
-                let cast =
-                    cast_value_to_type(def, &t).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                let cast = cast_value_to_type(def, &t)?;
                 if matches!(cast, Value::Null) && !nullable {
-                    anyhow::bail!("default NULL not allowed for NOT NULL column {}", n);
+                    return Err(sql_err(
+                        "23502",
+                        format!("default NULL not allowed for NOT NULL column {n}"),
+                    ));
                 }
                 default_value = Some(cast);
             }
@@ -75,7 +84,7 @@ impl Db {
                     let i = columns
                         .iter()
                         .position(|c| c.name == n)
-                        .ok_or_else(|| anyhow::anyhow!("unknown pk column: {n}"))?;
+                        .ok_or_else(|| sql_err("42703", format!("unknown pk column: {n}")))?;
                     pos.push(i);
                 }
                 Some(pos)
@@ -111,20 +120,25 @@ impl Db {
         let (col_name, data_type, nullable, default_raw) = column;
         let mut default_value = None;
         if let Some(def) = default_raw {
-            let cast =
-                cast_value_to_type(def, &data_type).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            let cast = cast_value_to_type(def, &data_type)?;
             if matches!(cast, Value::Null) && !nullable {
-                anyhow::bail!("default NULL not allowed for NOT NULL column {}", col_name);
+                return Err(sql_err(
+                    "23502",
+                    format!("default NULL not allowed for NOT NULL column {col_name}"),
+                ));
             }
             default_value = Some(cast);
         } else if !nullable {
-            anyhow::bail!("column {} must have a default or allow NULLs", col_name);
+            return Err(sql_err(
+                "23502",
+                format!("column {col_name} must have a default or allow NULLs"),
+            ));
         }
         let (table_id, column_exists) = {
             let meta = self
                 .catalog
                 .get_table(schema, name)
-                .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
             let exists = meta.columns.iter().any(|c| c.name == col_name);
             (meta.id, exists)
         };
@@ -132,14 +146,16 @@ impl Db {
             if if_not_exists {
                 return Ok(());
             }
-            anyhow::bail!("column {} already exists", col_name);
+            return Err(sql_err(
+                "42701",
+                format!("column {col_name} already exists"),
+            ));
         }
         let append_value = default_value.clone().unwrap_or(Value::Null);
         {
-            let table = self
-                .tables
-                .get_mut(&table_id)
-                .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", table_id))?;
+            let table = self.tables.get_mut(&table_id).ok_or_else(|| {
+                sql_err("XX000", format!("missing storage for table id {table_id}"))
+            })?;
             for row in table.rows_by_key.values_mut() {
                 row.push(append_value.clone());
             }
@@ -148,11 +164,11 @@ impl Db {
             .catalog
             .schemas
             .get_mut(schema)
-            .ok_or_else(|| anyhow::anyhow!("no such schema {schema}"))?;
+            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
         let table_meta = schema_entry
             .tables
             .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
         table_meta.columns.push(Column {
             name: col_name,
             data_type,
@@ -173,16 +189,19 @@ impl Db {
             let meta = self
                 .catalog
                 .get_table(schema, name)
-                .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
             let Some(idx) = meta.columns.iter().position(|c| c.name == column) else {
                 if if_exists {
                     return Ok(());
                 } else {
-                    anyhow::bail!("column {} does not exist", column);
+                    return Err(sql_err("42703", format!("column {column} does not exist")));
                 }
             };
             if idx != meta.columns.len() - 1 {
-                anyhow::bail!("can only drop the last column ({} is at position {})", column, idx);
+                return Err(sql_err(
+                    "0A000",
+                    format!("can only drop the last column ({column} is at position {idx})"),
+                ));
             }
             if meta
                 .pk
@@ -190,37 +209,126 @@ impl Db {
                 .map(|pk| pk.contains(&idx))
                 .unwrap_or(false)
             {
-                anyhow::bail!("cannot drop primary key column {}", column);
+                return Err(sql_err(
+                    "2BP01",
+                    format!("cannot drop primary key column {column}"),
+                ));
             }
             (meta.id, idx)
         };
         if let Some(table) = self.tables.get_mut(&table_id) {
             for row in table.rows_by_key.values_mut() {
                 if row.len() != drop_idx + 1 {
-                    anyhow::bail!("row length mismatch while dropping column {}", column);
+                    return Err(sql_err(
+                        "XX000",
+                        format!("row length mismatch while dropping column {column}"),
+                    ));
                 }
                 row.pop();
             }
         } else {
-            anyhow::bail!("missing storage for table id {}", table_id);
+            return Err(sql_err(
+                "XX000",
+                format!("missing storage for table id {table_id}"),
+            ));
         }
         let schema_entry = self
             .catalog
             .schemas
             .get_mut(schema)
-            .ok_or_else(|| anyhow::anyhow!("no such schema {schema}"))?;
+            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
         let table_meta = schema_entry
             .tables
             .get_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?;
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
         table_meta.columns.pop();
         Ok(())
+    }
+
+    pub fn create_index(
+        &mut self,
+        schema: &str,
+        table: &str,
+        index_name: &str,
+        columns: Vec<String>,
+        if_not_exists: bool,
+    ) -> anyhow::Result<()> {
+        if columns.is_empty() {
+            return Err(sql_err("0A000", "index must reference at least one column"));
+        }
+        let schema_entry = self
+            .catalog
+            .schemas
+            .get_mut(schema)
+            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
+        let table_meta = schema_entry
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+        if table_meta.indexes.iter().any(|idx| idx.name == index_name) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(sql_err(
+                "42P07",
+                format!("index {index_name} already exists"),
+            ));
+        }
+        let mut col_positions = Vec::with_capacity(columns.len());
+        for col_name in columns {
+            let pos = table_meta
+                .columns
+                .iter()
+                .position(|c| c.name == col_name)
+                .ok_or_else(|| sql_err("42703", format!("unknown column in index: {col_name}")))?;
+            col_positions.push(pos);
+        }
+        table_meta.indexes.push(crate::catalog::IndexMeta {
+            name: index_name.to_string(),
+            columns: col_positions,
+        });
+        Ok(())
+    }
+
+    pub fn drop_index(
+        &mut self,
+        schema: &str,
+        index_name: &str,
+        if_exists: bool,
+    ) -> anyhow::Result<()> {
+        let Some(schema_entry) = self.catalog.schemas.get_mut(schema) else {
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(sql_err("3F000", format!("no such schema {schema}")))
+            };
+        };
+        let mut removed = false;
+        for table_meta in schema_entry.tables.values_mut() {
+            if let Some(pos) = table_meta
+                .indexes
+                .iter()
+                .position(|idx| idx.name == index_name)
+            {
+                table_meta.indexes.remove(pos);
+                removed = true;
+                break;
+            }
+        }
+        if removed || if_exists {
+            Ok(())
+        } else {
+            Err(sql_err(
+                "42704",
+                format!("index {index_name} does not exist"),
+            ))
+        }
     }
 
     pub fn resolve_table(&self, schema: &str, name: &str) -> anyhow::Result<&TableMeta> {
         self.catalog
             .get_table(schema, name)
-            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))
     }
 
     pub fn resolve_table_mut(
@@ -231,12 +339,12 @@ impl Db {
         let tm = self
             .catalog
             .get_table(schema, name)
-            .ok_or_else(|| anyhow::anyhow!("no such table {schema}.{name}"))?
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
             .clone();
         let t = self
             .tables
             .get_mut(&tm.id)
-            .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", tm.id))?;
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
         Ok((self.catalog.get_table(schema, name).unwrap(), t))
     }
 
@@ -253,12 +361,15 @@ impl Db {
         for (ridx, r) in rows.drain(..).enumerate() {
             // arity: number of values must match table columns
             if r.len() != ncols {
-                anyhow::bail!(
-                    "insert has wrong number of values at row {}: expected {}, got {}",
-                    ridx + 1,
-                    ncols,
-                    r.len()
-                );
+                return Err(sql_err(
+                    "21P01",
+                    format!(
+                        "insert has wrong number of values at row {}: expected {}, got {}",
+                        ridx + 1,
+                        ncols,
+                        r.len()
+                    ),
+                ));
             }
 
             // coerce and validate each cell to the target column type
@@ -288,7 +399,10 @@ impl Db {
 
             // enforce pk uniqueness when present
             if tab.rows_by_key.contains_key(&key) {
-                anyhow::bail!("duplicate key value violates unique constraint");
+                return Err(sql_err(
+                    "23505",
+                    "duplicate key value violates unique constraint",
+                ));
             }
 
             // finally insert
@@ -309,7 +423,7 @@ impl Db {
         let table = self
             .tables
             .get(&tm.id)
-            .ok_or_else(|| anyhow::anyhow!("missing storage for table id {}", tm.id))?;
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
 
         let mut out_rows = Vec::new();
         for (_k, r) in table.scan_all() {
@@ -337,7 +451,10 @@ impl Db {
         if let Some(pkpos) = &meta.pk {
             for (idx, _) in sets {
                 if pkpos.iter().any(|pos| pos == idx) {
-                    anyhow::bail!("updating primary key columns is not supported");
+                    return Err(sql_err(
+                        "0A000",
+                        "updating primary key columns is not supported",
+                    ));
                 }
             }
         }
@@ -345,7 +462,7 @@ impl Db {
         for row in table.rows_by_key.values_mut() {
             let passes = if let Some(expr) = filter {
                 eval_bool_expr(row, expr, params)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .map_err(|e| sql_err("XX000", e.to_string()))?
                     .unwrap_or(false)
             } else {
                 true
@@ -357,7 +474,7 @@ impl Db {
             let mut updated = original.clone();
             for (idx, expr) in sets {
                 let value = eval_scalar_expr(&original, expr, params)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    .map_err(|e| sql_err("XX000", e.to_string()))?;
                 let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, meta)?;
                 updated[*idx] = coerced;
             }
@@ -379,7 +496,7 @@ impl Db {
         if let Some(expr) = filter {
             for (key, row) in table.rows_by_key.iter() {
                 let passes = eval_bool_expr(row, expr, params)
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?
+                    .map_err(|e| sql_err("XX000", e.to_string()))?
                     .unwrap_or(false);
                 if passes {
                     to_remove.push(key.clone());
@@ -404,17 +521,31 @@ fn coerce_value_for_column(
 ) -> anyhow::Result<Value> {
     if let Value::Null = val {
         if !col.nullable {
-            anyhow::bail!("column {} is not null", col.name);
+            return Err(sql_err("23502", format!("column {} is not null", col.name)));
         }
         if let Some(pkpos) = &meta.pk {
             if pkpos.contains(&idx) {
-                anyhow::bail!("primary key column {} cannot be null", col.name);
+                return Err(sql_err(
+                    "23502",
+                    format!("primary key column {} cannot be null", col.name),
+                ));
             }
         }
         return Ok(Value::Null);
     }
-    let coerced = cast_value_to_type(val, &col.data_type)
-        .map_err(|e| anyhow::anyhow!("column {} (index {}): {}", col.name, idx, e))?;
+    let coerced = cast_value_to_type(val, &col.data_type).map_err(|e| {
+        if let Some(sql) = e.downcast_ref::<SqlError>() {
+            sql_err(
+                sql.code,
+                format!("column {} (index {}): {}", col.name, idx, sql.message),
+            )
+        } else {
+            sql_err(
+                "42804",
+                format!("column {} (index {}): {}", col.name, idx, e),
+            )
+        }
+    })?;
     Ok(coerced)
 }
 
@@ -422,7 +553,7 @@ fn cast_value_to_type(val: Value, target: &DataType) -> anyhow::Result<Value> {
     match (target, val) {
         (DataType::Int4, Value::Int64(v)) => {
             if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                anyhow::bail!("value out of range for int4");
+                return Err(sql_err("22003", "value out of range for int4"));
             }
             Ok(Value::Int64(v))
         }
@@ -433,17 +564,17 @@ fn cast_value_to_type(val: Value, target: &DataType) -> anyhow::Result<Value> {
         (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),
         (DataType::Date, Value::Date(d)) => Ok(Value::Date(d)),
         (DataType::Date, Value::Text(s)) => {
-            let days = parse_date_str(&s).map_err(|e| anyhow::anyhow!(e))?;
+            let days = parse_date_str(&s).map_err(|e| sql_err("22007", e))?;
             Ok(Value::Date(days))
         }
         (DataType::Timestamp, Value::TimestampMicros(m)) => Ok(Value::TimestampMicros(m)),
         (DataType::Timestamp, Value::Text(s)) => {
-            let micros = parse_timestamp_str(&s).map_err(|e| anyhow::anyhow!(e))?;
+            let micros = parse_timestamp_str(&s).map_err(|e| sql_err("22007", e))?;
             Ok(Value::TimestampMicros(micros))
         }
         (DataType::Bytea, Value::Bytes(bytes)) => Ok(Value::Bytes(bytes)),
         (DataType::Bytea, Value::Text(s)) => {
-            let bytes = parse_bytea_text(&s).map_err(|e| anyhow::anyhow!(e))?;
+            let bytes = parse_bytea_text(&s).map_err(|e| sql_err("22001", e))?;
             Ok(Value::Bytes(bytes))
         }
         (DataType::Text, Value::Bool(b)) => Ok(Value::Text(if b { "t" } else { "f" }.into())),
@@ -452,6 +583,9 @@ fn cast_value_to_type(val: Value, target: &DataType) -> anyhow::Result<Value> {
             let f = f64::from_bits(bits);
             Ok(Value::Text(f.to_string()))
         }
-        (dt, got) => anyhow::bail!("type mismatch: expected {:?}, got {:?}", dt, got),
+        (dt, got) => Err(sql_err(
+            "42804",
+            format!("type mismatch: expected {dt:?}, got {got:?}"),
+        )),
     }
 }

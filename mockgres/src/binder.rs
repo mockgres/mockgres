@@ -1,7 +1,10 @@
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Expr, Field, Plan, ScalarExpr, Schema, Selection, UpdateSet, Value, fe,
+    BoolExpr, DataType, Expr, Field, Plan, ScalarExpr, Schema, Selection, SqlError, UpdateSet,
+    Value, fe, fe_code,
 };
+use anyhow::Error;
+use pgwire::error::PgWireError;
 
 pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
     match p {
@@ -9,7 +12,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
                 .resolve_table(schema_name, &table.name)
-                .map_err(|e| fe(e.to_string()))?;
+                .map_err(map_catalog_err)?;
 
             // build (idx, Field) for executor + compose output schema
             let cols: Vec<(usize, Field)> = match selection {
@@ -30,10 +33,11 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 Selection::Columns(names) => {
                     let mut out = Vec::with_capacity(names.len());
                     for n in names {
-                        let i =
-                            tm.columns.iter().position(|c| c.name == n).ok_or_else(|| {
-                                crate::engine::fe(format!("unknown column: {}", n))
-                            })?;
+                        let i = tm
+                            .columns
+                            .iter()
+                            .position(|c| c.name == n)
+                            .ok_or_else(|| fe_code("42703", format!("unknown column: {n}")))?;
                         out.push((
                             i,
                             Field {
@@ -91,7 +95,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
                 .resolve_table(schema_name, &table.name)
-                .map_err(|e| fe(e.to_string()))?;
+                .map_err(map_catalog_err)?;
             let schema = Schema {
                 fields: tm
                     .columns
@@ -110,11 +114,13 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
                     UpdateSet::ByName(name, expr) => {
-                        let idx = tm
-                            .columns
-                            .iter()
-                            .position(|c| c.name == name)
-                            .ok_or_else(|| fe(format!("unknown column in UPDATE: {name}")))?;
+                        let idx =
+                            tm.columns
+                                .iter()
+                                .position(|c| c.name == name)
+                                .ok_or_else(|| {
+                                    fe_code("42703", format!("unknown column in UPDATE: {name}"))
+                                })?;
                         let bound_expr = bind_scalar_expr(&expr, &schema, None)?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
@@ -134,7 +140,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
                 .resolve_table(schema_name, &table.name)
-                .map_err(|e| fe(e.to_string()))?;
+                .map_err(map_catalog_err)?;
             let schema = Schema {
                 fields: tm
                     .columns
@@ -221,7 +227,7 @@ fn bind_scalar_expr(
                 .fields
                 .iter()
                 .position(|f| f.name == *name)
-                .ok_or_else(|| fe(format!("unknown column: {}", name)))?;
+                .ok_or_else(|| fe_code("42703", format!("unknown column: {name}")))?;
             ScalarExpr::ColumnIdx(idx)
         }
         ScalarExpr::ColumnIdx(i) => ScalarExpr::ColumnIdx(*i),
@@ -255,5 +261,13 @@ fn apply_param_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
         if ty.is_none() {
             *ty = Some(dt.clone());
         }
+    }
+}
+
+fn map_catalog_err(err: Error) -> PgWireError {
+    if let Some(sql) = err.downcast_ref::<SqlError>() {
+        fe_code(sql.code, sql.message.clone())
+    } else {
+        fe(err.to_string())
     }
 }

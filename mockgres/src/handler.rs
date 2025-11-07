@@ -24,9 +24,9 @@ use crate::binder::bind;
 use crate::db::{CellInput, Db};
 use crate::engine::{
     BoolExpr, DataType, ExecNode, Expr, FilterExec, InsertSource, LimitExec, OrderExec, Plan,
-    ScalarExpr, Schema, SeqScanExec, SortKey, UpdateSet, Value, fe, to_pgwire_stream,
+    ProjectExec, ScalarExpr, Schema, SeqScanExec, SortKey, SqlError, UpdateSet, Value, ValuesExec,
+    fe, fe_code, to_pgwire_stream,
 };
-use crate::engine::{ProjectExec, ValuesExec};
 use crate::parser::Planner;
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 
@@ -63,6 +63,10 @@ impl Mockgres {
 
             Plan::CreateTable { .. } => "CREATE TABLE",
             Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
+            Plan::CreateIndex { .. } => "CREATE INDEX",
+            Plan::DropIndex { .. } => "DROP INDEX",
+            Plan::ShowVariable { .. } => "SHOW",
+            Plan::SetVariable { .. } => "SET",
             Plan::InsertValues { .. } => "INSERT 0",
             Plan::Update { .. } => "UPDATE 0",
             Plan::Delete { .. } => "DELETE 0",
@@ -108,13 +112,13 @@ impl Mockgres {
                 let schema_name = table.schema.as_deref().unwrap_or("public");
                 let _tm = db
                     .resolve_table(schema_name, &table.name)
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
                 let (rows, _) = if positions.is_empty() && schema.fields.is_empty() {
                     (vec![], vec![])
                 } else {
                     db.scan_bound_positions(schema_name, &table.name, &positions)
-                        .map_err(|e| fe(e.to_string()))?
+                        .map_err(map_db_err)?
                 };
                 drop(db);
                 let cnt = rows.len();
@@ -203,7 +207,7 @@ impl Mockgres {
                 let mut db = self.db.write();
                 let schema_name = table.schema.as_deref().unwrap_or("public");
                 db.create_table(schema_name, &table.name, cols.clone(), pk.clone())
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 drop(db);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -219,13 +223,8 @@ impl Mockgres {
             } => {
                 let mut db = self.db.write();
                 let schema_name = table.schema.as_deref().unwrap_or("public");
-                db.alter_table_add_column(
-                    schema_name,
-                    &table.name,
-                    column.clone(),
-                    *if_not_exists,
-                )
-                .map_err(|e| fe(e.to_string()))?;
+                db.alter_table_add_column(schema_name, &table.name, column.clone(), *if_not_exists)
+                    .map_err(map_db_err)?;
                 drop(db);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -242,11 +241,50 @@ impl Mockgres {
                 let mut db = self.db.write();
                 let schema_name = table.schema.as_deref().unwrap_or("public");
                 db.alter_table_drop_column(schema_name, &table.name, column, *if_exists)
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 drop(db);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                     Some("ALTER TABLE".into()),
+                    None,
+                ))
+            }
+
+            Plan::CreateIndex {
+                table,
+                name,
+                columns,
+                if_not_exists,
+            } => {
+                let mut db = self.db.write();
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                db.create_index(
+                    schema_name,
+                    &table.name,
+                    name,
+                    columns.clone(),
+                    *if_not_exists,
+                )
+                .map_err(map_db_err)?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("CREATE INDEX".into()),
+                    None,
+                ))
+            }
+
+            Plan::DropIndex { indexes, if_exists } => {
+                let mut db = self.db.write();
+                for idx in indexes {
+                    let schema_name = idx.schema.as_deref().unwrap_or("public");
+                    db.drop_index(schema_name, &idx.name, *if_exists)
+                        .map_err(map_db_err)?;
+                }
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("DROP INDEX".into()),
                     None,
                 ))
             }
@@ -271,7 +309,7 @@ impl Mockgres {
                 let schema_name = table.schema.as_deref().unwrap_or("public");
                 let inserted = db
                     .insert_full_rows(schema_name, &table.name, realized)
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 drop(db);
                 let tag = format!("INSERT 0 {}", inserted);
                 Ok((
@@ -304,7 +342,7 @@ impl Mockgres {
                         filter.as_ref(),
                         &params,
                     )
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 drop(db);
                 let tag = format!("UPDATE {}", count);
                 Ok((
@@ -318,12 +356,31 @@ impl Mockgres {
                 let schema_name = table.schema.as_deref().unwrap_or("public");
                 let count = db
                     .delete_rows(schema_name, &table.name, filter.as_ref(), &params)
-                    .map_err(|e| fe(e.to_string()))?;
+                    .map_err(map_db_err)?;
                 drop(db);
                 let tag = format!("DELETE {}", count);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                     Some(tag),
+                    None,
+                ))
+            }
+            Plan::ShowVariable { name, schema } => {
+                let value = match lookup_show_value(name) {
+                    Some(v) => v,
+                    None => return Err(fe_code("0A000", format!("SHOW {} not supported", name))),
+                };
+                let rows = vec![vec![Expr::Literal(Value::Text(value))]];
+                let exec = ValuesExec::new(schema.clone(), rows)?;
+                Ok((Box::new(exec), Some("SHOW".into()), Some(1)))
+            }
+            Plan::SetVariable { name, .. } => {
+                if name != "client_min_messages" {
+                    return Err(fe_code("0A000", format!("SET {} not supported", name)));
+                }
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
                     None,
                 ))
             }
@@ -562,6 +619,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::CreateIndex { .. }
+        | Plan::DropIndex { .. }
+        | Plan::ShowVariable { .. }
+        | Plan::SetVariable { .. }
         | Plan::InsertValues { .. } => {}
     }
 }
@@ -627,6 +688,10 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::CreateIndex { .. }
+        | Plan::DropIndex { .. }
+        | Plan::ShowVariable { .. }
+        | Plan::SetVariable { .. }
         | Plan::InsertValues { .. } => {}
     }
 }
@@ -688,6 +753,22 @@ fn map_datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Date => Type::DATE,
         DataType::Timestamp => Type::TIMESTAMP,
         DataType::Bytea => Type::BYTEA,
+    }
+}
+
+fn lookup_show_value(name: &str) -> Option<String> {
+    match name {
+        "server_version" => Some("15.0".to_string()),
+        "search_path" => Some("public".to_string()),
+        _ => None,
+    }
+}
+
+fn map_db_err(err: anyhow::Error) -> PgWireError {
+    if let Some(sql) = err.downcast_ref::<SqlError>() {
+        fe_code(sql.code, sql.message.clone())
+    } else {
+        fe(err.to_string())
     }
 }
 

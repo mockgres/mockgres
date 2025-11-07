@@ -1,9 +1,9 @@
 use crate::engine::{
     BoolExpr, CmpOp, DataType, Expr, Field, InsertSource, ObjName, Plan, ScalarExpr, Schema,
-    Selection, SortKey, UpdateSet, Value, fe,
+    Selection, SortKey, UpdateSet, Value, fe, fe_code,
 };
 use pg_query::protobuf::a_const::Val;
-use pg_query::protobuf::{AConst, AlterTableType, ConstrType};
+use pg_query::protobuf::{AConst, AlterTableType, ConstrType, ObjectType, VariableSetKind};
 use pg_query::{NodeEnum, parse};
 use std::convert::TryFrom;
 
@@ -312,14 +312,12 @@ impl Planner {
                     return Err(fe("one ALTER TABLE command at a time"));
                 }
                 let cmd_node = at.cmds.into_iter().next().unwrap();
-                let cmd = cmd_node
-                    .node
-                    .ok_or_else(|| fe("bad ALTER TABLE command"))?;
+                let cmd = cmd_node.node.ok_or_else(|| fe("bad ALTER TABLE command"))?;
                 let NodeEnum::AlterTableCmd(cmd) = cmd else {
                     return Err(fe("bad ALTER TABLE command"));
                 };
-                let subtype =
-                    AlterTableType::try_from(cmd.subtype).map_err(|_| fe("bad ALTER TABLE type"))?;
+                let subtype = AlterTableType::try_from(cmd.subtype)
+                    .map_err(|_| fe("bad ALTER TABLE type"))?;
                 match subtype {
                     AlterTableType::AtAddColumn => {
                         let col_node = cmd
@@ -349,6 +347,85 @@ impl Planner {
                     }
                     _ => Err(fe("unsupported ALTER TABLE command")),
                 }
+            }
+
+            Some(NodeEnum::IndexStmt(idx)) => {
+                let table_rv = idx.relation.ok_or_else(|| fe("missing index table"))?;
+                let table = ObjName {
+                    schema: if table_rv.schemaname.is_empty() {
+                        None
+                    } else {
+                        Some(table_rv.schemaname)
+                    },
+                    name: table_rv.relname,
+                };
+                if idx.idxname.is_empty() {
+                    return Err(fe("index name required"));
+                }
+                let columns = parse_index_columns(&idx.index_params)?;
+                Ok(Plan::CreateIndex {
+                    name: idx.idxname,
+                    table,
+                    columns,
+                    if_not_exists: idx.if_not_exists,
+                })
+            }
+
+            Some(NodeEnum::DropStmt(drop)) => {
+                let remove_type =
+                    ObjectType::try_from(drop.remove_type).map_err(|_| fe("bad drop type"))?;
+                if remove_type != ObjectType::ObjectIndex {
+                    return Err(fe("only DROP INDEX supported here"));
+                }
+                if drop.objects.is_empty() {
+                    return Err(fe("DROP INDEX requires names"));
+                }
+                let mut names = Vec::with_capacity(drop.objects.len());
+                for obj in drop.objects {
+                    let node = obj.node.ok_or_else(|| fe("bad DROP INDEX name"))?;
+                    names.push(parse_obj_name_from_list(&node)?);
+                }
+                Ok(Plan::DropIndex {
+                    indexes: names,
+                    if_exists: drop.missing_ok,
+                })
+            }
+
+            Some(NodeEnum::VariableShowStmt(show)) => {
+                let schema = Schema {
+                    fields: vec![Field {
+                        name: show.name.clone(),
+                        data_type: DataType::Text,
+                    }],
+                };
+                Ok(Plan::ShowVariable {
+                    name: show.name.to_ascii_lowercase(),
+                    schema,
+                })
+            }
+
+            Some(NodeEnum::VariableSetStmt(set)) => {
+                let name_lower = set.name.to_ascii_lowercase();
+                if name_lower != "client_min_messages" {
+                    return Err(fe_code("0A000", format!("SET {} not supported", set.name)));
+                }
+                let kind = VariableSetKind::try_from(set.kind).map_err(|_| fe("bad SET kind"))?;
+                let value = match kind {
+                    VariableSetKind::VarSetValue | VariableSetKind::VarSetCurrent => {
+                        Some(parse_set_value(&set.args)?)
+                    }
+                    VariableSetKind::VarSetDefault
+                    | VariableSetKind::VarReset
+                    | VariableSetKind::VarResetAll => None,
+                    VariableSetKind::VarSetMulti => {
+                        return Err(fe("SET MULTI not supported"));
+                    }
+                    VariableSetKind::Undefined => return Err(fe("bad SET kind")),
+                };
+                Ok(Plan::SetVariable {
+                    name: name_lower,
+                    value,
+                })
             }
 
             // INSERT VALUES
@@ -889,9 +966,7 @@ fn parse_column_def(
                     return None;
                 };
                 if cons.contype == ConstrType::ConstrDefault as i32 {
-                    cons.raw_expr
-                        .as_ref()
-                        .and_then(|expr| expr.node.as_ref())
+                    cons.raw_expr.as_ref().and_then(|expr| expr.node.as_ref())
                 } else {
                     None
                 }
@@ -920,16 +995,87 @@ fn parse_default_literal(node: &NodeEnum) -> pgwire::error::PgWireResult<Value> 
     }
 }
 
+fn parse_index_columns(params: &[pg_query::Node]) -> pgwire::error::PgWireResult<Vec<String>> {
+    if params.is_empty() {
+        return Err(fe("index requires at least one column"));
+    }
+    let mut cols = Vec::with_capacity(params.len());
+    for p in params {
+        let node = p.node.as_ref().ok_or_else(|| fe("bad index column"))?;
+        let NodeEnum::IndexElem(elem) = node else {
+            return Err(fe("index expressions not supported"));
+        };
+        if elem.expr.is_some() {
+            return Err(fe("expression indexes not supported"));
+        }
+        if elem.name.is_empty() {
+            return Err(fe("index column name required"));
+        }
+        cols.push(elem.name.clone());
+    }
+    Ok(cols)
+}
+
+fn parse_obj_name_from_list(node: &NodeEnum) -> pgwire::error::PgWireResult<ObjName> {
+    let NodeEnum::List(list) = node else {
+        return Err(fe("qualified name must be a list"));
+    };
+    if list.items.is_empty() {
+        return Err(fe("empty name list"));
+    }
+    let mut parts = Vec::new();
+    for item in &list.items {
+        let Some(NodeEnum::String(s)) = item.node.as_ref() else {
+            return Err(fe("expected identifier in name"));
+        };
+        parts.push(s.sval.clone());
+    }
+    let name = parts.pop().unwrap();
+    let schema = if parts.is_empty() {
+        None
+    } else if parts.len() == 1 {
+        Some(parts.remove(0))
+    } else {
+        return Err(fe("schema-qualified name can only include schema.table"));
+    };
+    Ok(ObjName { schema, name })
+}
+
+fn parse_set_value(args: &[pg_query::Node]) -> pgwire::error::PgWireResult<String> {
+    if args.len() != 1 {
+        return Err(fe("SET expects a single value"));
+    }
+    let node = args[0].node.as_ref().ok_or_else(|| fe("bad SET value"))?;
+    let NodeEnum::AConst(c) = node else {
+        return Err(fe("SET value must be constant"));
+    };
+    let value = const_to_value(c)?;
+    literal_value_to_string(value)
+}
+
+fn literal_value_to_string(value: Value) -> pgwire::error::PgWireResult<String> {
+    Ok(match value {
+        Value::Text(s) => s,
+        Value::Int64(i) => i.to_string(),
+        Value::Bool(b) => {
+            if b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
+        _ => return Err(fe("SET literal type not supported")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_alter_table_add_column_default() {
-        let plan = Planner::plan_sql(
-            "alter table items add column note text default 'pending'",
-        )
-        .expect("plan sql");
+        let plan = Planner::plan_sql("alter table items add column note text default 'pending'")
+            .expect("plan sql");
         match plan {
             Plan::AlterTableAddColumn { column, .. } => {
                 let (name, _ty, _nullable, default) = column;
@@ -938,6 +1084,78 @@ mod tests {
                     Some(Value::Text(s)) => assert_eq!(s, "pending"),
                     other => panic!("expected text default, got {other:?}"),
                 }
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_values_preserves_default_cells() {
+        let plan =
+            Planner::plan_sql("insert into things values (DEFAULT, 1)").expect("plan insert");
+        match plan {
+            Plan::InsertValues { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert!(matches!(rows[0][0], InsertSource::Default));
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_and_drop_index_parse() {
+        let create = Planner::plan_sql("create index idx_things on items (id, qty)")
+            .expect("plan create index");
+        match create {
+            Plan::CreateIndex {
+                name,
+                table,
+                columns,
+                if_not_exists,
+            } => {
+                assert_eq!(name, "idx_things");
+                assert_eq!(table.name, "items");
+                assert_eq!(columns, vec!["id".to_string(), "qty".to_string()]);
+                assert!(!if_not_exists);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+
+        let drop =
+            Planner::plan_sql("drop index if exists public.idx_things").expect("plan drop index");
+        match drop {
+            Plan::DropIndex {
+                indexes, if_exists, ..
+            } => {
+                assert!(if_exists);
+                assert_eq!(indexes.len(), 1);
+                assert_eq!(indexes[0].schema.as_deref(), Some("public"));
+                assert_eq!(indexes[0].name, "idx_things");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn show_server_version_parses() {
+        let plan = Planner::plan_sql("show server_version").expect("plan show");
+        match plan {
+            Plan::ShowVariable { name, schema } => {
+                assert_eq!(name, "server_version");
+                assert_eq!(schema.fields.len(), 1);
+                assert_eq!(schema.fields[0].name, "server_version");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_client_min_messages_parses() {
+        let plan = Planner::plan_sql("set client_min_messages = warning").expect("plan set");
+        match plan {
+            Plan::SetVariable { name, value } => {
+                assert_eq!(name, "client_min_messages");
+                assert_eq!(value.as_deref(), Some("warning"));
             }
             other => panic!("unexpected plan: {other:?}"),
         }
