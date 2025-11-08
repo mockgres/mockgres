@@ -2,9 +2,9 @@ mod binder;
 mod catalog;
 mod db;
 mod engine;
-mod handler;
 mod parser;
+mod server;
 mod storage;
 mod types;
 
-pub use handler::Mockgres;
+pub use server::Mockgres;
