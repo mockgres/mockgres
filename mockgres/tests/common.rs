@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -8,33 +9,15 @@ pub struct TestCtx {
     pub client: Client,
     pub _bg: JoinHandle<()>,
     pub shutdown: tokio::sync::oneshot::Sender<()>,
-    pub addr: std::net::SocketAddr,
 }
 
 pub async fn start() -> TestCtx {
-    let handler = Arc::new(mockgres::Mockgres::default());
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-
-    let (shutdown, mut rx) = tokio::sync::oneshot::channel::<()>();
-
-    let h = handler.clone();
-    let _bg = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut rx => break,
-                Ok((socket, _peer)) = listener.accept() => {
-                    let h2 = h.clone();
-                    tokio::spawn(async move {
-                        let _ = pgwire::tokio::process_socket(socket, None, h2).await;
-                    });
-                }
-            }
-        }
-    });
-
-    let conn_str = format!("host={} port={} user=postgres", addr.ip(), addr.port());
+    let server = ensure_server().await;
+    let conn_str = format!(
+        "host={} port={} user=postgres",
+        server.addr.ip(),
+        server.addr.port()
+    );
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("connect");
@@ -43,13 +26,51 @@ pub async fn start() -> TestCtx {
             eprintln!("connection error: {e}");
         }
     });
+    let (shutdown, _) = tokio::sync::oneshot::channel();
 
     TestCtx {
         client,
         _bg: conn_task,
         shutdown,
-        addr,
     }
+}
+
+struct ServerHandle {
+    addr: std::net::SocketAddr,
+    _bg: JoinHandle<()>,
+    _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+static SERVER: OnceCell<ServerHandle> = OnceCell::const_new();
+
+async fn ensure_server() -> &'static ServerHandle {
+    SERVER
+        .get_or_init(|| async {
+            let handler = Arc::new(mockgres::Mockgres::default());
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("local addr");
+            let (shutdown, mut rx) = tokio::sync::oneshot::channel::<()>();
+            let h = handler.clone();
+            let bg = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = &mut rx => break,
+                        Ok((socket, _peer)) = listener.accept() => {
+                            let h2 = h.clone();
+                            tokio::spawn(async move {
+                                let _ = pgwire::tokio::process_socket(socket, None, h2).await;
+                            });
+                        }
+                    }
+                }
+            });
+            ServerHandle {
+                addr,
+                _bg: bg,
+                _shutdown: shutdown,
+            }
+        })
+        .await
 }
 
 // run a simple query and return the first cell as string
