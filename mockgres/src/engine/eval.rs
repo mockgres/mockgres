@@ -1,7 +1,7 @@
 use crate::types::{format_bytea, format_date, format_timestamp};
-use futures::{stream, Stream, StreamExt};
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
+use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use std::sync::Arc;

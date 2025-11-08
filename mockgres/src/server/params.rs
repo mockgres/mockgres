@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::sync::Arc;
 
-use pgwire::api::results::FieldFormat;
 use pgwire::api::Type;
+use pgwire::api::results::FieldFormat;
 use pgwire::error::PgWireResult;
 
 use crate::engine::{BoolExpr, DataType, InsertSource, Plan, ScalarExpr, UpdateSet, Value, fe};

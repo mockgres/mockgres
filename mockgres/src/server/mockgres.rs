@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use pgwire::api::portal::Format;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireServerHandlers,
-    auth::{noop::NoopStartupHandler, StartupHandler},
+    auth::{StartupHandler, noop::NoopStartupHandler},
     cancel::CancelHandler,
     query::{ExtendedQueryHandler, SimpleQueryHandler},
     results::{
@@ -21,7 +21,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use crate::binder::bind;
 use crate::db::Db;
 use crate::engine::{Plan, Value, to_pgwire_stream};
-use crate::parser::Planner;
+use crate::sql::Planner;
 
 use super::describe::plan_fields;
 use super::exec_builder::{build_executor, command_tag};
@@ -220,7 +220,7 @@ pub mod pgwire_parser {
     use pgwire::error::PgWireResult;
 
     use crate::engine::Plan;
-    use crate::parser::Planner;
+    use crate::sql::Planner;
 
     #[derive(Clone, Default)]
     pub struct PgQueryParserAdapter;
