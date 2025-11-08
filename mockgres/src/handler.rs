@@ -71,6 +71,9 @@ impl Mockgres {
             Plan::Update { .. } => "UPDATE 0",
             Plan::Delete { .. } => "DELETE 0",
             Plan::UnboundSeqScan { .. } => "SELECT 0",
+            Plan::BeginTransaction => "BEGIN",
+            Plan::CommitTransaction => "COMMIT",
+            Plan::RollbackTransaction => "ROLLBACK",
         }
     }
 
@@ -417,6 +420,36 @@ impl Mockgres {
                     None,
                 ))
             }
+            Plan::BeginTransaction => {
+                let mut db = self.db.write();
+                db.begin_transaction().map_err(map_db_err)?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("BEGIN".into()),
+                    None,
+                ))
+            }
+            Plan::CommitTransaction => {
+                let mut db = self.db.write();
+                db.commit_transaction().map_err(map_db_err)?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("COMMIT".into()),
+                    None,
+                ))
+            }
+            Plan::RollbackTransaction => {
+                let mut db = self.db.write();
+                db.rollback_transaction().map_err(map_db_err)?;
+                drop(db);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("ROLLBACK".into()),
+                    None,
+                ))
+            }
             Plan::UnboundSeqScan { .. } => Err(fe("unbound plan; call binder first")),
         }
     }
@@ -670,7 +703,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::ShowVariable { .. }
-        | Plan::SetVariable { .. } => {}
+        | Plan::SetVariable { .. }
+        | Plan::BeginTransaction
+        | Plan::CommitTransaction
+        | Plan::RollbackTransaction => {}
     }
 }
 
@@ -764,7 +800,10 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::ShowVariable { .. }
-        | Plan::SetVariable { .. } => {}
+        | Plan::SetVariable { .. }
+        | Plan::BeginTransaction
+        | Plan::CommitTransaction
+        | Plan::RollbackTransaction => {}
     }
 }
 

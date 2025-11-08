@@ -9,7 +9,7 @@ pub enum RowKey {
 
 pub type Row = Vec<Value>;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Table {
     pub rows_by_key: HashMap<RowKey, Row>,
     pub next_rowid: u64,

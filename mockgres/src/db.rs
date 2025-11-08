@@ -16,11 +16,19 @@ fn sql_err(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(SqlError::new(code, msg.into()))
 }
 
+#[derive(Clone, Debug)]
+struct DbSnapshot {
+    catalog: Catalog,
+    tables: HashMap<TableId, Table>,
+    next_tid: u64,
+}
+
 #[derive(Debug)]
 pub struct Db {
     pub catalog: Catalog,
     pub tables: HashMap<TableId, Table>,
     pub next_tid: u64,
+    txn_stack: Vec<DbSnapshot>,
 }
 
 impl Default for Db {
@@ -31,11 +39,50 @@ impl Default for Db {
             catalog,
             tables: HashMap::new(),
             next_tid: 1,
+            txn_stack: Vec::new(),
         }
     }
 }
 
 impl Db {
+    pub fn begin_transaction(&mut self) -> anyhow::Result<()> {
+        if self.in_transaction() {
+            return Err(sql_err("25001", "transaction already in progress"));
+        }
+        let snapshot = self.snapshot();
+        self.txn_stack.push(snapshot);
+        Ok(())
+    }
+
+    pub fn commit_transaction(&mut self) -> anyhow::Result<()> {
+        if self.txn_stack.pop().is_none() {
+            return Err(sql_err("25P01", "no transaction in progress"));
+        }
+        Ok(())
+    }
+
+    pub fn rollback_transaction(&mut self) -> anyhow::Result<()> {
+        let Some(snapshot) = self.txn_stack.pop() else {
+            return Err(sql_err("25P01", "no transaction in progress"));
+        };
+        self.catalog = snapshot.catalog;
+        self.tables = snapshot.tables;
+        self.next_tid = snapshot.next_tid;
+        Ok(())
+    }
+
+    pub fn in_transaction(&self) -> bool {
+        !self.txn_stack.is_empty()
+    }
+
+    fn snapshot(&self) -> DbSnapshot {
+        DbSnapshot {
+            catalog: self.catalog.clone(),
+            tables: self.tables.clone(),
+            next_tid: self.next_tid,
+        }
+    }
+
     pub fn create_table(
         &mut self,
         schema: &str,

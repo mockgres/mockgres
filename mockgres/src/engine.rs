@@ -351,6 +351,9 @@ pub enum Plan {
         table: ObjName,
         filter: Option<BoolExpr>,
     },
+    BeginTransaction,
+    CommitTransaction,
+    RollbackTransaction,
 }
 
 #[derive(Clone, Debug)]
@@ -401,7 +404,10 @@ impl Plan {
             | Plan::SetVariable { .. }
             | Plan::InsertValues { .. }
             | Plan::Update { .. }
-            | Plan::Delete { .. } => {
+            | Plan::Delete { .. }
+            | Plan::BeginTransaction
+            | Plan::CommitTransaction
+            | Plan::RollbackTransaction => {
                 static EMPTY: Schema = Schema { fields: vec![] };
                 &EMPTY
             }

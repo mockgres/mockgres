@@ -3,7 +3,9 @@ use crate::engine::{
     ScalarFunc, ScalarUnaryOp, Schema, Selection, SortKey, UpdateSet, Value, fe, fe_code,
 };
 use pg_query::protobuf::a_const::Val;
-use pg_query::protobuf::{AConst, AlterTableType, ConstrType, ObjectType, VariableSetKind};
+use pg_query::protobuf::{
+    AConst, AlterTableType, ConstrType, ObjectType, TransactionStmtKind, VariableSetKind,
+};
 use pg_query::{NodeEnum, parse};
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -31,6 +33,7 @@ impl Planner {
             return Err(fe("empty query"));
         };
         match stmt.stmt.and_then(|n| n.node) {
+            Some(NodeEnum::TransactionStmt(tx)) => plan_transaction_stmt(&tx),
             // SELECT
             Some(NodeEnum::SelectStmt(sel)) => {
                 // SELECT <literal>[, <literal>...]
@@ -1135,6 +1138,37 @@ fn parse_limit_count(node: &NodeEnum) -> pgwire::error::PgWireResult<usize> {
             }
         }
         _ => Err(fe("unsupported limit expression")),
+    }
+}
+
+fn plan_transaction_stmt(
+    stmt: &pg_query::protobuf::TransactionStmt,
+) -> pgwire::error::PgWireResult<Plan> {
+    if !stmt.options.is_empty() {
+        return Err(fe_code("0A000", "transaction options not supported"));
+    }
+    if stmt.chain {
+        return Err(fe_code("0A000", "transaction chain not supported"));
+    }
+    let kind =
+        TransactionStmtKind::try_from(stmt.kind).map_err(|_| fe("unknown transaction kind"))?;
+    match kind {
+        TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart => {
+            Ok(Plan::BeginTransaction)
+        }
+        TransactionStmtKind::TransStmtCommit => Ok(Plan::CommitTransaction),
+        TransactionStmtKind::TransStmtRollback => Ok(Plan::RollbackTransaction),
+        TransactionStmtKind::Undefined => Err(fe("transaction kind not specified")),
+        TransactionStmtKind::TransStmtSavepoint
+        | TransactionStmtKind::TransStmtRelease
+        | TransactionStmtKind::TransStmtRollbackTo => {
+            Err(fe_code("0A000", "savepoints are not supported"))
+        }
+        TransactionStmtKind::TransStmtPrepare
+        | TransactionStmtKind::TransStmtCommitPrepared
+        | TransactionStmtKind::TransStmtRollbackPrepared => {
+            Err(fe_code("0A000", "two-phase commit is not supported"))
+        }
     }
 }
 
