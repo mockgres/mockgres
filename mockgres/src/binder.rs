@@ -1,7 +1,7 @@
 use crate::db::Db;
 use crate::engine::{
     BoolExpr, DataType, Field, Plan, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection,
-    SqlError, UpdateSet, Value, fe, fe_code,
+    SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
 use anyhow::Error;
 use pgwire::error::PgWireError;
@@ -186,9 +186,44 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
         }
         Plan::Order { input, keys } => {
             let child = bind(db, *input)?;
+            let child_schema = child.schema().clone();
+            let mut bound_keys = Vec::with_capacity(keys.len());
+            for key in keys {
+                match key {
+                    SortKey::ByName {
+                        col,
+                        asc,
+                        nulls_first,
+                    } => {
+                        let idx = child_schema
+                            .fields
+                            .iter()
+                            .position(|f| f.name == col)
+                            .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
+                        bound_keys.push(SortKey::ByIndex {
+                            idx,
+                            asc,
+                            nulls_first,
+                        });
+                    }
+                    SortKey::Expr {
+                        expr,
+                        asc,
+                        nulls_first,
+                    } => {
+                        let bound = bind_scalar_expr(&expr, &child_schema, None)?;
+                        bound_keys.push(SortKey::Expr {
+                            expr: bound,
+                            asc,
+                            nulls_first,
+                        });
+                    }
+                    other => bound_keys.push(other),
+                }
+            }
             Ok(Plan::Order {
                 input: Box::new(child),
-                keys,
+                keys: bound_keys,
             })
         }
         Plan::Limit { input, limit } => {

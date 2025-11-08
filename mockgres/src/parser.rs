@@ -5,6 +5,7 @@ use crate::engine::{
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, AlterTableType, ConstrType, ObjectType, VariableSetKind};
 use pg_query::{NodeEnum, parse};
+use std::collections::HashMap;
 use std::convert::TryFrom;
 
 pub struct Planner;
@@ -227,17 +228,22 @@ impl Planner {
                 // project them away post-filter to keep user-visible schema intact.
                 let mut project_prefix_len: Option<usize> = None;
                 if let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
-                    let requested_len = cols.len();
                     let mut needed = Vec::new();
                     collect_columns_from_bool_expr(expr, &mut needed);
-                    for name in needed {
-                        if !cols.iter().any(|c| c == &name) {
-                            if project_prefix_len.is_none() {
-                                project_prefix_len = Some(requested_len);
-                            }
-                            cols.push(name);
-                        }
+                    ensure_columns_present(cols, needed, &mut project_prefix_len);
+                }
+                let mut order_keys: Option<Vec<SortKey>> = None;
+                if !sel.sort_clause.is_empty() {
+                    let mut keys = parse_order_clause(&sel.sort_clause)?;
+                    if let Some(items) = &projection_items {
+                        rewrite_order_keys_for_projection(&mut keys, items);
                     }
+                    if let Selection::Columns(cols) = &mut selection {
+                        let mut needed = Vec::new();
+                        collect_columns_from_order_keys(&keys, &mut needed);
+                        ensure_columns_present(cols, needed, &mut project_prefix_len);
+                    }
+                    order_keys = Some(keys);
                 }
 
                 // start with unbound scan, then wrap in filter → order → limit
@@ -253,8 +259,7 @@ impl Planner {
                 }
 
                 // order by: ordinals or column names
-                if !sel.sort_clause.is_empty() {
-                    let keys = parse_order_clause(&sel.sort_clause)?;
+                if let Some(keys) = order_keys {
                     plan = Plan::Order {
                         input: Box::new(plan),
                         keys,
@@ -932,6 +937,85 @@ fn sanitize_insert_expr(expr: ScalarExpr) -> pgwire::error::PgWireResult<ScalarE
     }
 }
 
+fn rewrite_order_keys_for_projection(keys: &mut [SortKey], projection: &[(ScalarExpr, String)]) {
+    if projection.is_empty() {
+        return;
+    }
+    let mut alias_map: HashMap<String, ScalarExpr> = HashMap::new();
+    for (expr, name) in projection {
+        alias_map.insert(name.clone(), expr.clone());
+        alias_map.insert(name.to_ascii_lowercase(), expr.clone());
+    }
+    for key in keys.iter_mut() {
+        match key {
+            SortKey::ByIndex {
+                idx,
+                asc,
+                nulls_first,
+            } => {
+                if *idx < projection.len() {
+                    let expr = projection[*idx].0.clone();
+                    *key = SortKey::Expr {
+                        expr,
+                        asc: *asc,
+                        nulls_first: *nulls_first,
+                    };
+                }
+            }
+            SortKey::ByName {
+                col,
+                asc,
+                nulls_first,
+            } => {
+                let lookup = alias_map
+                    .get(col)
+                    .or_else(|| alias_map.get(&col.to_ascii_lowercase()));
+                if let Some(expr) = lookup {
+                    *key = SortKey::Expr {
+                        expr: expr.clone(),
+                        asc: *asc,
+                        nulls_first: *nulls_first,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_columns_from_order_keys(keys: &[SortKey], out: &mut Vec<String>) {
+    for key in keys {
+        match key {
+            SortKey::ByName { col, .. } => {
+                if !out.iter().any(|c| c == col) {
+                    out.push(col.clone());
+                }
+            }
+            SortKey::Expr { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+            _ => {}
+        }
+    }
+}
+
+fn ensure_columns_present(
+    cols: &mut Vec<String>,
+    needed: Vec<String>,
+    project_prefix_len: &mut Option<usize>,
+) {
+    if needed.is_empty() {
+        return;
+    }
+    let requested_len = cols.len();
+    for name in needed {
+        if !cols.iter().any(|c| c == &name) {
+            if project_prefix_len.is_none() {
+                *project_prefix_len = Some(requested_len);
+            }
+            cols.push(name);
+        }
+    }
+}
+
 fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
     match expr {
         ScalarExpr::Column(name) => {
@@ -1024,7 +1108,14 @@ fn parse_order_clause(
                     nulls_first,
                 }
             }
-            _ => return Err(fe("unsupported order by expression")),
+            _ => {
+                let expr = parse_scalar_expr(expr)?;
+                SortKey::Expr {
+                    expr,
+                    asc,
+                    nulls_first,
+                }
+            }
         };
         keys.push(key);
     }

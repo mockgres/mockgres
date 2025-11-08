@@ -372,6 +372,11 @@ pub enum SortKey {
         asc: bool,
         nulls_first: Option<bool>,
     },
+    Expr {
+        expr: ScalarExpr,
+        asc: bool,
+        nulls_first: Option<bool>,
+    },
 }
 
 impl Plan {
@@ -586,39 +591,105 @@ impl ExecNode for FilterExec {
 // order exec: materializes child rows, sorts them, then yields
 pub struct OrderExec {
     schema: Schema,
-    rows: Vec<Row>,
+    rows: Vec<(Row, Vec<Value>)>,
     pos: usize,
+}
+
+struct OrderKeySpec {
+    kind: OrderKeyKind,
+    asc: bool,
+    nulls_first: bool,
+}
+
+enum OrderKeyKind {
+    Column(usize),
+    Expr(usize),
 }
 
 impl OrderExec {
     pub fn new(
         schema: Schema,
         mut child: Box<dyn ExecNode>,
-        keys: Vec<(usize, bool, Option<bool>)>,
+        keys: Vec<SortKey>,
+        params: Arc<Vec<Value>>,
     ) -> PgWireResult<Self> {
         child.open()?;
+
+        let mut expr_specs = Vec::new();
+        let mut resolved_keys = Vec::with_capacity(keys.len());
+        for key in keys {
+            match key {
+                SortKey::ByIndex {
+                    idx,
+                    asc,
+                    nulls_first,
+                } => {
+                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                    resolved_keys.push(OrderKeySpec {
+                        kind: OrderKeyKind::Column(idx),
+                        asc,
+                        nulls_first: nulls_first_eff,
+                    });
+                }
+                SortKey::ByName {
+                    col,
+                    asc,
+                    nulls_first,
+                } => {
+                    let idx = schema
+                        .fields
+                        .iter()
+                        .position(|f| f.name == col)
+                        .ok_or_else(|| fe(format!("unknown column in order by: {}", col)))?;
+                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                    resolved_keys.push(OrderKeySpec {
+                        kind: OrderKeyKind::Column(idx),
+                        asc,
+                        nulls_first: nulls_first_eff,
+                    });
+                }
+                SortKey::Expr {
+                    expr,
+                    asc,
+                    nulls_first,
+                } => {
+                    let idx = expr_specs.len();
+                    expr_specs.push(expr);
+                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                    resolved_keys.push(OrderKeySpec {
+                        kind: OrderKeyKind::Expr(idx),
+                        asc,
+                        nulls_first: nulls_first_eff,
+                    });
+                }
+            }
+        }
+
         let mut buf = Vec::new();
         while let Some(r) = child.next()? {
-            buf.push(r);
+            let mut expr_vals = Vec::with_capacity(expr_specs.len());
+            for expr in &expr_specs {
+                expr_vals.push(eval_scalar_expr(&r, expr, &params)?);
+            }
+            buf.push((r, expr_vals));
         }
         child.close()?;
 
-        // resolve nulls policy up front: postgres default => asc => nulls last, desc => nulls first
-        let resolved_keys: Vec<(usize, bool, bool)> = keys
-            .into_iter()
-            .map(|(idx, asc, nulls_first_opt)| {
-                let nulls_first_eff = nulls_first_opt.unwrap_or(!asc);
-                (idx, asc, nulls_first_eff)
-            })
-            .collect();
-
-        // stable sort by keys, honoring asc/desc and nulls_first per key
-        buf.sort_by(|a, b| {
+        buf.sort_by(|(row_a, exprs_a), (row_b, exprs_b)| {
             use std::cmp::Ordering;
-            for (idx, asc, nulls_first) in &resolved_keys {
-                let av = a.get(*idx);
-                let bv = b.get(*idx);
-                let ord = order_values(av, bv, *asc, *nulls_first);
+            for spec in &resolved_keys {
+                let ord = match spec.kind {
+                    OrderKeyKind::Column(idx) => {
+                        let av = row_a.get(idx);
+                        let bv = row_b.get(idx);
+                        order_values(av, bv, spec.asc, spec.nulls_first)
+                    }
+                    OrderKeyKind::Expr(idx) => {
+                        let av = exprs_a.get(idx).map(|v| v);
+                        let bv = exprs_b.get(idx).map(|v| v);
+                        order_values(av, bv, spec.asc, spec.nulls_first)
+                    }
+                };
                 if ord != Ordering::Equal {
                     return ord;
                 }
@@ -631,6 +702,26 @@ impl OrderExec {
             rows: buf,
             pos: 0,
         })
+    }
+}
+
+impl ExecNode for OrderExec {
+    fn open(&mut self) -> PgWireResult<()> {
+        Ok(())
+    }
+    fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].0.clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+    fn close(&mut self) -> PgWireResult<()> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -758,26 +849,6 @@ fn order_values(
         }
 
         _ => Equal,
-    }
-}
-
-impl ExecNode for OrderExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        Ok(())
-    }
-    fn next(&mut self) -> PgWireResult<Option<Row>> {
-        if self.pos >= self.rows.len() {
-            return Ok(None);
-        }
-        let r = self.rows[self.pos].clone();
-        self.pos += 1;
-        Ok(Some(r))
-    }
-    fn close(&mut self) -> PgWireResult<()> {
-        Ok(())
-    }
-    fn schema(&self) -> &Schema {
-        &self.schema
     }
 }
 

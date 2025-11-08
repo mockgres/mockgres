@@ -24,7 +24,7 @@ use crate::binder::bind;
 use crate::db::{CellInput, Db};
 use crate::engine::{
     BoolExpr, DataType, ExecNode, Expr, FilterExec, InsertSource, LimitExec, OrderExec, Plan,
-    ProjectExec, ScalarExpr, Schema, SeqScanExec, SortKey, SqlError, UpdateSet, Value, ValuesExec,
+    ProjectExec, ScalarExpr, Schema, SeqScanExec, SqlError, UpdateSet, Value, ValuesExec,
     eval_scalar_expr, fe, fe_code, to_pgwire_stream,
 };
 use crate::parser::Planner;
@@ -167,33 +167,8 @@ impl Mockgres {
 
             Plan::Order { input, keys } => {
                 let (child, _tag, cnt) = self.build_executor(input, params.clone())?;
-                let mut idx_keys = Vec::with_capacity(keys.len());
-                for k in keys {
-                    match k {
-                        SortKey::ByIndex {
-                            idx,
-                            asc,
-                            nulls_first,
-                        } => idx_keys.push((*idx, *asc, *nulls_first)),
-                        SortKey::ByName {
-                            col,
-                            asc,
-                            nulls_first,
-                        } => {
-                            let i = child
-                                .schema()
-                                .fields
-                                .iter()
-                                .position(|f| f.name == *col)
-                                .ok_or_else(|| {
-                                    fe(format!("unknown column in order by: {}", col))
-                                })?;
-                            idx_keys.push((i, *asc, *nulls_first));
-                        }
-                    }
-                }
                 let schema = child.schema().clone();
-                let exec = Box::new(OrderExec::new(schema, child, idx_keys)?);
+                let exec = Box::new(OrderExec::new(schema, child, keys.clone(), params.clone())?);
                 Ok((exec, None, cnt))
             }
 
