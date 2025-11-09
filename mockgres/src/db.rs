@@ -1,12 +1,12 @@
-use crate::catalog::{Catalog, ForeignKeyMeta, TableId, TableMeta};
+use crate::catalog::{Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, ForeignKeySpec, ScalarExpr, SqlError, Value, cast_value_to_type,
-    eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ScalarExpr, SqlError, Value,
+    cast_value_to_type, eval_bool_expr, eval_scalar_expr,
 };
 use crate::session::{RowPointer, TxnChanges};
-use crate::storage::{Row, RowKey, Table, VersionedRow};
+use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
 use crate::txn::{TxId, VisibilityContext};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub enum CellInput {
@@ -42,7 +42,7 @@ impl Db {
         schema: &str,
         name: &str,
         cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
-        pk_names: Option<Vec<String>>,
+        pk_spec: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
     ) -> anyhow::Result<TableId> {
         self.catalog.ensure_schema(schema);
@@ -76,21 +76,7 @@ impl Db {
             });
         }
 
-        // map pk names -> positions
-        let pk: Option<Vec<usize>> = match pk_names {
-            None => None,
-            Some(ns) => {
-                let mut pos = Vec::with_capacity(ns.len());
-                for n in ns {
-                    let i = columns
-                        .iter()
-                        .position(|c| c.name == n)
-                        .ok_or_else(|| sql_err("42703", format!("unknown pk column: {n}")))?;
-                    pos.push(i);
-                }
-                Some(pos)
-            }
-        };
+        let pk_meta = self.build_primary_key_meta(name, &mut columns, pk_spec)?;
 
         let fk_metas = self.build_foreign_keys(schema, name, &columns, foreign_keys)?;
 
@@ -98,10 +84,12 @@ impl Db {
             id,
             name: name.to_string(),
             columns: columns.clone(),
-            pk,
+            primary_key: pk_meta,
             indexes: vec![],
             foreign_keys: fk_metas,
         };
+
+        let has_pk = tm.primary_key.is_some();
 
         self.catalog
             .schemas
@@ -110,8 +98,67 @@ impl Db {
             .tables
             .insert(name.to_string(), tm);
 
-        self.tables.insert(id, Table::default());
+        self.tables.insert(id, Table::with_pk(has_pk));
         Ok(id)
+    }
+
+    fn table_meta_by_id(&self, id: TableId) -> Option<&TableMeta> {
+        for schema in self.catalog.schemas.values() {
+            for meta in schema.tables.values() {
+                if meta.id == id {
+                    return Some(meta);
+                }
+            }
+        }
+        None
+    }
+
+    fn build_primary_key_meta(
+        &self,
+        table_name: &str,
+        columns: &mut [Column],
+        pk_spec: Option<PrimaryKeySpec>,
+    ) -> anyhow::Result<Option<PrimaryKeyMeta>> {
+        let Some(spec) = pk_spec else {
+            return Ok(None);
+        };
+        let PrimaryKeySpec {
+            name,
+            columns: pk_columns,
+        } = spec;
+        if pk_columns.is_empty() {
+            return Err(sql_err(
+                "42P16",
+                format!("primary key on {table_name} must reference at least one column"),
+            ));
+        }
+        let mut positions: Vec<ColId> = Vec::with_capacity(pk_columns.len());
+        for col_name in pk_columns {
+            let idx = columns
+                .iter()
+                .position(|c| c.name == col_name)
+                .ok_or_else(|| {
+                    sql_err(
+                        "42703",
+                        format!("primary key column {col_name} does not exist"),
+                    )
+                })?;
+            if positions.contains(&idx) {
+                return Err(sql_err(
+                    "42P16",
+                    format!("column {col_name} referenced multiple times in primary key"),
+                ));
+            }
+            positions.push(idx);
+        }
+        for idx in &positions {
+            columns[*idx].nullable = false;
+        }
+        let name = name.unwrap_or_else(|| format!("{table_name}_pkey"));
+        Ok(Some(PrimaryKeyMeta {
+            name,
+            columns: positions,
+        }))
     }
 
     fn build_foreign_keys(
@@ -122,7 +169,7 @@ impl Db {
         specs: Vec<ForeignKeySpec>,
     ) -> anyhow::Result<Vec<ForeignKeyMeta>> {
         let mut metas = Vec::with_capacity(specs.len());
-        for spec in specs {
+        for (spec_idx, spec) in specs.into_iter().enumerate() {
             if spec.columns.is_empty() {
                 return Err(sql_err(
                     "42830",
@@ -150,21 +197,42 @@ impl Db {
                 .schema
                 .clone()
                 .unwrap_or_else(|| "public".to_string());
-            let referenced_table = spec.referenced_table.name.clone();
+            let referenced_table_name = spec.referenced_table.name.clone();
             let ref_meta = self
                 .catalog
-                .get_table(&referenced_schema, &referenced_table)
+                .get_table(&referenced_schema, &referenced_table_name)
                 .ok_or_else(|| {
                     sql_err(
                         "42830",
                         format!(
                             "referenced table {}.{} for foreign key on {}.{} does not exist",
-                            referenced_schema, referenced_table, table_schema, table_name
+                            referenced_schema, referenced_table_name, table_schema, table_name
                         ),
                     )
                 })?;
+            let Some(parent_pk) = ref_meta.primary_key.as_ref() else {
+                return Err(sql_err(
+                    "42830",
+                    format!(
+                        "referenced table {}.{} must have a primary key",
+                        referenced_schema, referenced_table_name
+                    ),
+                ));
+            };
+            if parent_pk.columns.len() != local_indexes.len() {
+                return Err(sql_err(
+                    "42830",
+                    format!(
+                        "foreign key on {}.{} has {} local columns but parent primary key has {}",
+                        table_schema,
+                        table_name,
+                        local_indexes.len(),
+                        parent_pk.columns.len()
+                    ),
+                ));
+            }
 
-            let referenced_indexes: Vec<usize> = if let Some(ref_cols) = spec.referenced_columns {
+            let referenced_indexes = if let Some(ref_cols) = spec.referenced_columns {
                 if ref_cols.len() != local_indexes.len() {
                     return Err(sql_err(
                         "42830",
@@ -187,8 +255,8 @@ impl Db {
                             sql_err(
                                 "42703",
                                 format!(
-                                    "referenced column {}.{} does not exist on {}.{}",
-                                    rc, referenced_table, referenced_schema, referenced_table
+                                    "referenced column {} does not exist on {}.{}",
+                                    rc, referenced_schema, referenced_table_name
                                 ),
                             )
                         })?;
@@ -196,30 +264,22 @@ impl Db {
                 }
                 idxs
             } else {
-                let Some(pk) = ref_meta.pk.as_ref() else {
-                    return Err(sql_err(
-                        "42830",
-                        format!(
-                            "referenced table {}.{} must have a primary key or explicit column list",
-                            referenced_schema, referenced_table
-                        ),
-                    ));
-                };
-                if pk.len() != local_indexes.len() {
-                    return Err(sql_err(
-                        "42830",
-                        format!(
-                            "foreign key on {}.{} does not match referenced primary key column count",
-                            table_schema, table_name
-                        ),
-                    ));
-                }
-                pk.clone()
+                parent_pk.columns.clone()
             };
 
-            for (local_idx, ref_idx) in local_indexes.iter().zip(referenced_indexes.iter()) {
+            let ordered_local = self.align_local_to_parent_pk(
+                &local_indexes,
+                &referenced_indexes,
+                parent_pk,
+                table_schema,
+                table_name,
+                &referenced_schema,
+                &referenced_table_name,
+            )?;
+
+            for (local_idx, pk_idx) in ordered_local.iter().zip(parent_pk.columns.iter()) {
                 let local_type = &columns[*local_idx].data_type;
-                let ref_type = &ref_meta.columns[*ref_idx].data_type;
+                let ref_type = &ref_meta.columns[*pk_idx].data_type;
                 if local_type != ref_type {
                     return Err(sql_err(
                         "42804",
@@ -227,21 +287,55 @@ impl Db {
                             "foreign key column {} type {:?} does not match referenced column {} type {:?}",
                             columns[*local_idx].name,
                             local_type,
-                            ref_meta.columns[*ref_idx].name,
+                            ref_meta.columns[*pk_idx].name,
                             ref_type
                         ),
                     ));
                 }
             }
 
+            let fk_name = spec
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_fk{}", table_name, spec_idx + 1));
+
             metas.push(ForeignKeyMeta {
-                columns: local_indexes,
-                referenced_schema,
-                referenced_table,
-                referenced_columns: referenced_indexes,
+                name: fk_name,
+                local_columns: ordered_local,
+                referenced_table: ref_meta.id,
+                referenced_schema: referenced_schema.clone(),
+                referenced_table_name: referenced_table_name.clone(),
+                referenced_columns: parent_pk.columns.clone(),
+                on_delete: spec.on_delete,
             });
         }
         Ok(metas)
+    }
+
+    fn align_local_to_parent_pk(
+        &self,
+        local_indexes: &[ColId],
+        referenced_indexes: &[ColId],
+        parent_pk: &PrimaryKeyMeta,
+        table_schema: &str,
+        table_name: &str,
+        referenced_schema: &str,
+        referenced_table_name: &str,
+    ) -> anyhow::Result<Vec<ColId>> {
+        let mut ordered = Vec::with_capacity(parent_pk.columns.len());
+        for pk_idx in &parent_pk.columns {
+            let Some(pos) = referenced_indexes.iter().position(|idx| idx == pk_idx) else {
+                return Err(sql_err(
+                    "42830",
+                    format!(
+                        "foreign key on {}.{} must reference primary key columns of {}.{}",
+                        table_schema, table_name, referenced_schema, referenced_table_name
+                    ),
+                ));
+            };
+            ordered.push(local_indexes[pos]);
+        }
+        Ok(ordered)
     }
 
     pub fn alter_table_add_column(
@@ -340,9 +434,9 @@ impl Db {
                 ));
             }
             if meta
-                .pk
+                .primary_key
                 .as_ref()
-                .map(|pk| pk.contains(&idx))
+                .map(|pk| pk.columns.contains(&idx))
                 .unwrap_or(false)
             {
                 return Err(sql_err(
@@ -360,7 +454,7 @@ impl Db {
             if meta
                 .foreign_keys
                 .iter()
-                .any(|fk| fk.columns.contains(&drop_idx))
+                .any(|fk| fk.local_columns.contains(&drop_idx))
             {
                 return Err(sql_err(
                     "2BP01",
@@ -371,7 +465,7 @@ impl Db {
         let inbound = self.collect_inbound_foreign_keys(schema, name);
         if inbound
             .iter()
-            .any(|fk| fk.referenced_columns.contains(&drop_idx))
+            .any(|fk| fk.fk.referenced_columns.contains(&drop_idx))
         {
             return Err(sql_err(
                 "2BP01",
@@ -495,23 +589,6 @@ impl Db {
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))
     }
 
-    pub fn resolve_table_mut(
-        &mut self,
-        schema: &str,
-        name: &str,
-    ) -> anyhow::Result<(&TableMeta, &mut Table)> {
-        let tm = self
-            .catalog
-            .get_table(schema, name)
-            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
-            .clone();
-        let t = self
-            .tables
-            .get_mut(&tm.id)
-            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
-        Ok((self.catalog.get_table(schema, name).unwrap(), t))
-    }
-
     pub fn insert_full_rows(
         &mut self,
         schema: &str,
@@ -522,10 +599,12 @@ impl Db {
         let meta = self
             .catalog
             .get_table(schema, name)
-            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
+            .clone();
         let table_id = meta.id;
         let ncols = meta.columns.len();
-        let mut realized: Vec<(usize, Row)> = Vec::with_capacity(rows.len());
+        let mut staged: Vec<(Row, Option<RowKey>, Vec<Option<Vec<Value>>>)> =
+            Vec::with_capacity(rows.len());
 
         for (ridx, r) in rows.drain(..).enumerate() {
             // arity: number of values must match table columns
@@ -549,63 +628,72 @@ impl Db {
                     CellInput::Value(v) => v,
                     CellInput::Default => {
                         if let Some(expr) = &col.default {
-                            eval_column_default(expr, col, i, meta)?
+                            eval_column_default(expr, col, i, &meta)?
                         } else {
                             Value::Null
                         }
                     }
                 };
-                let coerced = coerce_value_for_column(value, col, i, meta)?;
+                let coerced = coerce_value_for_column(value, col, i, &meta)?;
                 out.push(coerced);
             }
-            self.ensure_outbound_foreign_keys(schema, name, meta, &out)?;
-            realized.push((ridx, out));
+            let pk_key = self.build_primary_key_row_key(&meta, &out)?;
+            let fk_keys = self.ensure_outbound_foreign_keys(schema, name, &meta, &out)?;
+            staged.push((out, pk_key, fk_keys));
         }
 
-        let tab = self
+        let mut table = self
             .tables
-            .get_mut(&table_id)
+            .remove(&table_id)
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
-        let mut count = 0usize;
-        let mut inserted_rows = Vec::with_capacity(realized.len());
-        let mut inserted_ptrs = Vec::with_capacity(realized.len());
+        let result = (|| {
+            let mut count = 0usize;
+            let mut inserted_rows = Vec::with_capacity(staged.len());
+            let mut inserted_ptrs = Vec::with_capacity(staged.len());
 
-        for (_ridx, out) in realized.into_iter() {
-            let row = out;
-            // build the row key (pk or hidden rowid)
-            let key = if let Some(pkpos) = &meta.pk {
-                let mut vals = Vec::with_capacity(pkpos.len());
-                for i in pkpos {
-                    vals.push(row[*i].clone());
+            for (row, pk_key, fk_keys) in staged.into_iter() {
+                let row_id = table.alloc_rowid();
+                if let Some(pk) = pk_key.clone() {
+                    let constraint = meta
+                        .primary_key
+                        .as_ref()
+                        .expect("pk metadata exists when pk_key is present");
+                    let pk_map = table
+                        .pk_map
+                        .as_mut()
+                        .expect("pk_map exists when table has primary key");
+                    if pk_map.contains_key(&pk) {
+                        return Err(sql_err(
+                            "23505",
+                            format!(
+                                "duplicate key value violates unique constraint {}",
+                                constraint.name
+                            ),
+                        ));
+                    }
+                    pk_map.insert(pk, row_id);
                 }
-                RowKey::Pk(vals)
-            } else {
-                // use per-table allocator for hidden rowid
-                let id = tab.alloc_rowid();
-                RowKey::Hidden(id)
-            };
 
-            // enforce pk uniqueness when present
-            if tab.rows_by_key.contains_key(&key) {
-                return Err(sql_err(
-                    "23505",
-                    "duplicate key value violates unique constraint",
-                ));
+                inserted_rows.push(row.clone());
+                let version = VersionedRow {
+                    xmin: txid,
+                    xmax: None,
+                    data: row,
+                };
+                let storage_key = RowKey::RowId(row_id);
+                table.rows_by_key.insert(storage_key.clone(), vec![version]);
+                self.add_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                inserted_ptrs.push(RowPointer {
+                    table_id,
+                    key: storage_key,
+                });
+                count += 1;
             }
 
-            // finally insert
-            inserted_rows.push(row.clone());
-            let version = VersionedRow {
-                xmin: txid,
-                xmax: None,
-                data: row,
-            };
-            tab.rows_by_key.insert(key.clone(), vec![version]);
-            inserted_ptrs.push(RowPointer { table_id, key });
-            count += 1;
-        }
-
-        Ok((count, inserted_rows, inserted_ptrs))
+            Ok((count, inserted_rows, inserted_ptrs))
+        })();
+        self.tables.insert(table_id, table);
+        result
     }
 
     pub fn scan_bound_positions(
@@ -644,68 +732,144 @@ impl Db {
         visibility: &VisibilityContext,
         txid: TxId,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)> {
-        let (meta, table) = self.resolve_table_mut(schema, name)?;
-        if sets.is_empty() {
-            return Ok((0, Vec::new(), Vec::new(), Vec::new()));
-        }
-        if let Some(pkpos) = &meta.pk {
+        let meta = self
+            .catalog
+            .get_table(schema, name)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
+            .clone();
+        let mut table = self
+            .tables
+            .remove(&meta.id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", meta.id)))?;
+        let result = (|| {
+            if sets.is_empty() {
+                return Ok((0, Vec::new(), Vec::new(), Vec::new()));
+            }
+            let pk_meta = meta.primary_key.as_ref();
+            let pk_columns: HashSet<usize> = pk_meta
+                .map(|pk| pk.columns.iter().copied().collect())
+                .unwrap_or_default();
+            let inbound = self.collect_inbound_foreign_keys(schema, name);
+            let updates_pk =
+                pk_meta.is_some() && sets.iter().any(|(idx, _)| pk_columns.contains(idx));
+            if updates_pk && !inbound.is_empty() {
+                return Err(sql_err(
+                    "0A000",
+                    "updating referenced primary key columns is not supported",
+                ));
+            }
+            let mut fk_updates = vec![false; meta.foreign_keys.len()];
             for (idx, _) in sets {
-                if pkpos.iter().any(|pos| pos == idx) {
-                    return Err(sql_err(
-                        "0A000",
-                        "updating primary key columns is not supported",
-                    ));
+                for (fk_idx, fk) in meta.foreign_keys.iter().enumerate() {
+                    if fk.local_columns.contains(idx) {
+                        fk_updates[fk_idx] = true;
+                    }
                 }
             }
-        }
-        let mut count = 0usize;
-        let mut updated_rows = Vec::new();
-        let mut inserted_ptrs = Vec::new();
-        let mut touched_ptrs = Vec::new();
-        for (key, versions) in table.rows_by_key.iter_mut() {
-            let Some(idx) = select_visible_version_idx(versions, visibility) else {
-                continue;
-            };
-            let snapshot = versions[idx].data.clone();
-            let passes = if let Some(expr) = filter {
-                eval_bool_expr(&snapshot, expr, params)
-                    .map_err(|e| sql_err("XX000", e.to_string()))?
-                    .unwrap_or(false)
-            } else {
-                true
-            };
-            if !passes {
-                continue;
+            let fk_changed = fk_updates.iter().any(|f| *f);
+            #[derive(Clone)]
+            struct PendingUpdate {
+                key: RowKey,
+                updated: Row,
+                old_pk: Option<RowKey>,
+                new_pk: Option<RowKey>,
+                old_fk: Vec<Option<Vec<Value>>>,
+                new_fk: Vec<Option<Vec<Value>>>,
             }
-            let mut updated = snapshot.clone();
-            for (idx, expr) in sets {
-                let value = eval_scalar_expr(&snapshot, expr, params)
-                    .map_err(|e| sql_err("XX000", e.to_string()))?;
-                let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, meta)?;
-                updated[*idx] = coerced;
+            let mut pending: Vec<PendingUpdate> = Vec::new();
+            for (key, versions) in table.rows_by_key.iter() {
+                let Some(idx) = select_visible_version_idx(versions, visibility) else {
+                    continue;
+                };
+                let snapshot = versions[idx].data.clone();
+                let passes = if let Some(expr) = filter {
+                    eval_bool_expr(&snapshot, expr, params)
+                        .map_err(|e| sql_err("XX000", e.to_string()))?
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if !passes {
+                    continue;
+                }
+                let mut updated = snapshot.clone();
+                for (idx, expr) in sets {
+                    let value = eval_scalar_expr(&snapshot, expr, params)
+                        .map_err(|e| sql_err("XX000", e.to_string()))?;
+                    let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, &meta)?;
+                    updated[*idx] = coerced;
+                }
+                let old_pk_key = self.build_primary_key_row_key(&meta, &snapshot)?;
+                let new_pk_key = self.build_primary_key_row_key(&meta, &updated)?;
+                let old_fk_keys: Vec<Option<Vec<Value>>> = meta
+                    .foreign_keys
+                    .iter()
+                    .map(|fk| self.build_fk_parent_key(&snapshot, fk))
+                    .collect();
+                let new_fk_keys =
+                    self.ensure_outbound_foreign_keys(schema, name, &meta, &updated)?;
+                pending.push(PendingUpdate {
+                    key: key.clone(),
+                    updated,
+                    old_pk: old_pk_key,
+                    new_pk: new_pk_key,
+                    old_fk: old_fk_keys,
+                    new_fk: new_fk_keys,
+                });
             }
-            if versions[idx].xmax.is_some() {
-                continue;
+            let mut count = 0usize;
+            let mut updated_rows = Vec::with_capacity(pending.len());
+            let mut inserted_ptrs = Vec::with_capacity(pending.len());
+            let mut touched_ptrs = Vec::with_capacity(pending.len());
+            for pending_update in pending {
+                if let Some(versions) = table.rows_by_key.get_mut(&pending_update.key) {
+                    let Some(idx) = select_visible_version_idx(versions, visibility) else {
+                        continue;
+                    };
+                    if versions[idx].xmax.is_some() {
+                        continue;
+                    }
+                    versions[idx].xmax = Some(txid);
+                    versions.push(VersionedRow {
+                        xmin: txid,
+                        xmax: None,
+                        data: pending_update.updated.clone(),
+                    });
+                    let row_id = row_key_to_row_id(&pending_update.key)?;
+                    updated_rows.push(pending_update.updated.clone());
+                    if let Some(pk_meta) = pk_meta {
+                        self.update_pk_map_for_row(
+                            &mut table,
+                            pk_meta,
+                            pending_update.old_pk.as_ref(),
+                            pending_update.new_pk.as_ref(),
+                            row_id,
+                        )?;
+                    }
+                    if fk_changed {
+                        self.remove_fk_rev_entries(
+                            &mut table,
+                            &meta,
+                            row_id,
+                            &pending_update.old_fk,
+                        );
+                        self.add_fk_rev_entries(&mut table, &meta, row_id, &pending_update.new_fk);
+                    }
+                    touched_ptrs.push(RowPointer {
+                        table_id: meta.id,
+                        key: pending_update.key.clone(),
+                    });
+                    inserted_ptrs.push(RowPointer {
+                        table_id: meta.id,
+                        key: pending_update.key,
+                    });
+                    count += 1;
+                }
             }
-            versions[idx].xmax = Some(txid);
-            let new_version = VersionedRow {
-                xmin: txid,
-                xmax: None,
-                data: updated.clone(),
-            };
-            versions.push(new_version);
-            updated_rows.push(updated);
-            touched_ptrs.push(RowPointer {
-                table_id: meta.id,
-                key: key.clone(),
-            });
-            inserted_ptrs.push(RowPointer {
-                table_id: meta.id,
-                key: key.clone(),
-            });
-            count += 1;
-        }
-        Ok((count, updated_rows, inserted_ptrs, touched_ptrs))
+            Ok((count, updated_rows, inserted_ptrs, touched_ptrs))
+        })();
+        self.tables.insert(meta.id, table);
+        result
     }
 
     pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
@@ -758,16 +922,21 @@ impl Db {
         visibility: &VisibilityContext,
         txid: TxId,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
-        let meta = self.resolve_table(schema, name)?;
+        let meta = self
+            .catalog
+            .get_table(schema, name)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
+            .clone();
         let table_id = meta.id;
-        let mut to_remove: Vec<(RowKey, Row)> = Vec::new();
-        {
-            let table = self.tables.get(&table_id).ok_or_else(|| {
-                sql_err(
-                    "XX000",
-                    format!("missing storage for table id {}", table_id),
-                )
-            })?;
+        let mut table = self.tables.remove(&table_id).ok_or_else(|| {
+            sql_err(
+                "XX000",
+                format!("missing storage for table id {}", table_id),
+            )
+        })?;
+        let result = (|| {
+            let mut to_remove: Vec<(RowKey, Row, Option<RowKey>, Vec<Option<Vec<Value>>>)> =
+                Vec::new();
             if let Some(expr) = filter {
                 for (key, versions) in table.rows_by_key.iter() {
                     let Some(idx) = select_visible_version_idx(versions, visibility) else {
@@ -778,45 +947,77 @@ impl Db {
                         .map_err(|e| sql_err("XX000", e.to_string()))?
                         .unwrap_or(false);
                     if passes {
-                        to_remove.push((key.clone(), row.clone()));
+                        let pk_key = self.build_primary_key_row_key(&meta, row)?;
+                        let fk_keys = meta
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| self.build_fk_parent_key(row, fk))
+                            .collect();
+                        to_remove.push((key.clone(), row.clone(), pk_key, fk_keys));
                     }
                 }
             } else {
                 for (key, versions) in table.rows_by_key.iter() {
                     if let Some(version) = select_visible_version(versions, visibility) {
-                        to_remove.push((key.clone(), version.data.clone()));
+                        let row = version.data.clone();
+                        let pk_key = self.build_primary_key_row_key(&meta, &row)?;
+                        let fk_keys = meta
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| self.build_fk_parent_key(&row, fk))
+                            .collect();
+                        to_remove.push((key.clone(), row, pk_key, fk_keys));
                     }
                 }
             }
-        }
-        let inbound = self.collect_inbound_foreign_keys(schema, name);
-        if !inbound.is_empty() {
-            for (_, row) in &to_remove {
-                self.ensure_no_inbound_refs(schema, name, &inbound, row)?;
+            let inbound = self.collect_inbound_foreign_keys(schema, name);
+            if !inbound.is_empty() {
+                for (_, row, _, _) in &to_remove {
+                    let Some(pk_vals) = self.build_primary_key_row_key(&meta, row)? else {
+                        continue;
+                    };
+                    let RowKey::Primary(values) = pk_vals else {
+                        continue;
+                    };
+                    self.ensure_no_inbound_refs(schema, name, meta.id, &inbound, &values)?;
+                }
             }
-        }
-        let count = to_remove.len();
-        let table = self.tables.get_mut(&table_id).ok_or_else(|| {
-            sql_err(
-                "XX000",
-                format!("missing storage for table id {}", table_id),
-            )
-        })?;
-        let mut removed_rows = Vec::with_capacity(count);
-        let mut touched_ptrs = Vec::with_capacity(count);
-        for (key, row) in to_remove {
-            if let Some(versions) = table.rows_by_key.get_mut(&key) {
-                if let Some(idx) = select_visible_version_idx(versions, visibility) {
-                    versions[idx].xmax = Some(txid);
+            let count = to_remove.len();
+            let mut removed_rows = Vec::with_capacity(count);
+            let mut touched_ptrs = Vec::with_capacity(count);
+            for (key, row, pk_key, fk_keys) in to_remove {
+                let mut removed = false;
+                {
+                    if let Some(versions) = table.rows_by_key.get_mut(&key) {
+                        if let Some(idx) = select_visible_version_idx(versions, visibility) {
+                            versions[idx].xmax = Some(txid);
+                            removed = true;
+                        }
+                    }
+                }
+                if removed {
+                    let row_id = row_key_to_row_id(&key)?;
+                    if let Some(pk) = pk_key.as_ref() {
+                        if let Some(pk_map) = table.pk_map.as_mut() {
+                            if let Some(existing) = pk_map.get(pk) {
+                                if *existing == row_id {
+                                    pk_map.remove(pk);
+                                }
+                            }
+                        }
+                    }
+                    self.remove_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
                     touched_ptrs.push(RowPointer {
                         table_id,
                         key: key.clone(),
                     });
                 }
+                removed_rows.push(row);
             }
-            removed_rows.push(row);
-        }
-        Ok((count, removed_rows, touched_ptrs))
+            Ok((count, removed_rows, touched_ptrs))
+        })();
+        self.tables.insert(table_id, table);
+        result
     }
 
     fn ensure_outbound_foreign_keys(
@@ -825,85 +1026,188 @@ impl Db {
         table_name: &str,
         meta: &TableMeta,
         row: &[Value],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<Option<Vec<Value>>>> {
+        let mut keys = Vec::with_capacity(meta.foreign_keys.len());
         for fk in &meta.foreign_keys {
-            let mut values = Vec::with_capacity(fk.columns.len());
-            let mut has_null = false;
-            for idx in &fk.columns {
-                let val = row.get(*idx).cloned().unwrap_or(Value::Null);
-                if matches!(val, Value::Null) {
-                    has_null = true;
-                    break;
-                }
-                values.push(val);
+            let key = self.build_fk_parent_key(row, fk);
+            if let Some(ref vals) = key {
+                self.ensure_parent_exists(fk, table_schema, table_name, vals)?;
             }
-            if has_null {
-                continue;
-            }
-            if !self.referenced_row_exists(
-                &fk.referenced_schema,
-                &fk.referenced_table,
-                &fk.referenced_columns,
-                &values,
-            )? {
+            keys.push(key);
+        }
+        Ok(keys)
+    }
+
+    fn build_primary_key_row_key(
+        &self,
+        meta: &TableMeta,
+        row: &[Value],
+    ) -> anyhow::Result<Option<RowKey>> {
+        let Some(pk) = meta.primary_key.as_ref() else {
+            return Ok(None);
+        };
+        let mut values = Vec::with_capacity(pk.columns.len());
+        for idx in &pk.columns {
+            let value = row.get(*idx).cloned().unwrap_or(Value::Null);
+            if matches!(value, Value::Null) {
                 return Err(sql_err(
-                    "23503",
+                    "23502",
                     format!(
-                        "insert on {}.{} violates foreign key referencing {}.{}",
-                        table_schema, table_name, fk.referenced_schema, fk.referenced_table
+                        "primary key column {} cannot be null",
+                        meta.columns[*idx].name
+                    ),
+                ));
+            }
+            values.push(value);
+        }
+        Ok(Some(RowKey::Primary(values)))
+    }
+
+    fn build_fk_parent_key(&self, row: &[Value], fk: &ForeignKeyMeta) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(fk.local_columns.len());
+        for idx in &fk.local_columns {
+            let value = row.get(*idx).cloned().unwrap_or(Value::Null);
+            if matches!(value, Value::Null) {
+                return None;
+            }
+            values.push(value);
+        }
+        Some(values)
+    }
+
+    fn ensure_parent_exists(
+        &self,
+        fk: &ForeignKeyMeta,
+        table_schema: &str,
+        table_name: &str,
+        parent_key: &[Value],
+    ) -> anyhow::Result<()> {
+        let parent_table = self.tables.get(&fk.referenced_table).ok_or_else(|| {
+            sql_err(
+                "XX000",
+                format!(
+                    "missing storage for referenced table id {}",
+                    fk.referenced_table
+                ),
+            )
+        })?;
+        let Some(pk_map) = parent_table.pk_map.as_ref() else {
+            return Err(sql_err(
+                "42830",
+                format!(
+                    "referenced table {}.{} must have a primary key",
+                    fk.referenced_schema, fk.referenced_table_name
+                ),
+            ));
+        };
+        let key = RowKey::Primary(parent_key.to_vec());
+        if let Some(row_id) = pk_map.get(&key) {
+            if let Some(versions) = parent_table.rows_by_key.get(&RowKey::RowId(*row_id)) {
+                if versions.iter().rev().any(|version| version.xmax.is_none()) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(sql_err(
+            "23503",
+            format!(
+                "insert on {}.{} violates foreign key {} referencing {}.{}",
+                table_schema, table_name, fk.name, fk.referenced_schema, fk.referenced_table_name
+            ),
+        ))
+    }
+
+    fn add_fk_rev_entries(
+        &self,
+        table: &mut Table,
+        meta: &TableMeta,
+        row_id: RowId,
+        keys: &[Option<Vec<Value>>],
+    ) {
+        for (fk, key) in meta.foreign_keys.iter().zip(keys.iter()) {
+            if let Some(values) = key {
+                let map_key = (fk.referenced_table, values.clone());
+                table
+                    .fk_rev
+                    .entry(map_key)
+                    .or_insert_with(HashSet::new)
+                    .insert(row_id);
+            }
+        }
+    }
+
+    fn remove_fk_rev_entries(
+        &self,
+        table: &mut Table,
+        meta: &TableMeta,
+        row_id: RowId,
+        keys: &[Option<Vec<Value>>],
+    ) {
+        for (fk, key) in meta.foreign_keys.iter().zip(keys.iter()) {
+            if let Some(values) = key {
+                let map_key = (fk.referenced_table, values.clone());
+                if let Some(set) = table.fk_rev.get_mut(&map_key) {
+                    set.remove(&row_id);
+                    if set.is_empty() {
+                        table.fk_rev.remove(&map_key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn update_pk_map_for_row(
+        &self,
+        table: &mut Table,
+        pk_meta: &PrimaryKeyMeta,
+        old_key: Option<&RowKey>,
+        new_key: Option<&RowKey>,
+        row_id: RowId,
+    ) -> anyhow::Result<()> {
+        let Some(new_key) = new_key else {
+            return Ok(());
+        };
+        let pk_map = table
+            .pk_map
+            .as_mut()
+            .expect("pk_map missing for table with primary key");
+        if let Some(existing) = pk_map.get(new_key) {
+            if *existing != row_id {
+                return Err(sql_err(
+                    "23505",
+                    format!(
+                        "duplicate key value violates unique constraint {}",
+                        pk_meta.name
                     ),
                 ));
             }
         }
+        if let Some(old) = old_key {
+            if let Some(existing) = pk_map.get(old) {
+                if *existing == row_id && old != new_key {
+                    pk_map.remove(old);
+                }
+            }
+        }
+        pk_map.insert(new_key.clone(), row_id);
         Ok(())
     }
 
-    fn referenced_row_exists(
-        &self,
-        schema: &str,
-        table: &str,
-        columns: &[usize],
-        values: &[Value],
-    ) -> anyhow::Result<bool> {
-        let meta = self.catalog.get_table(schema, table).ok_or_else(|| {
-            sql_err(
-                "42830",
-                format!("referenced table {}.{} missing", schema, table),
-            )
-        })?;
-        let storage = self
-            .tables
-            .get(&meta.id)
-            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", meta.id)))?;
-        'outer: for versions in storage.rows_by_key.values() {
-            let Some(row) = versions.last() else {
-                continue;
-            };
-            if row.xmax.is_some() {
-                continue;
-            }
-            for (col, val) in columns.iter().zip(values.iter()) {
-                if row.data[*col] != *val {
-                    continue 'outer;
-                }
-            }
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     fn collect_inbound_foreign_keys(&self, schema: &str, table: &str) -> Vec<InboundForeignKey> {
+        let Some(parent_meta) = self.catalog.get_table(schema, table) else {
+            return Vec::new();
+        };
+        let parent_id = parent_meta.id;
         let mut out = Vec::new();
         for (schema_name, schema_entry) in &self.catalog.schemas {
             for (table_name, meta) in &schema_entry.tables {
                 for fk in &meta.foreign_keys {
-                    if fk.referenced_schema == schema && fk.referenced_table == table {
+                    if fk.referenced_table == parent_id {
                         out.push(InboundForeignKey {
                             schema: schema_name.clone(),
                             table: table_name.clone(),
                             table_id: meta.id,
-                            columns: fk.columns.clone(),
-                            referenced_columns: fk.referenced_columns.clone(),
+                            fk: fk.clone(),
                         });
                     }
                 }
@@ -916,9 +1220,11 @@ impl Db {
         &self,
         schema: &str,
         table: &str,
+        parent_id: TableId,
         inbound: &[InboundForeignKey],
-        parent_row: &[Value],
+        parent_key: &[Value],
     ) -> anyhow::Result<()> {
+        let key_values = parent_key.to_vec();
         for fk in inbound {
             let child = match self.tables.get(&fk.table_id) {
                 Some(t) => t,
@@ -929,26 +1235,14 @@ impl Db {
                     ));
                 }
             };
-            for versions in child.rows_by_key.values() {
-                let Some(row) = versions.last() else {
-                    continue;
-                };
-                if row.xmax.is_some() {
-                    continue;
-                }
-                let mut matches = true;
-                for (child_idx, parent_idx) in fk.columns.iter().zip(fk.referenced_columns.iter()) {
-                    if row.data[*child_idx] != parent_row[*parent_idx] {
-                        matches = false;
-                        break;
-                    }
-                }
-                if matches {
+            let map_key = (parent_id, key_values.clone());
+            if let Some(rows) = child.fk_rev.get(&map_key) {
+                if !rows.is_empty() {
                     return Err(sql_err(
                         "23503",
                         format!(
-                            "operation on {}.{} violates foreign key from {}.{}",
-                            schema, table, fk.schema, fk.table
+                            "operation on {}.{} violates foreign key {} on {}.{}",
+                            schema, table, fk.fk.name, fk.schema, fk.table
                         ),
                     ));
                 }
@@ -969,13 +1263,50 @@ impl Db {
 
     fn rollback_inserts(&mut self, ptrs: &[RowPointer], txid: TxId) -> anyhow::Result<()> {
         for ptr in ptrs {
-            if let Some(table) = self.tables.get_mut(&ptr.table_id) {
+            let Some(meta) = self.table_meta_by_id(ptr.table_id).cloned() else {
+                continue;
+            };
+            if let Some(mut table) = self.tables.remove(&ptr.table_id) {
+                let mut removed_rows = Vec::new();
                 if let Some(versions) = table.rows_by_key.get_mut(&ptr.key) {
-                    versions.retain(|v| v.xmin != txid);
+                    versions.retain(|v| {
+                        if v.xmin == txid {
+                            removed_rows.push(v.data.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
                     if versions.is_empty() {
                         table.rows_by_key.remove(&ptr.key);
                     }
                 }
+                if !removed_rows.is_empty() {
+                    let row_id = row_key_to_row_id(&ptr.key)?;
+                    for row in removed_rows {
+                        if let Some(pk_key) = self.build_primary_key_row_key(&meta, &row)? {
+                            if let Some(pk_map) = table.pk_map.as_mut() {
+                                if let Some(existing) = pk_map.get(&pk_key) {
+                                    if *existing == row_id {
+                                        pk_map.remove(&pk_key);
+                                    }
+                                }
+                            }
+                        }
+                        let fk_keys = meta
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| self.build_fk_parent_key(&row, fk))
+                            .collect::<Vec<_>>();
+                        self.remove_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                    }
+                }
+                self.tables.insert(ptr.table_id, table);
+            } else {
+                return Err(sql_err(
+                    "XX000",
+                    format!("missing storage for table id {}", ptr.table_id),
+                ));
             }
         }
         Ok(())
@@ -983,14 +1314,41 @@ impl Db {
 
     fn rollback_xmax(&mut self, ptrs: &[RowPointer], txid: TxId) -> anyhow::Result<()> {
         for ptr in ptrs {
-            if let Some(table) = self.tables.get_mut(&ptr.table_id) {
+            let Some(meta) = self.table_meta_by_id(ptr.table_id).cloned() else {
+                continue;
+            };
+            if let Some(mut table) = self.tables.remove(&ptr.table_id) {
+                let mut restored_rows = Vec::new();
                 if let Some(versions) = table.rows_by_key.get_mut(&ptr.key) {
                     for version in versions.iter_mut() {
                         if version.xmax == Some(txid) {
                             version.xmax = None;
+                            restored_rows.push(version.data.clone());
                         }
                     }
                 }
+                if !restored_rows.is_empty() {
+                    let row_id = row_key_to_row_id(&ptr.key)?;
+                    for row in restored_rows {
+                        if let Some(pk_key) = self.build_primary_key_row_key(&meta, &row)? {
+                            if let Some(pk_map) = table.pk_map.as_mut() {
+                                pk_map.insert(pk_key, row_id);
+                            }
+                        }
+                        let fk_keys = meta
+                            .foreign_keys
+                            .iter()
+                            .map(|fk| self.build_fk_parent_key(&row, fk))
+                            .collect::<Vec<_>>();
+                        self.add_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                    }
+                }
+                self.tables.insert(ptr.table_id, table);
+            } else {
+                return Err(sql_err(
+                    "XX000",
+                    format!("missing storage for table id {}", ptr.table_id),
+                ));
             }
         }
         Ok(())
@@ -1002,8 +1360,18 @@ struct InboundForeignKey {
     schema: String,
     table: String,
     table_id: TableId,
-    columns: Vec<usize>,
-    referenced_columns: Vec<usize>,
+    fk: ForeignKeyMeta,
+}
+
+fn row_key_to_row_id(key: &RowKey) -> anyhow::Result<RowId> {
+    if let RowKey::RowId(id) = key {
+        Ok(*id)
+    } else {
+        Err(sql_err(
+            "XX000",
+            "expected physical RowId key but found primary key tuple",
+        ))
+    }
 }
 
 fn select_visible_version_idx(
@@ -1045,8 +1413,8 @@ fn coerce_value_for_column(
         if !col.nullable {
             return Err(sql_err("23502", format!("column {} is not null", col.name)));
         }
-        if let Some(pkpos) = &meta.pk {
-            if pkpos.contains(&idx) {
+        if let Some(pk) = &meta.primary_key {
+            if pk.columns.contains(&idx) {
                 return Err(sql_err(
                     "23502",
                     format!("primary key column {} cannot be null", col.name),

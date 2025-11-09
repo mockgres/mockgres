@@ -112,11 +112,25 @@ pub struct ObjName {
     pub name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferentialAction {
+    Restrict,
+    Cascade,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrimaryKeySpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ForeignKeySpec {
+    pub name: Option<String>,
     pub columns: Vec<String>,
     pub referenced_table: ObjName,
     pub referenced_columns: Option<Vec<String>>,
+    pub on_delete: ReferentialAction,
 }
 
 #[derive(Clone, Debug)]
@@ -169,7 +183,7 @@ pub enum Plan {
     CreateTable {
         table: ObjName,
         cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
-        pk: Option<Vec<String>>,
+        pk: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
     },
     AlterTableAddColumn {

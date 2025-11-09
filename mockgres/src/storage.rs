@@ -1,11 +1,14 @@
+use crate::catalog::TableId;
 use crate::engine::Value;
 use crate::txn::TxId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+pub type RowId = u64;
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
 pub enum RowKey {
-    Hidden(u64),
-    Pk(Vec<Value>),
+    RowId(RowId),
+    Primary(Vec<Value>),
 }
 
 pub type Row = Vec<Value>;
@@ -20,7 +23,9 @@ pub struct VersionedRow {
 #[derive(Clone, Debug)]
 pub struct Table {
     pub rows_by_key: HashMap<RowKey, Vec<VersionedRow>>,
-    pub next_rowid: u64,
+    pub next_rowid: RowId,
+    pub pk_map: Option<HashMap<RowKey, RowId>>,
+    pub fk_rev: HashMap<(TableId, Vec<Value>), HashSet<RowId>>,
 }
 
 impl Default for Table {
@@ -28,11 +33,21 @@ impl Default for Table {
         Self {
             rows_by_key: HashMap::new(),
             next_rowid: 1,
+            pk_map: None,
+            fk_rev: HashMap::new(),
         }
     }
 }
 
 impl Table {
+    pub fn with_pk(has_pk: bool) -> Self {
+        let mut tbl = Self::default();
+        if has_pk {
+            tbl.pk_map = Some(HashMap::new());
+        }
+        tbl
+    }
+
     pub fn insert(&mut self, k: RowKey, r: VersionedRow) {
         self.rows_by_key.insert(k, vec![r]);
     }

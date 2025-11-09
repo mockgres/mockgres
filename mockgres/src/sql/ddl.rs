@@ -1,4 +1,7 @@
-use crate::engine::{DataType, Field, ForeignKeySpec, ObjName, Plan, Schema, fe, fe_code};
+use crate::engine::{
+    DataType, Field, ForeignKeySpec, ObjName, Plan, PrimaryKeySpec, ReferentialAction, Schema, fe,
+    fe_code,
+};
 use pg_query::protobuf::{
     AlterTableStmt, AlterTableType, Constraint, CreateStmt, DropStmt, IndexStmt, ObjectType,
     RangeVar, TransactionStmt, VariableSetKind, VariableSetStmt, VariableShowStmt,
@@ -51,7 +54,7 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
     };
 
     let mut cols = Vec::new();
-    let mut pk: Option<Vec<String>> = None;
+    let mut pk: Option<PrimaryKeySpec> = None;
     let mut foreign_keys = Vec::new();
 
     for elt in stmt.table_elts {
@@ -62,18 +65,32 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
                 foreign_keys.extend(column_fks);
                 let col_name_clone = cname.clone();
                 cols.push((cname, dt, nullable, default));
-                if cd.constraints.iter().any(|c| {
-                    matches!(
-                        c.node.as_ref(),
-                        Some(pg_query::NodeEnum::Constraint(cons))
-                            if cons.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32
-                    )
-                }) {
-                    pk = Some(vec![col_name_clone]);
+                for c in &cd.constraints {
+                    let Some(pg_query::NodeEnum::Constraint(cons)) = c.node.as_ref() else {
+                        continue;
+                    };
+                    if cons.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32 {
+                        if pk.is_some() {
+                            return Err(fe("multiple primary key definitions are not supported"));
+                        }
+                        let name = if cons.conname.is_empty() {
+                            None
+                        } else {
+                            Some(cons.conname.clone())
+                        };
+                        pk = Some(PrimaryKeySpec {
+                            name,
+                            columns: vec![col_name_clone.clone()],
+                        });
+                        break;
+                    }
                 }
             }
             pg_query::NodeEnum::Constraint(cons) => {
                 if cons.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32 {
+                    if pk.is_some() {
+                        return Err(fe("multiple primary key definitions are not supported"));
+                    }
                     let mut names = Vec::new();
                     for n in cons.keys {
                         let pg_query::NodeEnum::String(s) = n.node.unwrap() else {
@@ -81,7 +98,18 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
                         };
                         names.push(s.sval);
                     }
-                    pk = Some(names);
+                    if names.is_empty() {
+                        return Err(fe("PRIMARY KEY requires column list"));
+                    }
+                    let name = if cons.conname.is_empty() {
+                        None
+                    } else {
+                        Some(cons.conname)
+                    };
+                    pk = Some(PrimaryKeySpec {
+                        name,
+                        columns: names,
+                    });
                 } else if cons.contype == pg_query::protobuf::ConstrType::ConstrForeign as i32 {
                     if let Some(fk) = parse_foreign_key_constraint(&cons, None)? {
                         foreign_keys.push(fk);
@@ -271,10 +299,18 @@ fn parse_foreign_key_constraint(
     } else {
         Some(parse_identifier_list(&cons.pk_attrs)?)
     };
+    let name = if cons.conname.is_empty() {
+        None
+    } else {
+        Some(cons.conname.clone())
+    };
+    let on_delete = parse_referential_action(cons.fk_del_action.as_str())?;
     Ok(Some(ForeignKeySpec {
+        name,
         columns,
         referenced_table,
         referenced_columns,
+        on_delete,
     }))
 }
 
@@ -301,5 +337,16 @@ fn range_var_to_obj_name(rv: &RangeVar) -> ObjName {
             Some(rv.schemaname.clone())
         },
         name: rv.relname.clone(),
+    }
+}
+
+fn parse_referential_action(tag: &str) -> PgWireResult<ReferentialAction> {
+    match tag {
+        "" | "r" | "a" => Ok(ReferentialAction::Restrict),
+        "c" => Ok(ReferentialAction::Cascade),
+        other => Err(fe_code(
+            "0A000",
+            format!("unsupported ON DELETE action code: {other}"),
+        )),
     }
 }

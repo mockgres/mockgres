@@ -1,9 +1,10 @@
-use crate::engine::Column;
+use crate::engine::{Column, ReferentialAction};
 use std::collections::HashMap;
 
 pub type SchemaName = String;
 pub type TableName = String;
 pub type TableId = u64;
+pub type ColId = usize;
 
 #[derive(Clone, Debug)]
 pub struct IndexMeta {
@@ -13,10 +14,19 @@ pub struct IndexMeta {
 
 #[derive(Clone, Debug)]
 pub struct ForeignKeyMeta {
-    pub columns: Vec<usize>,
-    pub referenced_schema: String,
-    pub referenced_table: String,
-    pub referenced_columns: Vec<usize>,
+    pub name: String,
+    pub local_columns: Vec<ColId>,
+    pub referenced_table: TableId,
+    pub referenced_schema: SchemaName,
+    pub referenced_table_name: TableName,
+    pub referenced_columns: Vec<ColId>,
+    pub on_delete: ReferentialAction,
+}
+
+#[derive(Clone, Debug)]
+pub struct PrimaryKeyMeta {
+    pub name: String,
+    pub columns: Vec<ColId>,
 }
 
 #[derive(Clone, Debug)]
@@ -24,7 +34,7 @@ pub struct TableMeta {
     pub id: TableId,
     pub name: TableName,
     pub columns: Vec<Column>,
-    pub pk: Option<Vec<usize>>,
+    pub primary_key: Option<PrimaryKeyMeta>,
     pub indexes: Vec<IndexMeta>,
     pub foreign_keys: Vec<ForeignKeyMeta>,
 }

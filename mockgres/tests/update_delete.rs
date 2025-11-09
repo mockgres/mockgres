@@ -74,13 +74,16 @@ async fn update_rows_with_filters() {
         .expect("fetch id=1");
     assert_eq!(existing.len(), 1);
 
-    // pk update not allowed
-    let err = ctx
-        .client
+    ctx.client
         .execute("update t set id = 10 where id = 1", &[])
         .await
-        .expect_err("pk update");
-    assert!(err.to_string().contains("primary key"));
+        .expect("pk update succeeds when no inbound refs");
+    let err = ctx
+        .client
+        .execute("update t set id = 2 where id = 10", &[])
+        .await
+        .expect_err("pk collision");
+    assert!(err.to_string().contains("duplicate key"));
 
     let _ = ctx.shutdown.send(());
 }
