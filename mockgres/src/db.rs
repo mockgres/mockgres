@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ScalarExpr, SqlError, Value,
-    cast_value_to_type, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ReferentialAction, ScalarExpr,
+    SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
 };
 use crate::session::{RowPointer, TxnChanges};
 use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
@@ -78,7 +78,8 @@ impl Db {
 
         let pk_meta = self.build_primary_key_meta(name, &mut columns, pk_spec)?;
 
-        let fk_metas = self.build_foreign_keys(schema, name, &columns, foreign_keys)?;
+        let fk_metas =
+            self.build_foreign_keys(schema, name, id, &columns, pk_meta.as_ref(), foreign_keys)?;
 
         let tm = TableMeta {
             id,
@@ -165,7 +166,9 @@ impl Db {
         &self,
         table_schema: &str,
         table_name: &str,
+        table_id: TableId,
         columns: &[Column],
+        self_pk: Option<&PrimaryKeyMeta>,
         specs: Vec<ForeignKeySpec>,
     ) -> anyhow::Result<Vec<ForeignKeyMeta>> {
         let mut metas = Vec::with_capacity(specs.len());
@@ -198,116 +201,137 @@ impl Db {
                 .clone()
                 .unwrap_or_else(|| "public".to_string());
             let referenced_table_name = spec.referenced_table.name.clone();
-            let ref_meta = self
-                .catalog
-                .get_table(&referenced_schema, &referenced_table_name)
-                .ok_or_else(|| {
-                    sql_err(
-                        "42830",
-                        format!(
-                            "referenced table {}.{} for foreign key on {}.{} does not exist",
-                            referenced_schema, referenced_table_name, table_schema, table_name
-                        ),
-                    )
-                })?;
-            let Some(parent_pk) = ref_meta.primary_key.as_ref() else {
-                return Err(sql_err(
-                    "42830",
-                    format!(
-                        "referenced table {}.{} must have a primary key",
-                        referenced_schema, referenced_table_name
-                    ),
-                ));
-            };
-            if parent_pk.columns.len() != local_indexes.len() {
-                return Err(sql_err(
-                    "42830",
-                    format!(
-                        "foreign key on {}.{} has {} local columns but parent primary key has {}",
-                        table_schema,
-                        table_name,
-                        local_indexes.len(),
-                        parent_pk.columns.len()
-                    ),
-                ));
-            }
-
-            let referenced_indexes = if let Some(ref_cols) = spec.referenced_columns {
-                if ref_cols.len() != local_indexes.len() {
+            let self_reference =
+                referenced_schema == table_schema && referenced_table_name == table_name;
+            let mut build_meta = |parent_pk: &PrimaryKeyMeta,
+                                  parent_columns: &[Column],
+                                  referenced_table_id: TableId|
+             -> anyhow::Result<()> {
+                if parent_pk.columns.len() != local_indexes.len() {
                     return Err(sql_err(
                         "42830",
                         format!(
-                            "foreign key on {}.{} has {} columns but referenced list has {}",
+                            "foreign key on {}.{} has {} local columns but parent primary key has {}",
                             table_schema,
                             table_name,
                             local_indexes.len(),
-                            ref_cols.len()
+                            parent_pk.columns.len()
                         ),
                     ));
                 }
-                let mut idxs = Vec::with_capacity(ref_cols.len());
-                for rc in ref_cols {
-                    let idx = ref_meta
-                        .columns
-                        .iter()
-                        .position(|c| c.name == rc)
-                        .ok_or_else(|| {
-                            sql_err(
-                                "42703",
-                                format!(
-                                    "referenced column {} does not exist on {}.{}",
-                                    rc, referenced_schema, referenced_table_name
-                                ),
-                            )
-                        })?;
-                    idxs.push(idx);
+                let referenced_indexes = if let Some(ref_cols) = spec.referenced_columns.as_ref() {
+                    if ref_cols.len() != local_indexes.len() {
+                        return Err(sql_err(
+                            "42830",
+                            format!(
+                                "foreign key on {}.{} has {} columns but referenced list has {}",
+                                table_schema,
+                                table_name,
+                                local_indexes.len(),
+                                ref_cols.len()
+                            ),
+                        ));
+                    }
+                    let mut idxs = Vec::with_capacity(ref_cols.len());
+                    for rc in ref_cols {
+                        let idx = parent_columns
+                            .iter()
+                            .position(|c| c.name == rc.as_str())
+                            .ok_or_else(|| {
+                                sql_err(
+                                    "42703",
+                                    format!(
+                                        "referenced column {} does not exist on {}.{}",
+                                        rc, referenced_schema, referenced_table_name
+                                    ),
+                                )
+                            })?;
+                        idxs.push(idx);
+                    }
+                    idxs
+                } else {
+                    parent_pk.columns.clone()
+                };
+
+                let ordered_local = self.align_local_to_parent_pk(
+                    &local_indexes,
+                    &referenced_indexes,
+                    parent_pk,
+                    table_schema,
+                    table_name,
+                    &referenced_schema,
+                    &referenced_table_name,
+                )?;
+
+                for (local_idx, pk_idx) in ordered_local.iter().zip(parent_pk.columns.iter()) {
+                    let local_type = &columns[*local_idx].data_type;
+                    let ref_type = &parent_columns[*pk_idx].data_type;
+                    if local_type != ref_type {
+                        return Err(sql_err(
+                            "42804",
+                            format!(
+                                "foreign key column {} type {:?} does not match referenced column {} type {:?}",
+                                columns[*local_idx].name,
+                                local_type,
+                                parent_columns[*pk_idx].name,
+                                ref_type
+                            ),
+                        ));
+                    }
                 }
-                idxs
-            } else {
-                parent_pk.columns.clone()
+
+                let fk_name = spec
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_fk{}", table_name, spec_idx + 1));
+
+                metas.push(ForeignKeyMeta {
+                    name: fk_name,
+                    local_columns: ordered_local,
+                    referenced_table: referenced_table_id,
+                    referenced_schema: referenced_schema.clone(),
+                    referenced_table_name: referenced_table_name.clone(),
+                    referenced_columns: parent_pk.columns.clone(),
+                    on_delete: spec.on_delete,
+                });
+                Ok(())
             };
 
-            let ordered_local = self.align_local_to_parent_pk(
-                &local_indexes,
-                &referenced_indexes,
-                parent_pk,
-                table_schema,
-                table_name,
-                &referenced_schema,
-                &referenced_table_name,
-            )?;
-
-            for (local_idx, pk_idx) in ordered_local.iter().zip(parent_pk.columns.iter()) {
-                let local_type = &columns[*local_idx].data_type;
-                let ref_type = &ref_meta.columns[*pk_idx].data_type;
-                if local_type != ref_type {
-                    return Err(sql_err(
-                        "42804",
+            if self_reference {
+                let parent_pk = self_pk.ok_or_else(|| {
+                    sql_err(
+                        "42830",
                         format!(
-                            "foreign key column {} type {:?} does not match referenced column {} type {:?}",
-                            columns[*local_idx].name,
-                            local_type,
-                            ref_meta.columns[*pk_idx].name,
-                            ref_type
+                            "referenced table {}.{} must have a primary key",
+                            referenced_schema, referenced_table_name
                         ),
-                    ));
-                }
+                    )
+                })?;
+                build_meta(parent_pk, columns, table_id)?;
+            } else {
+                let ref_meta = self
+                    .catalog
+                    .get_table(&referenced_schema, &referenced_table_name)
+                    .ok_or_else(|| {
+                        sql_err(
+                            "42830",
+                            format!(
+                                "referenced table {}.{} for foreign key on {}.{} does not exist",
+                                referenced_schema, referenced_table_name, table_schema, table_name
+                            ),
+                        )
+                    })?;
+                let parent_pk = ref_meta.primary_key.as_ref().ok_or_else(|| {
+                    sql_err(
+                        "42830",
+                        format!(
+                            "referenced table {}.{} must have a primary key",
+                            referenced_schema, referenced_table_name
+                        ),
+                    )
+                })?;
+                build_meta(parent_pk, &ref_meta.columns, ref_meta.id)?;
             }
-
-            let fk_name = spec
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{}_fk{}", table_name, spec_idx + 1));
-
-            metas.push(ForeignKeyMeta {
-                name: fk_name,
-                local_columns: ordered_local,
-                referenced_table: ref_meta.id,
-                referenced_schema: referenced_schema.clone(),
-                referenced_table_name: referenced_table_name.clone(),
-                referenced_columns: parent_pk.columns.clone(),
-                on_delete: spec.on_delete,
-            });
         }
         Ok(metas)
     }
@@ -928,95 +952,220 @@ impl Db {
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?
             .clone();
         let table_id = meta.id;
-        let mut table = self.tables.remove(&table_id).ok_or_else(|| {
-            sql_err(
-                "XX000",
-                format!("missing storage for table id {}", table_id),
-            )
-        })?;
-        let result = (|| {
-            let mut to_remove: Vec<(RowKey, Row, Option<RowKey>, Vec<Option<Vec<Value>>>)> =
-                Vec::new();
-            if let Some(expr) = filter {
-                for (key, versions) in table.rows_by_key.iter() {
-                    let Some(idx) = select_visible_version_idx(versions, visibility) else {
-                        continue;
-                    };
-                    let row = &versions[idx].data;
-                    let passes = eval_bool_expr(row, expr, params)
+        let schema_name = schema.to_string();
+        let table_name = name.to_string();
+        let (seeds, removed_rows) = {
+            let table = self.tables.get(&table_id).ok_or_else(|| {
+                sql_err(
+                    "XX000",
+                    format!("missing storage for table id {}", table_id),
+                )
+            })?;
+            let mut seeds = Vec::new();
+            let mut removed_rows = Vec::new();
+            for (key, versions) in table.rows_by_key.iter() {
+                let Some(idx) = select_visible_version_idx(versions, visibility) else {
+                    continue;
+                };
+                let row = versions[idx].data.clone();
+                let passes = match filter {
+                    Some(expr) => eval_bool_expr(&row, expr, params)
                         .map_err(|e| sql_err("XX000", e.to_string()))?
-                        .unwrap_or(false);
-                    if passes {
-                        let pk_key = self.build_primary_key_row_key(&meta, row)?;
-                        let fk_keys = meta
-                            .foreign_keys
-                            .iter()
-                            .map(|fk| self.build_fk_parent_key(row, fk))
-                            .collect();
-                        to_remove.push((key.clone(), row.clone(), pk_key, fk_keys));
-                    }
+                        .unwrap_or(false),
+                    None => true,
+                };
+                if !passes {
+                    continue;
                 }
-            } else {
-                for (key, versions) in table.rows_by_key.iter() {
-                    if let Some(version) = select_visible_version(versions, visibility) {
-                        let row = version.data.clone();
-                        let pk_key = self.build_primary_key_row_key(&meta, &row)?;
-                        let fk_keys = meta
-                            .foreign_keys
-                            .iter()
-                            .map(|fk| self.build_fk_parent_key(&row, fk))
-                            .collect();
-                        to_remove.push((key.clone(), row, pk_key, fk_keys));
-                    }
-                }
+                let pk_key = self.build_primary_key_row_key(&meta, &row)?;
+                let fk_keys = meta
+                    .foreign_keys
+                    .iter()
+                    .map(|fk| self.build_fk_parent_key(&row, fk))
+                    .collect();
+                let row_key = key.clone();
+                let row_id = row_key_to_row_id(&row_key)?;
+                seeds.push(DeleteTarget {
+                    schema: schema_name.clone(),
+                    table: table_name.clone(),
+                    meta: meta.clone(),
+                    row_key,
+                    row_id,
+                    pk_key,
+                    fk_keys,
+                });
+                removed_rows.push(row);
             }
-            let inbound = self.collect_inbound_foreign_keys(schema, name);
-            if !inbound.is_empty() {
-                for (_, row, _, _) in &to_remove {
-                    let Some(pk_vals) = self.build_primary_key_row_key(&meta, row)? else {
-                        continue;
-                    };
-                    let RowKey::Primary(values) = pk_vals else {
-                        continue;
-                    };
-                    self.ensure_no_inbound_refs(schema, name, meta.id, &inbound, &values)?;
-                }
+            (seeds, removed_rows)
+        };
+        if seeds.is_empty() {
+            return Ok((0, removed_rows, Vec::new()));
+        }
+        let plan = self.build_delete_plan(seeds, visibility)?;
+        let touched_ptrs = self.apply_delete_plan(plan, visibility, txid)?;
+        Ok((removed_rows.len(), removed_rows, touched_ptrs))
+    }
+
+    fn build_delete_plan(
+        &self,
+        initial: Vec<DeleteTarget>,
+        visibility: &VisibilityContext,
+    ) -> anyhow::Result<Vec<DeleteTarget>> {
+        let mut plan = Vec::new();
+        let mut stack: Vec<CascadeFrame> = initial
+            .into_iter()
+            .map(|target| CascadeFrame {
+                target,
+                expanded: false,
+            })
+            .collect();
+        let mut visited: HashSet<(TableId, RowId)> = HashSet::new();
+        while let Some(mut frame) = stack.pop() {
+            let key = (frame.target.meta.id, frame.target.row_id);
+            if frame.expanded {
+                plan.push(frame.target);
+                continue;
             }
-            let count = to_remove.len();
-            let mut removed_rows = Vec::with_capacity(count);
-            let mut touched_ptrs = Vec::with_capacity(count);
-            for (key, row, pk_key, fk_keys) in to_remove {
-                let mut removed = false;
-                {
-                    if let Some(versions) = table.rows_by_key.get_mut(&key) {
-                        if let Some(idx) = select_visible_version_idx(versions, visibility) {
-                            versions[idx].xmax = Some(txid);
-                            removed = true;
+            if !visited.insert(key) {
+                continue;
+            }
+            frame.expanded = true;
+            let inbound =
+                self.collect_inbound_foreign_keys(&frame.target.schema, &frame.target.table);
+            if let Some(RowKey::Primary(pk_vals)) = frame.target.pk_key.as_ref() {
+                self.ensure_no_inbound_refs(
+                    &frame.target.schema,
+                    &frame.target.table,
+                    frame.target.meta.id,
+                    &inbound,
+                    pk_vals,
+                    visibility,
+                )?;
+                for fk in inbound {
+                    if fk.fk.on_delete == ReferentialAction::Cascade {
+                        let children = self.collect_cascade_children(&fk, pk_vals, visibility)?;
+                        for child in children {
+                            stack.push(CascadeFrame {
+                                target: child,
+                                expanded: false,
+                            });
                         }
                     }
                 }
-                if removed {
-                    let row_id = row_key_to_row_id(&key)?;
-                    if let Some(pk) = pk_key.as_ref() {
-                        if let Some(pk_map) = table.pk_map.as_mut() {
-                            if let Some(existing) = pk_map.get(pk) {
-                                if *existing == row_id {
-                                    pk_map.remove(pk);
+            } else if !inbound.is_empty() {
+                return Err(sql_err(
+                    "42830",
+                    format!(
+                        "referenced table {}.{} must have a primary key",
+                        frame.target.schema, frame.target.table
+                    ),
+                ));
+            }
+            stack.push(frame);
+        }
+        Ok(plan)
+    }
+
+    fn collect_cascade_children(
+        &self,
+        fk: &InboundForeignKey,
+        parent_key: &[Value],
+        visibility: &VisibilityContext,
+    ) -> anyhow::Result<Vec<DeleteTarget>> {
+        let child_table = self.tables.get(&fk.table_id).ok_or_else(|| {
+            sql_err(
+                "XX000",
+                format!("missing storage for table id {}", fk.table_id),
+            )
+        })?;
+        let child_meta = self
+            .catalog
+            .get_table(&fk.schema, &fk.table)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {}.{}", fk.schema, fk.table)))?
+            .clone();
+        let mut targets = Vec::new();
+        let map_key = (fk.fk.referenced_table, parent_key.to_vec());
+        if let Some(rows) = child_table.fk_rev.get(&map_key) {
+            for row_id in rows {
+                if let Some(row) = visible_row_clone(child_table, *row_id, visibility) {
+                    let pk_key = self.build_primary_key_row_key(&child_meta, &row)?;
+                    let fk_keys = child_meta
+                        .foreign_keys
+                        .iter()
+                        .map(|fk_meta| self.build_fk_parent_key(&row, fk_meta))
+                        .collect();
+                    targets.push(DeleteTarget {
+                        schema: fk.schema.clone(),
+                        table: fk.table.clone(),
+                        meta: child_meta.clone(),
+                        row_key: RowKey::RowId(*row_id),
+                        row_id: *row_id,
+                        pk_key,
+                        fk_keys,
+                    });
+                }
+            }
+        }
+        Ok(targets)
+    }
+
+    fn apply_delete_plan(
+        &mut self,
+        plan: Vec<DeleteTarget>,
+        visibility: &VisibilityContext,
+        txid: TxId,
+    ) -> anyhow::Result<Vec<RowPointer>> {
+        let mut table_cache: HashMap<TableId, Table> = HashMap::new();
+        let result = (|| {
+            let mut touched_ptrs = Vec::with_capacity(plan.len());
+            for target in plan {
+                let table_entry = if let Some(tbl) = table_cache.get_mut(&target.meta.id) {
+                    tbl
+                } else {
+                    let table = self.tables.remove(&target.meta.id).ok_or_else(|| {
+                        sql_err(
+                            "XX000",
+                            format!("missing storage for table id {}", target.meta.id),
+                        )
+                    })?;
+                    table_cache.insert(target.meta.id, table);
+                    table_cache
+                        .get_mut(&target.meta.id)
+                        .expect("table cache entry exists")
+                };
+                if let Some(versions) = table_entry.rows_by_key.get_mut(&target.row_key) {
+                    if let Some(idx) = select_visible_version_idx(versions, visibility) {
+                        if versions[idx].xmax.is_some() {
+                            continue;
+                        }
+                        versions[idx].xmax = Some(txid);
+                        touched_ptrs.push(RowPointer {
+                            table_id: target.meta.id,
+                            key: target.row_key.clone(),
+                        });
+                        if let Some(pk_key) = target.pk_key.as_ref() {
+                            if let Some(pk_map) = table_entry.pk_map.as_mut() {
+                                if let Some(existing) = pk_map.get(pk_key) {
+                                    if *existing == target.row_id {
+                                        pk_map.remove(pk_key);
+                                    }
                                 }
                             }
                         }
+                        self.remove_fk_rev_entries(
+                            table_entry,
+                            &target.meta,
+                            target.row_id,
+                            &target.fk_keys,
+                        );
                     }
-                    self.remove_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
-                    touched_ptrs.push(RowPointer {
-                        table_id,
-                        key: key.clone(),
-                    });
                 }
-                removed_rows.push(row);
             }
-            Ok((count, removed_rows, touched_ptrs))
+            Ok(touched_ptrs)
         })();
-        self.tables.insert(table_id, table);
+        for (id, table) in table_cache {
+            self.tables.insert(id, table);
+        }
         result
     }
 
@@ -1223,9 +1372,13 @@ impl Db {
         parent_id: TableId,
         inbound: &[InboundForeignKey],
         parent_key: &[Value],
+        visibility: &VisibilityContext,
     ) -> anyhow::Result<()> {
         let key_values = parent_key.to_vec();
         for fk in inbound {
+            if fk.fk.on_delete != ReferentialAction::Restrict {
+                continue;
+            }
             let child = match self.tables.get(&fk.table_id) {
                 Some(t) => t,
                 None => {
@@ -1237,7 +1390,10 @@ impl Db {
             };
             let map_key = (parent_id, key_values.clone());
             if let Some(rows) = child.fk_rev.get(&map_key) {
-                if !rows.is_empty() {
+                if rows
+                    .iter()
+                    .any(|row_id| visible_row_clone(child, *row_id, visibility).is_some())
+                {
                     return Err(sql_err(
                         "23503",
                         format!(
@@ -1363,6 +1519,22 @@ struct InboundForeignKey {
     fk: ForeignKeyMeta,
 }
 
+#[derive(Clone)]
+struct DeleteTarget {
+    schema: String,
+    table: String,
+    meta: TableMeta,
+    row_key: RowKey,
+    row_id: RowId,
+    pk_key: Option<RowKey>,
+    fk_keys: Vec<Option<Vec<Value>>>,
+}
+
+struct CascadeFrame {
+    target: DeleteTarget,
+    expanded: bool,
+}
+
 fn row_key_to_row_id(key: &RowKey) -> anyhow::Result<RowId> {
     if let RowKey::RowId(id) = key {
         Ok(*id)
@@ -1391,6 +1563,14 @@ fn select_visible_version<'a>(
     visibility: &VisibilityContext,
 ) -> Option<&'a VersionedRow> {
     select_visible_version_idx(versions, visibility).map(|idx| &versions[idx])
+}
+
+fn visible_row_clone(table: &Table, row_id: RowId, visibility: &VisibilityContext) -> Option<Row> {
+    table
+        .rows_by_key
+        .get(&RowKey::RowId(row_id))
+        .and_then(|versions| select_visible_version(versions, visibility))
+        .map(|version| version.data.clone())
 }
 
 fn eval_column_default(
