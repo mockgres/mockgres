@@ -161,21 +161,25 @@ pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
     let remove_type = ObjectType::try_from(drop.remove_type).map_err(|_| fe("bad drop type"))?;
-    if remove_type != ObjectType::ObjectIndex {
-        return Err(fe("only DROP INDEX supported here"));
-    }
     if drop.objects.is_empty() {
-        return Err(fe("DROP INDEX requires names"));
+        return Err(fe("DROP requires at least one name"));
     }
     let mut names = Vec::with_capacity(drop.objects.len());
     for obj in drop.objects {
-        let node = obj.node.ok_or_else(|| fe("bad DROP INDEX name"))?;
+        let node = obj.node.ok_or_else(|| fe("bad DROP name"))?;
         names.push(parse_obj_name_from_list(&node)?);
     }
-    Ok(Plan::DropIndex {
-        indexes: names,
-        if_exists: drop.missing_ok,
-    })
+    match remove_type {
+        ObjectType::ObjectIndex => Ok(Plan::DropIndex {
+            indexes: names,
+            if_exists: drop.missing_ok,
+        }),
+        ObjectType::ObjectTable => Ok(Plan::DropTable {
+            tables: names,
+            if_exists: drop.missing_ok,
+        }),
+        _ => Err(fe("only DROP INDEX or DROP TABLE supported")),
+    }
 }
 
 pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {

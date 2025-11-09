@@ -24,6 +24,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
+        Plan::DropTable { .. } => "DROP TABLE",
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
         Plan::InsertValues { .. } => "INSERT 0",
@@ -235,6 +236,20 @@ pub fn build_executor(
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("DROP INDEX".into()),
+                None,
+            ))
+        }
+        Plan::DropTable { tables, if_exists } => {
+            let mut db = db.write();
+            for table in tables {
+                let schema_name = table.schema.as_deref().unwrap_or("public");
+                db.drop_table(schema_name, &table.name, *if_exists)
+                    .map_err(map_db_err)?;
+            }
+            drop(db);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("DROP TABLE".into()),
                 None,
             ))
         }

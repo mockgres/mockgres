@@ -160,6 +160,10 @@ pub enum Plan {
         indexes: Vec<ObjName>,
         if_exists: bool,
     },
+    DropTable {
+        tables: Vec<ObjName>,
+        if_exists: bool,
+    },
     ShowVariable {
         name: String,
         schema: Schema,
@@ -228,6 +232,7 @@ impl Plan {
             | Plan::AlterTableDropColumn { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
+            | Plan::DropTable { .. }
             | Plan::SetVariable { .. }
             | Plan::InsertValues { .. }
             | Plan::Update { .. }

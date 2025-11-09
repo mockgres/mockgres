@@ -531,6 +531,36 @@ impl Db {
         Ok(count)
     }
 
+    pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
+        let schema_entry = match self.catalog.schemas.get_mut(schema) {
+            Some(entry) => entry,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(sql_err("3F000", format!("no such schema {schema}")));
+            }
+        };
+        match schema_entry.tables.remove(name) {
+            Some(meta) => {
+                if self.tables.remove(&meta.id).is_none() {
+                    return Err(sql_err(
+                        "XX000",
+                        format!("missing storage for table id {}", meta.id),
+                    ));
+                }
+                Ok(())
+            }
+            None => {
+                if if_exists {
+                    Ok(())
+                } else {
+                    Err(sql_err("42P01", format!("no such table {schema}.{name}")))
+                }
+            }
+        }
+    }
+
     pub fn delete_rows(
         &mut self,
         schema: &str,

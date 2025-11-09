@@ -44,3 +44,54 @@ async fn default_nulls_last_for_asc_first_for_desc() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_nulls_first_last_respected() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute("create table null_orders(txt text, flag bool)", &[])
+        .await
+        .expect("create table");
+    ctx.client
+        .execute(
+            "insert into null_orders values
+                ('b', true),
+                (null, null),
+                ('a', false)",
+            &[],
+        )
+        .await
+        .expect("insert rows");
+
+    let txt_vals: Vec<Option<String>> = ctx
+        .client
+        .query(
+            "select txt from null_orders order by txt asc nulls first",
+            &[],
+        )
+        .await
+        .expect("txt nulls first")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        txt_vals,
+        vec![None, Some("a".to_string()), Some("b".to_string())]
+    );
+
+    let flag_vals: Vec<Option<bool>> = ctx
+        .client
+        .query(
+            "select flag from null_orders order by flag desc nulls last",
+            &[],
+        )
+        .await
+        .expect("flag nulls last")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(flag_vals, vec![Some(true), Some(false), None]);
+
+    let _ = ctx.shutdown.send(());
+}
