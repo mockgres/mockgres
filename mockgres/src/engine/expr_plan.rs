@@ -21,6 +21,10 @@ pub enum ScalarExpr {
     Literal(Value),
     Column(String),
     ColumnIdx(usize),
+    Cast {
+        expr: Box<ScalarExpr>,
+        ty: DataType,
+    },
     Param {
         idx: usize,
         ty: Option<DataType>,
@@ -118,7 +122,8 @@ pub enum Plan {
     },
     Limit {
         input: Box<Plan>,
-        limit: usize,
+        limit: Option<usize>,
+        offset: usize,
     },
     SeqScan {
         table: ObjName,

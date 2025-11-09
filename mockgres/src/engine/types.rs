@@ -1,3 +1,4 @@
+use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 use pgwire::api::Type;
 use pgwire::error::PgWireError;
 use std::fmt;
@@ -147,5 +148,76 @@ impl Value {
         } else {
             None
         }
+    }
+}
+
+pub fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value, SqlError> {
+    match (target, val) {
+        (DataType::Int4, Value::Int64(v)) => {
+            if v < i32::MIN as i64 || v > i32::MAX as i64 {
+                return Err(SqlError::new("22003", "value out of range for int4"));
+            }
+            Ok(Value::Int64(v))
+        }
+        (DataType::Int4, Value::Text(s)) => {
+            let parsed: i32 = s
+                .parse()
+                .map_err(|e| SqlError::new("22P02", format!("invalid input for int4: {e}")))?;
+            Ok(Value::Int64(parsed as i64))
+        }
+        (DataType::Int8, Value::Int64(v)) => Ok(Value::Int64(v)),
+        (DataType::Int8, Value::Text(s)) => {
+            let parsed: i64 = s
+                .parse()
+                .map_err(|e| SqlError::new("22P02", format!("invalid input for int8: {e}")))?;
+            Ok(Value::Int64(parsed))
+        }
+        (DataType::Float8, Value::Float64Bits(bits)) => Ok(Value::Float64Bits(bits)),
+        (DataType::Float8, Value::Int64(v)) => Ok(Value::from_f64(v as f64)),
+        (DataType::Float8, Value::Text(s)) => {
+            let parsed: f64 = s
+                .parse()
+                .map_err(|e| SqlError::new("22P02", format!("invalid input for float8: {e}")))?;
+            Ok(Value::from_f64(parsed))
+        }
+        (DataType::Text, Value::Text(s)) => Ok(Value::Text(s)),
+        (DataType::Text, Value::Bool(b)) => Ok(Value::Text(if b { "t" } else { "f" }.into())),
+        (DataType::Text, Value::Int64(i)) => Ok(Value::Text(i.to_string())),
+        (DataType::Text, Value::Float64Bits(bits)) => {
+            let f = f64::from_bits(bits);
+            Ok(Value::Text(f.to_string()))
+        }
+        (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),
+        (DataType::Bool, Value::Text(s)) => {
+            let lowered = s.to_ascii_lowercase();
+            match lowered.as_str() {
+                "t" | "true" => Ok(Value::Bool(true)),
+                "f" | "false" => Ok(Value::Bool(false)),
+                other => Err(SqlError::new(
+                    "22P02",
+                    format!("invalid input for bool: {other}"),
+                )),
+            }
+        }
+        (DataType::Date, Value::Date(d)) => Ok(Value::Date(d)),
+        (DataType::Date, Value::Text(s)) => {
+            let days = parse_date_str(&s).map_err(|e| SqlError::new("22007", e))?;
+            Ok(Value::Date(days))
+        }
+        (DataType::Timestamp, Value::TimestampMicros(m)) => Ok(Value::TimestampMicros(m)),
+        (DataType::Timestamp, Value::Text(s)) => {
+            let micros = parse_timestamp_str(&s).map_err(|e| SqlError::new("22007", e))?;
+            Ok(Value::TimestampMicros(micros))
+        }
+        (DataType::Bytea, Value::Bytes(bytes)) => Ok(Value::Bytes(bytes)),
+        (DataType::Bytea, Value::Text(s)) => {
+            let bytes = parse_bytea_text(&s).map_err(|e| SqlError::new("22001", e))?;
+            Ok(Value::Bytes(bytes))
+        }
+        (_, Value::Null) => Ok(Value::Null),
+        (dt, got) => Err(SqlError::new(
+            "42804",
+            format!("type mismatch: expected {dt:?}, got {got:?}"),
+        )),
     }
 }

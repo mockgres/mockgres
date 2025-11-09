@@ -226,11 +226,16 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 keys: bound_keys,
             })
         }
-        Plan::Limit { input, limit } => {
+        Plan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
             let child = bind(db, *input)?;
             Ok(Plan::Limit {
                 input: Box::new(child),
                 limit,
+                offset,
             })
         }
 
@@ -303,6 +308,10 @@ fn bind_scalar_expr(
             op: *op,
             expr: Box::new(bind_scalar_expr(expr, schema, hint)?),
         },
+        ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
+            expr: Box::new(bind_scalar_expr(expr, schema, Some(ty))?),
+            ty: ty.clone(),
+        },
         ScalarExpr::Func { func, args } => ScalarExpr::Func {
             func: *func,
             args: args
@@ -347,6 +356,7 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
             }
         },
         ScalarExpr::UnaryOp { expr, .. } => scalar_expr_type(expr.as_ref(), schema),
+        ScalarExpr::Cast { ty, .. } => Some(ty.clone()),
         ScalarExpr::Func { func, args } => match func {
             ScalarFunc::Upper | ScalarFunc::Lower => Some(DataType::Text),
             ScalarFunc::Length => Some(DataType::Int8),

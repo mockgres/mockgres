@@ -131,12 +131,23 @@ pub fn build_executor(
             Ok((exec, None, cnt))
         }
 
-        Plan::Limit { input, limit } => {
+        Plan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
+            let limit_val = *limit;
+            let offset_val = *offset;
             let (child, _tag, cnt) = build_executor(db, input, params.clone())?;
-            let out_cnt = cnt.map(|c| c.min(*limit));
+            let remaining_after_offset = cnt.map(|c| c.saturating_sub(offset_val));
+            let out_cnt = match (remaining_after_offset, limit_val) {
+                (Some(c), Some(lim)) => Some(c.min(lim)),
+                (Some(c), None) => Some(c),
+                _ => None,
+            };
             let schema = child.schema().clone();
             Ok((
-                Box::new(LimitExec::new(schema, child, *limit)),
+                Box::new(LimitExec::new(schema, child, limit_val, offset_val)),
                 None,
                 out_cnt,
             ))

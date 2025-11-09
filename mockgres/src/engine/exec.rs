@@ -446,19 +446,28 @@ fn order_values(
     }
 }
 
-// limit exec: forwards up to n rows from child
+// limit exec: skips `offset` rows, then forwards up to `limit` rows (if provided)
 pub struct LimitExec {
     schema: Schema,
     child: Box<dyn ExecNode>,
-    remaining: usize,
+    offset: usize,
+    skipped: usize,
+    remaining: Option<usize>,
 }
 
 impl LimitExec {
-    pub fn new(schema: Schema, child: Box<dyn ExecNode>, n: usize) -> Self {
+    pub fn new(
+        schema: Schema,
+        child: Box<dyn ExecNode>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Self {
         Self {
             schema,
             child,
-            remaining: n,
+            offset,
+            skipped: 0,
+            remaining: limit,
         }
     }
 }
@@ -468,12 +477,22 @@ impl ExecNode for LimitExec {
         self.child.open()
     }
     fn next(&mut self) -> PgWireResult<Option<Row>> {
-        if self.remaining == 0 {
-            return Ok(None);
+        while self.skipped < self.offset {
+            match self.child.next()? {
+                Some(_) => self.skipped += 1,
+                None => return Ok(None),
+            }
+        }
+        if let Some(rem) = &mut self.remaining {
+            if *rem == 0 {
+                return Ok(None);
+            }
         }
         match self.child.next()? {
             Some(r) => {
-                self.remaining -= 1;
+                if let Some(rem) = &mut self.remaining {
+                    *rem -= 1;
+                }
                 Ok(Some(r))
             }
             None => Ok(None),

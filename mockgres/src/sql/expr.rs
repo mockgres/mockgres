@@ -5,7 +5,7 @@ use pg_query::NodeEnum;
 use pg_query::protobuf::{AExpr, BoolExprType, ColumnRef, FuncCall, Node, NullTestType, ParamRef};
 use pgwire::error::PgWireResult;
 
-use super::tokens::{const_to_value, try_parse_literal};
+use super::tokens::{const_to_value, parse_type_name, try_parse_literal};
 
 pub fn parse_bool_expr(node: &NodeEnum) -> PgWireResult<BoolExpr> {
     match node {
@@ -92,7 +92,16 @@ pub fn parse_scalar_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
                 .ok_or_else(|| fe("bad type cast"))?;
-            parse_scalar_expr(inner)
+            let expr = parse_scalar_expr(inner)?;
+            let target = tc
+                .type_name
+                .as_ref()
+                .ok_or_else(|| fe("missing cast target"))?;
+            let dt = parse_type_name(target)?;
+            Ok(ScalarExpr::Cast {
+                expr: Box::new(expr),
+                ty: dt,
+            })
         }
         _ => {
             if let Some(v) = try_parse_literal(node)? {
@@ -223,6 +232,7 @@ pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>
             collect_columns_from_scalar_expr(right, out);
         }
         ScalarExpr::UnaryOp { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+        ScalarExpr::Cast { expr, .. } => collect_columns_from_scalar_expr(expr, out),
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_columns_from_scalar_expr(arg, out);
@@ -256,6 +266,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::Literal(_) => "?column?".into(),
         ScalarExpr::BinaryOp { .. } => "?column?".into(),
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
+        ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
         ScalarExpr::Func { .. } => "?column?".into(),
     }
 }

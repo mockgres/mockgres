@@ -133,6 +133,7 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
             collect_param_hints_from_scalar(right, out);
         }
         ScalarExpr::UnaryOp { expr, .. } => collect_param_hints_from_scalar(expr, out),
+        ScalarExpr::Cast { expr, .. } => collect_param_hints_from_scalar(expr, out),
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_param_hints_from_scalar(arg, out);
@@ -228,6 +229,7 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
             collect_param_indexes_from_scalar(right, out);
         }
         ScalarExpr::UnaryOp { expr, .. } => collect_param_indexes_from_scalar(expr, out),
+        ScalarExpr::Cast { expr, .. } => collect_param_indexes_from_scalar(expr, out),
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_param_indexes_from_scalar(arg, out);

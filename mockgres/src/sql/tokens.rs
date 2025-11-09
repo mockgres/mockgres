@@ -1,7 +1,7 @@
 use crate::engine::{DataType, ObjName, Value, fe};
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
-use pg_query::protobuf::{AConst, ColumnDef};
+use pg_query::protobuf::{AConst, ColumnDef, TypeName};
 use pgwire::error::PgWireResult;
 
 pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
@@ -24,6 +24,10 @@ pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
 
 pub(super) fn map_type(cd: &ColumnDef) -> PgWireResult<DataType> {
     let typ = cd.type_name.as_ref().ok_or_else(|| fe("missing type"))?;
+    parse_type_name(typ)
+}
+
+pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
     let mut tokens: Vec<String> = typ
         .names
         .iter()

@@ -43,6 +43,52 @@ async fn where_order_limit_and_tags() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn limit_and_offset_clauses_page_results() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute("create table paged(i int primary key)", &[])
+        .await
+        .expect("create paged");
+    ctx.client
+        .execute("insert into paged values (1),(2),(3),(4),(5)", &[])
+        .await
+        .expect("seed paged");
+
+    let page: Vec<i32> = ctx
+        .client
+        .query("select i from paged order by i limit 2 offset 1", &[])
+        .await
+        .expect("limit/offset query")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(page, vec![2, 3]);
+
+    let offset_only: Vec<i32> = ctx
+        .client
+        .query("select i from paged order by i offset 3", &[])
+        .await
+        .expect("offset only")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(offset_only, vec![4, 5]);
+
+    let empty: Vec<i32> = ctx
+        .client
+        .query("select i from paged order by i limit 0 offset 2", &[])
+        .await
+        .expect("limit zero")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert!(empty.is_empty());
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn where_boolean_and_null_ops() {
     let ctx = common::start().await;
 

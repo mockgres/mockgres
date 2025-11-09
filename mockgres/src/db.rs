@@ -1,9 +1,9 @@
 use crate::catalog::{Catalog, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, ScalarExpr, SqlError, Value, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, ScalarExpr, SqlError, Value, cast_value_to_type, eval_bool_expr,
+    eval_scalar_expr,
 };
 use crate::storage::{Row, RowKey, Table};
-use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -581,58 +581,10 @@ fn coerce_value_for_column(
         return Ok(Value::Null);
     }
     let coerced = cast_value_to_type(val, &col.data_type).map_err(|e| {
-        if let Some(sql) = e.downcast_ref::<SqlError>() {
-            sql_err(
-                sql.code,
-                format!("column {} (index {}): {}", col.name, idx, sql.message),
-            )
-        } else {
-            sql_err(
-                "42804",
-                format!("column {} (index {}): {}", col.name, idx, e),
-            )
-        }
+        sql_err(
+            e.code,
+            format!("column {} (index {}): {}", col.name, idx, e.message),
+        )
     })?;
     Ok(coerced)
-}
-
-fn cast_value_to_type(val: Value, target: &DataType) -> anyhow::Result<Value> {
-    match (target, val) {
-        (DataType::Int4, Value::Int64(v)) => {
-            if v < i32::MIN as i64 || v > i32::MAX as i64 {
-                return Err(sql_err("22003", "value out of range for int4"));
-            }
-            Ok(Value::Int64(v))
-        }
-        (DataType::Int8, Value::Int64(v)) => Ok(Value::Int64(v)),
-        (DataType::Float8, Value::Float64Bits(bits)) => Ok(Value::Float64Bits(bits)),
-        (DataType::Float8, Value::Int64(v)) => Ok(Value::from_f64(v as f64)),
-        (DataType::Text, Value::Text(s)) => Ok(Value::Text(s)),
-        (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),
-        (DataType::Date, Value::Date(d)) => Ok(Value::Date(d)),
-        (DataType::Date, Value::Text(s)) => {
-            let days = parse_date_str(&s).map_err(|e| sql_err("22007", e))?;
-            Ok(Value::Date(days))
-        }
-        (DataType::Timestamp, Value::TimestampMicros(m)) => Ok(Value::TimestampMicros(m)),
-        (DataType::Timestamp, Value::Text(s)) => {
-            let micros = parse_timestamp_str(&s).map_err(|e| sql_err("22007", e))?;
-            Ok(Value::TimestampMicros(micros))
-        }
-        (DataType::Bytea, Value::Bytes(bytes)) => Ok(Value::Bytes(bytes)),
-        (DataType::Bytea, Value::Text(s)) => {
-            let bytes = parse_bytea_text(&s).map_err(|e| sql_err("22001", e))?;
-            Ok(Value::Bytes(bytes))
-        }
-        (DataType::Text, Value::Bool(b)) => Ok(Value::Text(if b { "t" } else { "f" }.into())),
-        (DataType::Text, Value::Int64(i)) => Ok(Value::Text(i.to_string())),
-        (DataType::Text, Value::Float64Bits(bits)) => {
-            let f = f64::from_bits(bits);
-            Ok(Value::Text(f.to_string()))
-        }
-        (dt, got) => Err(sql_err(
-            "42804",
-            format!("type mismatch: expected {dt:?}, got {got:?}"),
-        )),
-    }
 }

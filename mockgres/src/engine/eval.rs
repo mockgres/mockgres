@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use super::exec::ExecNode;
 use super::{
-    BoolExpr, CmpOp, DataType, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value, fe,
-    fe_code,
+    BoolExpr, CmpOp, DataType, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value,
+    cast_value_to_type, fe, fe_code,
 };
 
 pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> PgWireResult<Value> {
@@ -39,6 +39,14 @@ pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> P
                 evaluated.push(eval_scalar_expr(row, arg, params)?);
             }
             eval_function(*func, evaluated)
+        }
+        ScalarExpr::Cast { expr, ty } => {
+            let value = eval_scalar_expr(row, expr, params)?;
+            if matches!(value, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                cast_value_to_type(value, ty).map_err(|e| fe_code(e.code, e.message.clone()))
+            }
         }
     }
 }

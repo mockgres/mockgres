@@ -69,11 +69,19 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
 
+    let mut limit_value = None;
     if let Some(limit_node) = sel.limit_count.as_ref().and_then(|n| n.node.as_ref()) {
-        let lim = parse_limit_count(limit_node)?;
+        limit_value = Some(parse_limit_count(limit_node)?);
+    }
+    let mut offset_value = 0usize;
+    if let Some(offset_node) = sel.limit_offset.as_ref().and_then(|n| n.node.as_ref()) {
+        offset_value = parse_offset_count(offset_node)?;
+    }
+    if limit_value.is_some() || offset_value != 0 {
         plan = Plan::Limit {
             input: Box::new(plan),
-            limit: lim,
+            limit: limit_value,
+            offset: offset_value,
         };
     }
 
@@ -435,6 +443,10 @@ fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
                 .map(sanitize_insert_expr)
                 .collect::<PgWireResult<Vec<_>>>()?,
         }),
+        ScalarExpr::Cast { expr, ty } => Ok(ScalarExpr::Cast {
+            expr: Box::new(sanitize_insert_expr(*expr)?),
+            ty,
+        }),
         other => Ok(other),
     }
 }
@@ -487,18 +499,26 @@ fn ensure_columns_present(
 }
 
 fn parse_limit_count(node: &NodeEnum) -> PgWireResult<usize> {
+    parse_nonnegative_count(node, "limit")
+}
+
+fn parse_offset_count(node: &NodeEnum) -> PgWireResult<usize> {
+    parse_nonnegative_count(node, "offset")
+}
+
+fn parse_nonnegative_count(node: &NodeEnum, label: &str) -> PgWireResult<usize> {
     match node {
         NodeEnum::AConst(c) => {
             if let Some(Val::Ival(iv)) = c.val.as_ref() {
                 if iv.ival < 0 {
-                    return Err(fe("limit must be non-negative"));
+                    return Err(fe(format!("{label} must be non-negative")));
                 }
                 Ok(iv.ival as usize)
             } else {
-                Err(fe("limit must be integer"))
+                Err(fe(format!("{label} must be integer")))
             }
         }
-        _ => Err(fe("unsupported limit expression")),
+        _ => Err(fe(format!("unsupported {label} expression"))),
     }
 }
 
@@ -522,6 +542,7 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::Date(_)) => DataType::Date,
         ScalarExpr::Literal(Value::TimestampMicros(_)) => DataType::Timestamp,
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
+        ScalarExpr::Cast { ty, .. } => ty.clone(),
         _ => DataType::Text,
     }
 }
