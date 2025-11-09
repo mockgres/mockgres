@@ -1,14 +1,19 @@
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 pub struct TestCtx {
     pub client: Client,
+    #[allow(dead_code)]
+    conn_str: String,
     pub _bg: JoinHandle<()>,
     pub _server: JoinHandle<()>,
     pub shutdown: tokio::sync::oneshot::Sender<()>,
+    #[allow(dead_code)]
+    extra_connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 pub async fn start() -> TestCtx {
@@ -26,12 +31,15 @@ pub async fn start() -> TestCtx {
             eprintln!("connection error: {e}");
         }
     });
+    let extras = Arc::new(Mutex::new(Vec::new()));
 
     TestCtx {
         client,
+        conn_str,
         _bg: conn_task,
         _server: server_task,
         shutdown,
+        extra_connections: extras,
     }
 }
 
@@ -61,7 +69,24 @@ async fn run_server(
     }
 }
 
+impl TestCtx {
+    #[allow(dead_code)]
+    pub async fn new_client(&self) -> Client {
+        let (client, connection) = tokio_postgres::connect(&self.conn_str, NoTls)
+            .await
+            .expect("connect extra client");
+        let handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("connection error: {e}");
+            }
+        });
+        self.extra_connections.lock().await.push(handle);
+        client
+    }
+}
+
 // run a simple query and return the first cell as string
+#[allow(dead_code)]
 pub async fn simple_first_cell(client: &Client, sql: &str) -> String {
     let msgs = client.simple_query(sql).await.expect("simple query");
     let row = msgs
