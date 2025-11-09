@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Field, InsertSource, Plan, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
-    Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
+    BoolExpr, DataType, Field, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp,
+    ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
 use anyhow::Error;
 use pgwire::error::PgWireError;
@@ -134,6 +134,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             table,
             sets,
             filter,
+            mut returning,
+            mut returning_schema,
         } => {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
@@ -175,13 +177,24 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 Some(f) => Some(bind_bool_expr(&f, &schema)?),
                 None => None,
             };
+            returning_schema = match returning.as_mut() {
+                Some(clause) => Some(bind_returning_clause(clause, &schema)?),
+                None => None,
+            };
             Ok(Plan::Update {
                 table,
                 sets: bound_sets,
                 filter: bound_filter,
+                returning,
+                returning_schema,
             })
         }
-        Plan::Delete { table, filter } => {
+        Plan::Delete {
+            table,
+            filter,
+            mut returning,
+            mut returning_schema,
+        } => {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
                 .resolve_table(schema_name, &table.name)
@@ -200,9 +213,15 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 Some(f) => Some(bind_bool_expr(&f, &schema)?),
                 None => None,
             };
+            returning_schema = match returning.as_mut() {
+                Some(clause) => Some(bind_returning_clause(clause, &schema)?),
+                None => None,
+            };
             Ok(Plan::Delete {
                 table,
                 filter: bound_filter,
+                returning,
+                returning_schema,
             })
         }
         Plan::Order { input, keys } => {
@@ -263,6 +282,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             table,
             columns,
             rows,
+            mut returning,
+            mut returning_schema,
         } => {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
@@ -336,15 +357,57 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 }
                 bound_rows.push(bound_row);
             }
+            returning_schema = match returning.as_mut() {
+                Some(clause) => Some(bind_returning_clause(clause, &table_schema)?),
+                None => None,
+            };
             Ok(Plan::InsertValues {
                 table,
                 columns,
                 rows: bound_rows,
+                returning,
+                returning_schema,
             })
         }
 
         other => Ok(other),
     }
+}
+
+fn bind_returning_clause(
+    clause: &mut ReturningClause,
+    schema: &Schema,
+) -> pgwire::error::PgWireResult<Schema> {
+    let mut expanded = Vec::new();
+    for item in clause.exprs.drain(..) {
+        match item {
+            ReturningExpr::Star => {
+                for field in &schema.fields {
+                    expanded.push(ReturningExpr::Expr {
+                        expr: ScalarExpr::Column(field.name.clone()),
+                        alias: field.name.clone(),
+                    });
+                }
+            }
+            ReturningExpr::Expr { expr, alias } => {
+                expanded.push(ReturningExpr::Expr { expr, alias });
+            }
+        }
+    }
+    clause.exprs = expanded;
+    let mut fields = Vec::with_capacity(clause.exprs.len());
+    for item in clause.exprs.iter_mut() {
+        if let ReturningExpr::Expr { expr, alias } = item {
+            let bound = bind_scalar_expr(expr, schema, None)?;
+            let dt = scalar_expr_type(&bound, schema).unwrap_or(DataType::Text);
+            fields.push(Field {
+                name: alias.clone(),
+                data_type: dt,
+            });
+            *expr = bound;
+        }
+    }
+    Ok(Schema { fields })
 }
 
 fn bind_bool_expr(expr: &BoolExpr, schema: &Schema) -> pgwire::error::PgWireResult<BoolExpr> {

@@ -90,6 +90,17 @@ pub enum InsertSource {
 }
 
 #[derive(Clone, Debug)]
+pub enum ReturningExpr {
+    Star,
+    Expr { expr: ScalarExpr, alias: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct ReturningClause {
+    pub exprs: Vec<ReturningExpr>,
+}
+
+#[derive(Clone, Debug)]
 pub enum Selection {
     Star,
     Columns(Vec<String>),
@@ -193,15 +204,21 @@ pub enum Plan {
         table: ObjName,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertSource>>,
+        returning: Option<ReturningClause>,
+        returning_schema: Option<Schema>,
     },
     Update {
         table: ObjName,
         sets: Vec<UpdateSet>,
         filter: Option<BoolExpr>,
+        returning: Option<ReturningClause>,
+        returning_schema: Option<Schema>,
     },
     Delete {
         table: ObjName,
         filter: Option<BoolExpr>,
+        returning: Option<ReturningClause>,
+        returning_schema: Option<Schema>,
     },
     BeginTransaction,
     CommitTransaction,
@@ -244,6 +261,18 @@ impl Plan {
             Plan::Filter { input, .. } | Plan::Order { input, .. } | Plan::Limit { input, .. } => {
                 input.schema()
             }
+            Plan::InsertValues {
+                returning_schema, ..
+            }
+            | Plan::Update {
+                returning_schema, ..
+            }
+            | Plan::Delete {
+                returning_schema, ..
+            } => {
+                static EMPTY: Schema = Schema { fields: vec![] };
+                returning_schema.as_ref().unwrap_or(&EMPTY)
+            }
             Plan::UnboundSeqScan { .. }
             | Plan::UnboundJoin { .. }
             | Plan::CreateTable { .. }
@@ -253,9 +282,6 @@ impl Plan {
             | Plan::DropIndex { .. }
             | Plan::DropTable { .. }
             | Plan::SetVariable { .. }
-            | Plan::InsertValues { .. }
-            | Plan::Update { .. }
-            | Plan::Delete { .. }
             | Plan::BeginTransaction
             | Plan::CommitTransaction
             | Plan::RollbackTransaction => {

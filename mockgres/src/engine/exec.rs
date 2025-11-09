@@ -33,6 +33,10 @@ impl ValuesExec {
             idx: 0,
         })
     }
+
+    pub fn from_values(schema: Schema, rows: Vec<Vec<Value>>) -> Self {
+        Self { schema, rows, idx: 0 }
+    }
 }
 impl ExecNode for ValuesExec {
     fn open(&mut self) -> PgWireResult<()> {

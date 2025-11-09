@@ -91,6 +91,20 @@ mod tests {
     }
 
     #[test]
+    fn insert_returning_clause_is_parsed() {
+        let plan = Planner::plan_sql(
+            "insert into gadgets(id) values (1) returning id, qty, upper(coalesce(note, 'x'))",
+        )
+        .expect("plan insert");
+        match plan {
+            Plan::InsertValues { returning, .. } => {
+                assert!(returning.is_some(), "expected returning clause");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_and_drop_index_parse() {
         let create = Planner::plan_sql("create index idx_things on items (id, qty)")
             .expect("plan create index");

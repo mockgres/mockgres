@@ -6,7 +6,10 @@ use pgwire::api::Type;
 use pgwire::api::results::FieldFormat;
 use pgwire::error::PgWireResult;
 
-use crate::engine::{BoolExpr, DataType, InsertSource, Plan, ScalarExpr, UpdateSet, Value, fe};
+use crate::engine::{
+    BoolExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr, UpdateSet,
+    Value, fe,
+};
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 
 use super::mapping::{map_datatype_to_pg_type, map_pg_type_to_datatype};
@@ -72,24 +75,42 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             collect_param_hints_from_plan(left, out);
             collect_param_hints_from_plan(right, out);
         }
-        Plan::Update { sets, filter, .. } => {
+        Plan::Update {
+            sets,
+            filter,
+            returning,
+            ..
+        } => {
             collect_param_hints_from_update_sets(sets, out);
             if let Some(expr) = filter {
                 collect_param_hints_from_bool(expr, out);
             }
+            if let Some(clause) = returning {
+                collect_param_hints_from_returning(clause, out);
+            }
         }
-        Plan::Delete { filter, .. } => {
+        Plan::Delete {
+            filter, returning, ..
+        } => {
             if let Some(expr) = filter {
                 collect_param_hints_from_bool(expr, out);
             }
+            if let Some(clause) = returning {
+                collect_param_hints_from_returning(clause, out);
+            }
         }
-        Plan::InsertValues { rows, .. } => {
+        Plan::InsertValues {
+            rows, returning, ..
+        } => {
             for row in rows {
                 for src in row {
                     if let InsertSource::Expr(expr) = src {
                         collect_param_hints_from_scalar(expr, out);
                     }
                 }
+            }
+            if let Some(clause) = returning {
+                collect_param_hints_from_returning(clause, out);
             }
         }
         Plan::SeqScan { .. }
@@ -158,6 +179,17 @@ fn collect_param_hints_from_update_sets(sets: &[UpdateSet], out: &mut HashMap<us
     }
 }
 
+fn collect_param_hints_from_returning(
+    clause: &ReturningClause,
+    out: &mut HashMap<usize, DataType>,
+) {
+    for item in &clause.exprs {
+        if let ReturningExpr::Expr { expr, .. } = item {
+            collect_param_hints_from_scalar(expr, out);
+        }
+    }
+}
+
 fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
     match plan {
         Plan::Filter { input, expr, .. } => {
@@ -175,24 +207,42 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             collect_param_indexes(left, out);
             collect_param_indexes(right, out);
         }
-        Plan::Update { sets, filter, .. } => {
+        Plan::Update {
+            sets,
+            filter,
+            returning,
+            ..
+        } => {
             collect_param_indexes_from_update_sets(sets, out);
             if let Some(expr) = filter {
                 collect_param_indexes_from_bool(expr, out);
             }
+            if let Some(clause) = returning {
+                collect_param_indexes_from_returning(clause, out);
+            }
         }
-        Plan::Delete { filter, .. } => {
+        Plan::Delete {
+            filter, returning, ..
+        } => {
             if let Some(expr) = filter {
                 collect_param_indexes_from_bool(expr, out);
             }
+            if let Some(clause) = returning {
+                collect_param_indexes_from_returning(clause, out);
+            }
         }
-        Plan::InsertValues { rows, .. } => {
+        Plan::InsertValues {
+            rows, returning, ..
+        } => {
             for row in rows {
                 for src in row {
                     if let InsertSource::Expr(expr) = src {
                         collect_param_indexes_from_scalar(expr, out);
                     }
                 }
+            }
+            if let Some(clause) = returning {
+                collect_param_indexes_from_returning(clause, out);
             }
         }
         Plan::SeqScan { .. }
@@ -255,6 +305,14 @@ fn collect_param_indexes_from_update_sets(sets: &[UpdateSet], out: &mut BTreeSet
             UpdateSet::ByIndex(_, expr) | UpdateSet::ByName(_, expr) => {
                 collect_param_indexes_from_scalar(expr, out);
             }
+        }
+    }
+}
+
+fn collect_param_indexes_from_returning(clause: &ReturningClause, out: &mut BTreeSet<usize>) {
+    for item in &clause.exprs {
+        if let ReturningExpr::Expr { expr, .. } = item {
+            collect_param_indexes_from_scalar(expr, out);
         }
     }
 }

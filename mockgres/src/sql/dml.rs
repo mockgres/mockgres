@@ -1,6 +1,6 @@
 use crate::engine::{
-    DataType, Field, InsertSource, ObjName, Plan, ScalarExpr, Schema, Selection, SortKey,
-    UpdateSet, Value, fe,
+    DataType, Field, InsertSource, ObjName, Plan, ReturningClause, ReturningExpr, ScalarExpr,
+    Schema, Selection, SortKey, UpdateSet, Value, fe,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
@@ -217,10 +217,13 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
         }
         all_rows.push(row);
     }
+    let returning = parse_returning_clause(&ins.returning_list)?;
     Ok(Plan::InsertValues {
         table,
         columns: insert_columns,
         rows: all_rows,
+        returning,
+        returning_schema: None,
     })
 }
 
@@ -262,10 +265,13 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
     } else {
         None
     };
+    let returning = parse_returning_clause(&upd.returning_list)?;
     Ok(Plan::Update {
         table,
         sets,
         filter,
+        returning,
+        returning_schema: None,
     })
 }
 
@@ -284,7 +290,13 @@ pub fn plan_delete(del: DeleteStmt) -> PgWireResult<Plan> {
     } else {
         None
     };
-    Ok(Plan::Delete { table, filter })
+    let returning = parse_returning_clause(&del.returning_list)?;
+    Ok(Plan::Delete {
+        table,
+        filter,
+        returning,
+        returning_schema: None,
+    })
 }
 
 fn parse_select_list(
@@ -337,6 +349,53 @@ fn parse_select_list(
         exprs.push((expr, alias));
     }
     Ok((Selection::Columns(cols), Some(exprs)))
+}
+
+fn parse_returning_clause(
+    returning_list: &[pg_query::Node],
+) -> PgWireResult<Option<ReturningClause>> {
+    if returning_list.is_empty() {
+        return Ok(None);
+    }
+    let mut exprs = Vec::with_capacity(returning_list.len());
+    for item in returning_list {
+        let rt = item
+            .node
+            .as_ref()
+            .and_then(|n| {
+                if let NodeEnum::ResTarget(rt) = n {
+                    Some(rt)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| fe("bad RETURNING target"))?;
+        if let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref()) {
+            if cr
+                .fields
+                .get(0)
+                .and_then(|f| f.node.as_ref())
+                .map(|n| matches!(n, NodeEnum::AStar(_)))
+                .unwrap_or(false)
+            {
+                exprs.push(ReturningExpr::Star);
+                continue;
+            }
+        }
+        let expr_node = rt
+            .val
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("missing RETURNING expression"))?;
+        let expr = parse_scalar_expr(expr_node)?;
+        let alias = if rt.name.is_empty() {
+            derive_expr_name(&expr)
+        } else {
+            rt.name.clone()
+        };
+        exprs.push(ReturningExpr::Expr { expr, alias });
+    }
+    Ok(Some(ReturningClause { exprs }))
 }
 
 fn parse_range_var(node: pg_query::Node) -> PgWireResult<ObjName> {

@@ -560,7 +560,7 @@ impl Db {
         schema: &str,
         name: &str,
         mut rows: Vec<Vec<CellInput>>,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(usize, Vec<Row>)> {
         let meta = self
             .catalog
             .get_table(schema, name)
@@ -603,6 +603,7 @@ impl Db {
             .get_mut(&table_id)
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
         let mut count = 0usize;
+        let mut inserted_rows = Vec::with_capacity(realized.len());
 
         for (_ridx, out) in realized.into_iter() {
             let row = out;
@@ -628,11 +629,12 @@ impl Db {
             }
 
             // finally insert
+            inserted_rows.push(row.clone());
             tab.insert(key, row);
             count += 1;
         }
 
-        Ok(count)
+        Ok((count, inserted_rows))
     }
 
     pub fn scan_bound_positions(
@@ -665,10 +667,10 @@ impl Db {
         sets: &[(usize, ScalarExpr)],
         filter: Option<&BoolExpr>,
         params: &[Value],
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(usize, Vec<Row>)> {
         let (meta, table) = self.resolve_table_mut(schema, name)?;
         if sets.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         if let Some(pkpos) = &meta.pk {
             for (idx, _) in sets {
@@ -681,6 +683,7 @@ impl Db {
             }
         }
         let mut count = 0usize;
+        let mut updated_rows = Vec::new();
         for row in table.rows_by_key.values_mut() {
             let passes = if let Some(expr) = filter {
                 eval_bool_expr(row, expr, params)
@@ -700,10 +703,11 @@ impl Db {
                 let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, meta)?;
                 updated[*idx] = coerced;
             }
-            *row = updated;
+            *row = updated.clone();
+            updated_rows.push(updated);
             count += 1;
         }
-        Ok(count)
+        Ok((count, updated_rows))
     }
 
     pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
@@ -753,7 +757,7 @@ impl Db {
         name: &str,
         filter: Option<&BoolExpr>,
         params: &[Value],
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<(usize, Vec<Row>)> {
         let meta = self.resolve_table(schema, name)?;
         let table_id = meta.id;
         let mut to_remove: Vec<(RowKey, Row)> = Vec::new();
@@ -795,10 +799,12 @@ impl Db {
                 format!("missing storage for table id {}", table_id),
             )
         })?;
-        for (key, _) in to_remove {
+        let mut removed_rows = Vec::with_capacity(count);
+        for (key, row) in to_remove {
             table.rows_by_key.remove(&key);
+            removed_rows.push(row);
         }
-        Ok(count)
+        Ok((count, removed_rows))
     }
 
     fn ensure_outbound_foreign_keys(

@@ -5,8 +5,10 @@ use pgwire::error::PgWireResult;
 use crate::db::Db;
 use crate::engine::{
     ExecNode, Expr, FilterExec, LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec,
-    ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec, fe, fe_code,
+    ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec,
+    eval_scalar_expr, fe, fe_code,
 };
+use crate::storage::Row;
 
 use super::errors::map_db_err;
 use super::insert::evaluate_insert_source;
@@ -295,6 +297,8 @@ pub fn build_executor(
             table,
             columns,
             rows,
+            returning,
+            returning_schema,
         } => {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let table_meta = {
@@ -362,21 +366,31 @@ pub fn build_executor(
                 realized.push(full);
             }
             let mut db = db.write();
-            let inserted = db
+            let (inserted, inserted_rows) = db
                 .insert_full_rows(schema_name, &table.name, realized)
                 .map_err(map_db_err)?;
             drop(db);
             let tag = format!("INSERT 0 {}", inserted);
-            Ok((
-                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
-                Some(tag),
-                None,
-            ))
+            if let Some(clause) = returning.clone() {
+                let schema = returning_schema
+                    .clone()
+                    .expect("returning schema missing for INSERT");
+                let rows = materialize_returning_rows(&clause, &inserted_rows, &params)?;
+                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+            } else {
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some(tag),
+                    None,
+                ))
+            }
         }
         Plan::Update {
             table,
             sets,
             filter,
+            returning,
+            returning_schema,
         } => {
             let assignments = sets
                 .iter()
@@ -389,7 +403,7 @@ pub fn build_executor(
                 .collect::<PgWireResult<Vec<_>>>()?;
             let mut db = db.write();
             let schema_name = table.schema.as_deref().unwrap_or("public");
-            let count = db
+            let (count, updated_rows) = db
                 .update_rows(
                     schema_name,
                     &table.name,
@@ -400,25 +414,46 @@ pub fn build_executor(
                 .map_err(map_db_err)?;
             drop(db);
             let tag = format!("UPDATE {}", count);
-            Ok((
-                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
-                Some(tag),
-                None,
-            ))
+            if let Some(clause) = returning.clone() {
+                let schema = returning_schema
+                    .clone()
+                    .expect("returning schema missing for UPDATE");
+                let rows = materialize_returning_rows(&clause, &updated_rows, &params)?;
+                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+            } else {
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some(tag),
+                    None,
+                ))
+            }
         }
-        Plan::Delete { table, filter } => {
+        Plan::Delete {
+            table,
+            filter,
+            returning,
+            returning_schema,
+        } => {
             let mut db = db.write();
             let schema_name = table.schema.as_deref().unwrap_or("public");
-            let count = db
+            let (count, removed_rows) = db
                 .delete_rows(schema_name, &table.name, filter.as_ref(), &params)
                 .map_err(map_db_err)?;
             drop(db);
             let tag = format!("DELETE {}", count);
-            Ok((
-                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
-                Some(tag),
-                None,
-            ))
+            if let Some(clause) = returning.clone() {
+                let schema = returning_schema
+                    .clone()
+                    .expect("returning schema missing for DELETE");
+                let rows = materialize_returning_rows(&clause, &removed_rows, &params)?;
+                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+            } else {
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some(tag),
+                    None,
+                ))
+            }
         }
         Plan::ShowVariable { name, schema } => {
             let value = match super::mapping::lookup_show_value(name) {
@@ -473,4 +508,28 @@ pub fn build_executor(
             Err(fe("unbound plan; call binder first"))
         }
     }
+}
+
+fn materialize_returning_rows(
+    clause: &ReturningClause,
+    rows: &[Row],
+    params: &[Value],
+) -> PgWireResult<Vec<Vec<Value>>> {
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut projected = Vec::with_capacity(clause.exprs.len());
+        for item in &clause.exprs {
+            match item {
+                ReturningExpr::Expr { expr, .. } => {
+                    let value = eval_scalar_expr(row, expr, params)?;
+                    projected.push(value);
+                }
+                ReturningExpr::Star => {
+                    return Err(fe("RETURNING * not bound"));
+                }
+            }
+        }
+        out.push(projected);
+    }
+    Ok(out)
 }
