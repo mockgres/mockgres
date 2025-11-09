@@ -41,7 +41,7 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{InsertSource, Plan, Value};
+    use crate::engine::{InsertSource, Plan, ScalarExpr, Value};
 
     #[test]
     fn parses_alter_table_add_column_default() {
@@ -52,7 +52,7 @@ mod tests {
                 let (name, _ty, _nullable, default) = column;
                 assert_eq!(name, "note");
                 match default {
-                    Some(Value::Text(s)) => assert_eq!(s, "pending"),
+                    Some(ScalarExpr::Literal(Value::Text(s))) => assert_eq!(s, "pending"),
                     other => panic!("expected text default, got {other:?}"),
                 }
             }

@@ -137,3 +137,48 @@ async fn insert_default_keyword() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn default_expressions_are_evaluated() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute(
+            "create table default_expr_demo(
+                id int primary key,
+                label text not null default upper('ab' || 'cd'),
+                score int not null default (1 + 2)
+            )",
+            &[],
+        )
+        .await
+        .expect("create table");
+
+    for id in [1, 2] {
+        ctx.client
+            .execute(
+                "insert into default_expr_demo values ($1, DEFAULT, DEFAULT)",
+                &[&id],
+            )
+            .await
+            .expect("insert row");
+    }
+
+    let rows = ctx
+        .client
+        .query(
+            "select id, label, score from default_expr_demo order by id",
+            &[],
+        )
+        .await
+        .expect("select values");
+
+    assert_eq!(rows.len(), 2);
+    for (idx, row) in rows.iter().enumerate() {
+        assert_eq!(row.get::<_, i32>(0), (idx + 1) as i32);
+        assert_eq!(row.get::<_, String>(1), "ABCD");
+        assert_eq!(row.get::<_, i32>(2), 3);
+    }
+
+    let _ = ctx.shutdown.send(());
+}

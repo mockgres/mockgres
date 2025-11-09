@@ -100,6 +100,14 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
 
+        Plan::CountRows { input, schema } => {
+            let child = bind(db, *input)?;
+            Ok(Plan::CountRows {
+                input: Box::new(child),
+                schema,
+            })
+        }
+
         // wrappers: bind child; nothing else to do
         Plan::Filter {
             input,

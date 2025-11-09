@@ -454,3 +454,157 @@ pub fn to_pgwire_stream(
 
     Ok((fields, s))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{parse_date_str, parse_timestamp_str};
+
+    fn lit_int(v: i64) -> ScalarExpr {
+        ScalarExpr::Literal(Value::Int64(v))
+    }
+
+    fn lit_text(v: &str) -> ScalarExpr {
+        ScalarExpr::Literal(Value::Text(v.to_string()))
+    }
+
+    fn lit_float(v: f64) -> ScalarExpr {
+        ScalarExpr::Literal(Value::from_f64(v))
+    }
+
+    #[test]
+    fn evaluates_all_arithmetic_ops() {
+        let add = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Add,
+            left: Box::new(lit_int(2)),
+            right: Box::new(lit_int(3)),
+        };
+        assert_eq!(eval_scalar_expr(&[], &add, &[]).unwrap(), Value::Int64(5));
+
+        let sub = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Sub,
+            left: Box::new(lit_float(7.5)),
+            right: Box::new(lit_int(2)),
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &sub, &[]).unwrap().as_f64().unwrap(),
+            5.5
+        );
+
+        let mul = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Mul,
+            left: Box::new(lit_int(4)),
+            right: Box::new(lit_int(3)),
+        };
+        assert_eq!(eval_scalar_expr(&[], &mul, &[]).unwrap(), Value::Int64(12));
+
+        let div = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Div,
+            left: Box::new(lit_int(9)),
+            right: Box::new(lit_int(2)),
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &div, &[]).unwrap().as_f64().unwrap(),
+            4.5
+        );
+    }
+
+    #[test]
+    fn evaluates_concat_and_unary_ops() {
+        let concat = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Concat,
+            left: Box::new(lit_text("hello")),
+            right: Box::new(lit_int(5)),
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &concat, &[]).unwrap(),
+            Value::Text("hello5".into())
+        );
+
+        let negate = ScalarExpr::UnaryOp {
+            op: ScalarUnaryOp::Negate,
+            expr: Box::new(lit_float(1.5)),
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &negate, &[])
+                .unwrap()
+                .as_f64()
+                .unwrap(),
+            -1.5
+        );
+    }
+
+    #[test]
+    fn evaluates_scalar_functions() {
+        let upper = ScalarExpr::Func {
+            func: ScalarFunc::Upper,
+            args: vec![lit_text("hi")],
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &upper, &[]).unwrap(),
+            Value::Text("HI".into())
+        );
+
+        let lower = ScalarExpr::Func {
+            func: ScalarFunc::Lower,
+            args: vec![lit_text("LOUD")],
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &lower, &[]).unwrap(),
+            Value::Text("loud".into())
+        );
+
+        let len_bytes = ScalarExpr::Func {
+            func: ScalarFunc::Length,
+            args: vec![ScalarExpr::Literal(Value::Bytes(b"abc".to_vec()))],
+        };
+        assert_eq!(
+            eval_scalar_expr(&[], &len_bytes, &[]).unwrap(),
+            Value::Int64(3)
+        );
+    }
+
+    #[test]
+    fn evaluates_bool_exprs_with_null_semantics() {
+        let comparison = BoolExpr::Comparison {
+            lhs: lit_int(5),
+            op: CmpOp::Gt,
+            rhs: lit_int(3),
+        };
+        assert_eq!(eval_bool_expr(&[], &comparison, &[]).unwrap(), Some(true));
+
+        let null_cmp = BoolExpr::Comparison {
+            lhs: ScalarExpr::Literal(Value::Null),
+            op: CmpOp::Eq,
+            rhs: lit_int(1),
+        };
+        assert_eq!(eval_bool_expr(&[], &null_cmp, &[]).unwrap(), None);
+
+        let is_null = BoolExpr::IsNull {
+            expr: ScalarExpr::Literal(Value::Null),
+            negated: false,
+        };
+        assert_eq!(eval_bool_expr(&[], &is_null, &[]).unwrap(), Some(true));
+    }
+
+    #[test]
+    fn casts_text_to_temporal_types() {
+        let date_expr = ScalarExpr::Cast {
+            expr: Box::new(lit_text("2024-02-01")),
+            ty: DataType::Date,
+        };
+        let expected_date = Value::Date(parse_date_str("2024-02-01").unwrap());
+        assert_eq!(
+            eval_scalar_expr(&[], &date_expr, &[]).unwrap(),
+            expected_date
+        );
+
+        let ts_expr = ScalarExpr::Cast {
+            expr: Box::new(lit_text("2024-02-01 12:34:56")),
+            ty: DataType::Timestamp,
+        };
+        let expected_ts =
+            Value::TimestampMicros(parse_timestamp_str("2024-02-01 12:34:56").unwrap());
+        assert_eq!(eval_scalar_expr(&[], &ts_expr, &[]).unwrap(), expected_ts);
+    }
+}

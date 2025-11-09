@@ -4,9 +4,9 @@ use pgwire::error::PgWireResult;
 
 use crate::db::Db;
 use crate::engine::{
-    ExecNode, Expr, FilterExec, LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec,
-    ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec,
-    eval_scalar_expr, fe, fe_code,
+    CountExec, ExecNode, Expr, FilterExec, LimitExec, NestedLoopJoinExec, OrderExec, Plan,
+    ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value,
+    ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::session::{RowPointer, Session};
 use crate::storage::Row;
@@ -20,6 +20,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::Values { .. }
         | Plan::SeqScan { .. }
         | Plan::Projection { .. }
+        | Plan::CountRows { .. }
         | Plan::Filter { .. }
         | Plan::Order { .. }
         | Plan::Limit { .. }
@@ -83,6 +84,22 @@ pub fn build_executor(
                 )),
                 None,
                 cnt,
+            ))
+        }
+
+        Plan::CountRows { input, schema } => {
+            let (child, _tag, _cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
+            Ok((
+                Box::new(CountExec::new(schema.clone(), child)),
+                None,
+                Some(1),
             ))
         }
 

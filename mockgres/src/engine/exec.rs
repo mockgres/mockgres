@@ -107,6 +107,48 @@ impl ExecNode for ProjectExec {
     }
 }
 
+pub struct CountExec {
+    schema: Schema,
+    input: Box<dyn ExecNode>,
+    produced: bool,
+}
+
+impl CountExec {
+    pub fn new(schema: Schema, input: Box<dyn ExecNode>) -> Self {
+        Self {
+            schema,
+            input,
+            produced: false,
+        }
+    }
+}
+
+impl ExecNode for CountExec {
+    fn open(&mut self) -> PgWireResult<()> {
+        self.input.open()
+    }
+
+    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+        if self.produced {
+            return Ok(None);
+        }
+        let mut count: i64 = 0;
+        while let Some(_) = self.input.next()? {
+            count += 1;
+        }
+        self.produced = true;
+        Ok(Some(vec![Value::Int64(count)]))
+    }
+
+    fn close(&mut self) -> PgWireResult<()> {
+        self.input.close()
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
 pub struct SeqScanExec {
     schema: Schema,
     rows: Vec<Vec<Value>>,

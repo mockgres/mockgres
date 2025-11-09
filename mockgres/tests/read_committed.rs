@@ -28,7 +28,11 @@ async fn other_sessions_only_see_committed_rows() {
         .query("select count(*) from mvcc_vis", &[])
         .await
         .expect("outside read");
-    assert_eq!(outside[0].get::<_, i64>(0), 0, "others must not see uncommitted rows");
+    assert_eq!(
+        outside[0].get::<_, i64>(0),
+        0,
+        "others must not see uncommitted rows"
+    );
 
     ctx.client.execute("commit", &[]).await.expect("commit");
 
@@ -36,7 +40,11 @@ async fn other_sessions_only_see_committed_rows() {
         .query("select count(*) from mvcc_vis", &[])
         .await
         .expect("after commit");
-    assert_eq!(after[0].get::<_, i64>(0), 1, "committed rows become visible");
+    assert_eq!(
+        after[0].get::<_, i64>(0),
+        1,
+        "committed rows become visible"
+    );
 
     let _ = ctx.shutdown.send(());
 }
@@ -46,7 +54,10 @@ async fn statements_take_fresh_snapshots_in_read_committed() {
     let ctx = common::start().await;
 
     ctx.client
-        .execute("create table mvcc_notes(id int primary key, note text)", &[])
+        .execute(
+            "create table mvcc_notes(id int primary key, note text)",
+            &[],
+        )
         .await
         .expect("create table");
     ctx.client
@@ -72,9 +83,16 @@ async fn statements_take_fresh_snapshots_in_read_committed() {
         .query("select note from mvcc_notes where id = 1", &[])
         .await
         .expect("second read");
-    assert_eq!(second[0].get::<_, &str>(0), "published", "new statement sees committed change");
+    assert_eq!(
+        second[0].get::<_, &str>(0),
+        "published",
+        "new statement sees committed change"
+    );
 
-    client_b.execute("rollback", &[]).await.expect("rollback reader");
+    client_b
+        .execute("rollback", &[])
+        .await
+        .expect("rollback reader");
 
     let _ = ctx.shutdown.send(());
 }

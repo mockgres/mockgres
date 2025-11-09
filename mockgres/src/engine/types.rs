@@ -1,3 +1,4 @@
+use super::expr_plan::ScalarExpr;
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 use pgwire::api::Type;
 use pgwire::error::PgWireError;
@@ -67,7 +68,7 @@ pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
-    pub default: Option<Value>,
+    pub default: Option<ScalarExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

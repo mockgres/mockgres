@@ -16,7 +16,7 @@ pub enum Expr {
     Column(usize),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScalarExpr {
     Literal(Value),
     Column(String),
@@ -44,7 +44,7 @@ pub enum ScalarExpr {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarBinaryOp {
     Add,
     Sub,
@@ -53,12 +53,12 @@ pub enum ScalarBinaryOp {
     Concat,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarUnaryOp {
     Negate,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarFunc {
     Coalesce,
     Upper,
@@ -162,15 +162,19 @@ pub enum Plan {
         exprs: Vec<(ScalarExpr, String)>,
         schema: Schema,
     },
+    CountRows {
+        input: Box<Plan>,
+        schema: Schema,
+    },
     CreateTable {
         table: ObjName,
-        cols: Vec<(String, DataType, bool, Option<Value>)>,
+        cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
         pk: Option<Vec<String>>,
         foreign_keys: Vec<ForeignKeySpec>,
     },
     AlterTableAddColumn {
         table: ObjName,
-        column: (String, DataType, bool, Option<Value>),
+        column: (String, DataType, bool, Option<ScalarExpr>),
         if_not_exists: bool,
     },
     AlterTableDropColumn {
@@ -256,6 +260,7 @@ impl Plan {
             Plan::Values { schema, .. }
             | Plan::SeqScan { schema, .. }
             | Plan::Projection { schema, .. }
+            | Plan::CountRows { schema, .. }
             | Plan::Join { schema, .. } => schema,
             Plan::ShowVariable { schema, .. } => schema,
             Plan::Filter { input, .. } | Plan::Order { input, .. } | Plan::Limit { input, .. } => {

@@ -71,6 +71,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_scalar(expr, out);
             }
         }
+        Plan::CountRows { input, .. } => collect_param_hints_from_plan(input, out),
         Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
             collect_param_hints_from_plan(left, out);
             collect_param_hints_from_plan(right, out);
@@ -203,6 +204,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_scalar(expr, out);
             }
         }
+        Plan::CountRows { input, .. } => collect_param_indexes(input, out),
         Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
             collect_param_indexes(left, out);
             collect_param_indexes(right, out);

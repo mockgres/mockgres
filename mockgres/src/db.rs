@@ -41,7 +41,7 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        cols: Vec<(String, DataType, bool, Option<Value>)>,
+        cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
         pk_names: Option<Vec<String>>,
         foreign_keys: Vec<ForeignKeySpec>,
     ) -> anyhow::Result<TableId> {
@@ -57,23 +57,22 @@ impl Db {
         self.next_tid += 1;
 
         let mut columns: Vec<Column> = Vec::with_capacity(cols.len());
-        for (n, t, nullable, default_raw) in cols.into_iter() {
-            let mut default_value = None;
-            if let Some(def) = default_raw {
-                let cast = cast_value_to_type(def, &t)?;
-                if matches!(cast, Value::Null) && !nullable {
-                    return Err(sql_err(
-                        "23502",
-                        format!("default NULL not allowed for NOT NULL column {n}"),
-                    ));
-                }
-                default_value = Some(cast);
+        for (n, t, nullable, default_expr) in cols.into_iter() {
+            if matches!(
+                default_expr.as_ref(),
+                Some(ScalarExpr::Literal(Value::Null))
+            ) && !nullable
+            {
+                return Err(sql_err(
+                    "23502",
+                    format!("default NULL not allowed for NOT NULL column {n}"),
+                ));
             }
             columns.push(Column {
                 name: n,
                 data_type: t,
                 nullable,
-                default: default_value,
+                default: default_expr,
             });
         }
 
@@ -249,33 +248,17 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        column: (String, DataType, bool, Option<Value>),
+        column: (String, DataType, bool, Option<ScalarExpr>),
         if_not_exists: bool,
     ) -> anyhow::Result<()> {
-        let (col_name, data_type, nullable, default_raw) = column;
-        let mut default_value = None;
-        if let Some(def) = default_raw {
-            let cast = cast_value_to_type(def, &data_type)?;
-            if matches!(cast, Value::Null) && !nullable {
-                return Err(sql_err(
-                    "23502",
-                    format!("default NULL not allowed for NOT NULL column {col_name}"),
-                ));
-            }
-            default_value = Some(cast);
-        } else if !nullable {
-            return Err(sql_err(
-                "23502",
-                format!("column {col_name} must have a default or allow NULLs"),
-            ));
-        }
-        let (table_id, column_exists) = {
+        let (col_name, data_type, nullable, default_expr) = column;
+        let (table_id, column_exists, meta_snapshot) = {
             let meta = self
                 .catalog
                 .get_table(schema, name)
                 .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
             let exists = meta.columns.iter().any(|c| c.name == col_name);
-            (meta.id, exists)
+            (meta.id, exists, meta.clone())
         };
         if column_exists {
             if if_not_exists {
@@ -286,7 +269,23 @@ impl Db {
                 format!("column {col_name} already exists"),
             ));
         }
-        let append_value = default_value.clone().unwrap_or(Value::Null);
+        let new_col_index = meta_snapshot.columns.len();
+        let temp_column = Column {
+            name: col_name.clone(),
+            data_type: data_type.clone(),
+            nullable,
+            default: None,
+        };
+        let append_value = if let Some(expr) = &default_expr {
+            eval_column_default(expr, &temp_column, new_col_index, &meta_snapshot)?
+        } else if nullable {
+            Value::Null
+        } else {
+            return Err(sql_err(
+                "23502",
+                format!("column {col_name} must have a default or allow NULLs"),
+            ));
+        };
         {
             let table = self.tables.get_mut(&table_id).ok_or_else(|| {
                 sql_err("XX000", format!("missing storage for table id {table_id}"))
@@ -310,7 +309,7 @@ impl Db {
             name: col_name,
             data_type,
             nullable,
-            default: default_value,
+            default: default_expr,
         });
         Ok(())
     }
@@ -548,7 +547,13 @@ impl Db {
                 let col = &meta.columns[i];
                 let value = match cell {
                     CellInput::Value(v) => v,
-                    CellInput::Default => col.default.clone().unwrap_or(Value::Null),
+                    CellInput::Default => {
+                        if let Some(expr) = &col.default {
+                            eval_column_default(expr, col, i, meta)?
+                        } else {
+                            Value::Null
+                        }
+                    }
                 };
                 let coerced = coerce_value_for_column(value, col, i, meta)?;
                 out.push(coerced);
@@ -874,6 +879,9 @@ impl Db {
             let Some(row) = versions.last() else {
                 continue;
             };
+            if row.xmax.is_some() {
+                continue;
+            }
             for (col, val) in columns.iter().zip(values.iter()) {
                 if row.data[*col] != *val {
                     continue 'outer;
@@ -925,6 +933,9 @@ impl Db {
                 let Some(row) = versions.last() else {
                     continue;
                 };
+                if row.xmax.is_some() {
+                    continue;
+                }
                 let mut matches = true;
                 for (child_idx, parent_idx) in fk.columns.iter().zip(fk.referenced_columns.iter()) {
                     if row.data[*child_idx] != parent_row[*parent_idx] {
@@ -1012,6 +1023,16 @@ fn select_visible_version<'a>(
     visibility: &VisibilityContext,
 ) -> Option<&'a VersionedRow> {
     select_visible_version_idx(versions, visibility).map(|idx| &versions[idx])
+}
+
+fn eval_column_default(
+    expr: &ScalarExpr,
+    col: &Column,
+    idx: usize,
+    meta: &TableMeta,
+) -> anyhow::Result<Value> {
+    let value = eval_scalar_expr(&[], expr, &[]).map_err(|e| sql_err("XX000", e.to_string()))?;
+    coerce_value_for_column(value, col, idx, meta)
 }
 
 fn coerce_value_for_column(

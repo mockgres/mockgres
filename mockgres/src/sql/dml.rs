@@ -17,10 +17,22 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     if sel.from_clause.is_empty() {
         return plan_literal_select(sel);
     }
+    let mut count_star = false;
+    let mut count_alias = "count".to_string();
+    if sel.target_list.len() == 1 {
+        if let Some(alias) = detect_count_star(sel.target_list.first().unwrap()) {
+            count_star = true;
+            count_alias = alias;
+        }
+    }
     let from_count = sel.from_clause.len();
     let multi_from = from_count > 1;
 
-    let (mut selection, projection_items) = parse_select_list(&mut sel.target_list)?;
+    let (mut selection, projection_items) = if count_star {
+        (Selection::Star, None)
+    } else {
+        parse_select_list(&mut sel.target_list)?
+    };
 
     let where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
@@ -106,7 +118,18 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
 
-    if let Some(exprs) = projection_items {
+    if count_star {
+        let schema = Schema {
+            fields: vec![Field {
+                name: count_alias,
+                data_type: DataType::Int8,
+            }],
+        };
+        plan = Plan::CountRows {
+            input: Box::new(plan),
+            schema,
+        };
+    } else if let Some(exprs) = projection_items {
         let schema = Schema {
             fields: exprs
                 .iter()
@@ -124,6 +147,37 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     Ok(plan)
+}
+
+fn detect_count_star(node: &pg_query::Node) -> Option<String> {
+    let rt = node.node.as_ref().and_then(|n| match n {
+        NodeEnum::ResTarget(rt) => Some(rt),
+        _ => None,
+    })?;
+    let expr_node = rt.val.as_ref()?.node.as_ref()?;
+    let NodeEnum::FuncCall(fc) = expr_node else {
+        return None;
+    };
+    if !fc.agg_star {
+        return None;
+    }
+    let name = fc.funcname.iter().find_map(|n| {
+        n.node.as_ref().and_then(|nn| {
+            if let NodeEnum::String(s) = nn {
+                Some(s.sval.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+    })?;
+    if name != "count" {
+        return None;
+    }
+    if rt.name.is_empty() {
+        Some("count".into())
+    } else {
+        Some(rt.name.clone())
+    }
 }
 
 fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {

@@ -1,5 +1,5 @@
-use crate::engine::{DataType, ObjName, Value, fe};
-use crate::types::{parse_date_str, parse_timestamp_str};
+use super::expr::parse_scalar_expr;
+use crate::engine::{DataType, ObjName, ScalarExpr, Value, fe};
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, ColumnDef, TypeName};
@@ -75,70 +75,9 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
     Ok(dt)
 }
 
-pub(super) fn parse_default_literal(node: &NodeEnum, target: &DataType) -> PgWireResult<Value> {
-    match target {
-        DataType::Text => {
-            let Some(Value::Text(v)) = try_parse_literal(node)? else {
-                return Err(fe("default value must be text"));
-            };
-            Ok(Value::Text(v))
-        }
-        DataType::Int4 | DataType::Int8 => {
-            let Some(Value::Int64(v)) = try_parse_literal(node)? else {
-                return Err(fe("default value must be integer"));
-            };
-            Ok(Value::Int64(v))
-        }
-        DataType::Float8 => {
-            let Some(Value::Float64Bits(v)) = try_parse_literal(node)? else {
-                return Err(fe("default value must be float"));
-            };
-            Ok(Value::Float64Bits(v))
-        }
-        DataType::Bool => {
-            let Some(Value::Bool(v)) = try_parse_literal(node)? else {
-                return Err(fe("default value must be bool"));
-            };
-            Ok(Value::Bool(v))
-        }
-        DataType::Date => {
-            let Some(val) = try_parse_literal(node)? else {
-                return Err(fe("default value must be date"));
-            };
-            match val {
-                Value::Date(v) => Ok(Value::Date(v)),
-                Value::Text(s) => {
-                    let days = parse_date_str(&s).map_err(fe)?;
-                    Ok(Value::Date(days))
-                }
-                _ => Err(fe("default value must be date")),
-            }
-        }
-        DataType::Timestamp => {
-            let Some(val) = try_parse_literal(node)? else {
-                return Err(fe("default value must be timestamp"));
-            };
-            match val {
-                Value::TimestampMicros(v) => Ok(Value::TimestampMicros(v)),
-                Value::Text(s) => {
-                    let micros = parse_timestamp_str(&s).map_err(fe)?;
-                    Ok(Value::TimestampMicros(micros))
-                }
-                _ => Err(fe("default value must be timestamp")),
-            }
-        }
-        DataType::Bytea => {
-            let Some(Value::Bytes(v)) = try_parse_literal(node)? else {
-                return Err(fe("default value must be bytea"));
-            };
-            Ok(Value::Bytes(v))
-        }
-    }
-}
-
 pub(super) fn parse_column_def(
     cd: &ColumnDef,
-) -> PgWireResult<(String, DataType, bool, Option<Value>)> {
+) -> PgWireResult<(String, DataType, bool, Option<ScalarExpr>)> {
     let dt = map_type(cd)?;
     let default_node = cd
         .raw_default
@@ -162,7 +101,11 @@ pub(super) fn parse_column_def(
         .iter()
         .any(|c| matches!(c.node.as_ref(), Some(NodeEnum::Constraint(cons)) if cons.contype == pg_query::protobuf::ConstrType::ConstrNotnull as i32));
     let default = match default_node {
-        Some(node) => Some(parse_default_literal(node, &dt)?),
+        Some(node) => {
+            let expr = parse_scalar_expr(node)?;
+            ensure_default_expr_is_const(&expr)?;
+            Some(expr)
+        }
         None => None,
     };
     let name = cd.colname.clone();
@@ -170,6 +113,29 @@ pub(super) fn parse_column_def(
         return Err(fe("column must have a name"));
     }
     Ok((name, dt, nullable, default))
+}
+
+fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
+    match expr {
+        ScalarExpr::Literal(_) => Ok(()),
+        ScalarExpr::Column(_) | ScalarExpr::ColumnIdx(_) => {
+            Err(fe("DEFAULT expressions cannot reference columns"))
+        }
+        ScalarExpr::Param { .. } => Err(fe("DEFAULT expressions cannot reference parameters")),
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            ensure_default_expr_is_const(left)?;
+            ensure_default_expr_is_const(right)
+        }
+        ScalarExpr::UnaryOp { expr, .. } | ScalarExpr::Cast { expr, .. } => {
+            ensure_default_expr_is_const(expr)
+        }
+        ScalarExpr::Func { args, .. } => {
+            for arg in args {
+                ensure_default_expr_is_const(arg)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 pub(super) fn parse_index_columns(params: &[pg_query::Node]) -> PgWireResult<Vec<String>> {
