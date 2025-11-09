@@ -59,6 +59,17 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 schema,
             })
         }
+        Plan::UnboundJoin { left, right } => {
+            let left_bound = bind(db, *left)?;
+            let right_bound = bind(db, *right)?;
+            let mut fields = left_bound.schema().fields.clone();
+            fields.extend(right_bound.schema().fields.clone());
+            Ok(Plan::Join {
+                left: Box::new(left_bound),
+                right: Box::new(right_bound),
+                schema: Schema { fields },
+            })
+        }
 
         Plan::Projection {
             input,
@@ -287,11 +298,20 @@ fn bind_scalar_expr(
     Ok(match expr {
         ScalarExpr::Literal(v) => ScalarExpr::Literal(v.clone()),
         ScalarExpr::Column(name) => {
-            let idx = schema
+            let mut matches = schema
                 .fields
                 .iter()
-                .position(|f| f.name == *name)
-                .ok_or_else(|| fe_code("42703", format!("unknown column: {name}")))?;
+                .enumerate()
+                .filter(|(_, f)| f.name == *name);
+            let Some((idx, _)) = matches.next() else {
+                return Err(fe_code("42703", format!("unknown column: {name}")));
+            };
+            if matches.next().is_some() {
+                return Err(fe_code(
+                    "42702",
+                    format!("column reference \"{name}\" is ambiguous"),
+                ));
+            }
             ScalarExpr::ColumnIdx(idx)
         }
         ScalarExpr::ColumnIdx(i) => ScalarExpr::ColumnIdx(*i),

@@ -4,8 +4,8 @@ use pgwire::error::PgWireResult;
 
 use crate::db::Db;
 use crate::engine::{
-    ExecNode, Expr, FilterExec, LimitExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema,
-    SeqScanExec, UpdateSet, Value, ValuesExec, fe, fe_code,
+    ExecNode, Expr, FilterExec, LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec,
+    ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec, fe, fe_code,
 };
 
 use super::errors::map_db_err;
@@ -18,7 +18,9 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Projection { .. }
         | Plan::Filter { .. }
         | Plan::Order { .. }
-        | Plan::Limit { .. } => "SELECT 0",
+        | Plan::Limit { .. }
+        | Plan::UnboundJoin { .. }
+        | Plan::Join { .. } => "SELECT 0",
 
         Plan::CreateTable { .. } => "CREATE TABLE",
         Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
@@ -149,6 +151,27 @@ pub fn build_executor(
             let schema = child.schema().clone();
             Ok((
                 Box::new(LimitExec::new(schema, child, limit_val, offset_val)),
+                None,
+                out_cnt,
+            ))
+        }
+        Plan::Join {
+            left,
+            right,
+            schema,
+        } => {
+            let (left_exec, _ltag, left_cnt) = build_executor(db, left, params.clone())?;
+            let (right_exec, _rtag, right_cnt) = build_executor(db, right, params.clone())?;
+            let out_cnt = match (left_cnt, right_cnt) {
+                (Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
+                _ => None,
+            };
+            Ok((
+                Box::new(NestedLoopJoinExec::new(
+                    schema.clone(),
+                    left_exec,
+                    right_exec,
+                )?),
                 None,
                 out_cnt,
             ))
@@ -432,6 +455,8 @@ pub fn build_executor(
                 None,
             ))
         }
-        Plan::UnboundSeqScan { .. } => Err(fe("unbound plan; call binder first")),
+        Plan::UnboundSeqScan { .. } | Plan::UnboundJoin { .. } => {
+            Err(fe("unbound plan; call binder first"))
+        }
     }
 }

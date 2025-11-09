@@ -125,6 +125,15 @@ pub enum Plan {
         limit: Option<usize>,
         offset: usize,
     },
+    UnboundJoin {
+        left: Box<Plan>,
+        right: Box<Plan>,
+    },
+    Join {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        schema: Schema,
+    },
     SeqScan {
         table: ObjName,
         cols: Vec<(usize, Field)>,
@@ -221,12 +230,14 @@ impl Plan {
         match self {
             Plan::Values { schema, .. }
             | Plan::SeqScan { schema, .. }
-            | Plan::Projection { schema, .. } => schema,
+            | Plan::Projection { schema, .. }
+            | Plan::Join { schema, .. } => schema,
             Plan::ShowVariable { schema, .. } => schema,
             Plan::Filter { input, .. } | Plan::Order { input, .. } | Plan::Limit { input, .. } => {
                 input.schema()
             }
             Plan::UnboundSeqScan { .. }
+            | Plan::UnboundJoin { .. }
             | Plan::CreateTable { .. }
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }

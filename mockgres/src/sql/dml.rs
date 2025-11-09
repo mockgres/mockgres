@@ -17,12 +17,10 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     if sel.from_clause.is_empty() {
         return plan_literal_select(sel);
     }
-    if sel.from_clause.len() != 1 {
-        return Err(fe("single table only"));
-    }
-    let table = parse_range_var(sel.from_clause.remove(0))?;
+    let from_count = sel.from_clause.len();
+    let multi_from = from_count > 1;
 
-    let (selection, projection_items) = parse_select_list(&mut sel.target_list)?;
+    let (mut selection, projection_items) = parse_select_list(&mut sel.target_list)?;
 
     let where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
@@ -31,11 +29,12 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     };
 
     let mut project_prefix_len: Option<usize> = None;
-    let mut selection = selection;
-    if let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
-        let mut needed = Vec::new();
-        collect_columns_from_bool_expr(expr, &mut needed);
-        ensure_columns_present(cols, needed, &mut project_prefix_len);
+    if !multi_from {
+        if let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
+            let mut needed = Vec::new();
+            collect_columns_from_bool_expr(expr, &mut needed);
+            ensure_columns_present(cols, needed, &mut project_prefix_len);
+        }
     }
 
     let mut order_keys: Option<Vec<SortKey>> = None;
@@ -44,15 +43,37 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         if let Some(items) = &projection_items {
             rewrite_order_keys_for_projection(&mut keys, items);
         }
-        if let Selection::Columns(cols) = &mut selection {
-            let mut needed = Vec::new();
-            collect_columns_from_order_keys(&keys, &mut needed);
-            ensure_columns_present(cols, needed, &mut project_prefix_len);
+        if !multi_from {
+            if let Selection::Columns(cols) = &mut selection {
+                let mut needed = Vec::new();
+                collect_columns_from_order_keys(&keys, &mut needed);
+                ensure_columns_present(cols, needed, &mut project_prefix_len);
+            }
         }
         order_keys = Some(keys);
     }
 
-    let mut plan = Plan::UnboundSeqScan { table, selection };
+    let mut from_clause = sel.from_clause;
+    let first_table = parse_range_var(from_clause.remove(0))?;
+    let mut plan = Plan::UnboundSeqScan {
+        table: first_table,
+        selection: if multi_from {
+            Selection::Star
+        } else {
+            selection
+        },
+    };
+    for rv in from_clause {
+        let table = parse_range_var(rv)?;
+        let right = Plan::UnboundSeqScan {
+            table,
+            selection: Selection::Star,
+        };
+        plan = Plan::UnboundJoin {
+            left: Box::new(plan),
+            right: Box::new(right),
+        };
+    }
 
     if let Some(pred) = where_expr {
         plan = Plan::Filter {

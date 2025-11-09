@@ -68,6 +68,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_scalar(expr, out);
             }
         }
+        Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
+            collect_param_hints_from_plan(left, out);
+            collect_param_hints_from_plan(right, out);
+        }
         Plan::Update { sets, filter, .. } => {
             collect_param_hints_from_update_sets(sets, out);
             if let Some(expr) = filter {
@@ -166,6 +170,10 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             for (expr, _) in exprs {
                 collect_param_indexes_from_scalar(expr, out);
             }
+        }
+        Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
+            collect_param_indexes(left, out);
+            collect_param_indexes(right, out);
         }
         Plan::Update { sets, filter, .. } => {
             collect_param_indexes_from_update_sets(sets, out);

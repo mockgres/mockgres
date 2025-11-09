@@ -134,6 +134,71 @@ impl ExecNode for SeqScanExec {
     }
 }
 
+pub struct NestedLoopJoinExec {
+    schema: Schema,
+    rows: Vec<Row>,
+    pos: usize,
+}
+
+impl NestedLoopJoinExec {
+    pub fn new(
+        schema: Schema,
+        mut left: Box<dyn ExecNode>,
+        mut right: Box<dyn ExecNode>,
+    ) -> PgWireResult<Self> {
+        left.open()?;
+        let mut left_rows = Vec::new();
+        while let Some(row) = left.next()? {
+            left_rows.push(row);
+        }
+        left.close()?;
+
+        right.open()?;
+        let mut right_rows = Vec::new();
+        while let Some(row) = right.next()? {
+            right_rows.push(row);
+        }
+        right.close()?;
+
+        let mut rows = Vec::with_capacity(left_rows.len() * right_rows.len());
+        if !left_rows.is_empty() && !right_rows.is_empty() {
+            for l in &left_rows {
+                for r in &right_rows {
+                    let mut combined = l.clone();
+                    combined.extend(r.clone());
+                    rows.push(combined);
+                }
+            }
+        }
+
+        Ok(Self {
+            schema,
+            rows,
+            pos: 0,
+        })
+    }
+}
+
+impl ExecNode for NestedLoopJoinExec {
+    fn open(&mut self) -> PgWireResult<()> {
+        Ok(())
+    }
+    fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+    fn close(&mut self) -> PgWireResult<()> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
 pub struct FilterExec {
     schema: Schema,
     child: Box<dyn ExecNode>,
