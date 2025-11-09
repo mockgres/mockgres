@@ -9,7 +9,7 @@ async fn insert_with_column_list_and_defaults() {
             "create table gadgets(
                 id int primary key,
                 name text default 'n/a',
-                qty int not null default 0
+                qty int not null
             )",
             &[],
         )

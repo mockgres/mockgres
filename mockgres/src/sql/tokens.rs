@@ -1,4 +1,5 @@
 use crate::engine::{DataType, ObjName, Value, fe};
+use crate::types::{parse_date_str, parse_timestamp_str};
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, ColumnDef, TypeName};
@@ -101,16 +102,30 @@ pub(super) fn parse_default_literal(node: &NodeEnum, target: &DataType) -> PgWir
             Ok(Value::Bool(v))
         }
         DataType::Date => {
-            let Some(Value::Date(v)) = try_parse_literal(node)? else {
+            let Some(val) = try_parse_literal(node)? else {
                 return Err(fe("default value must be date"));
             };
-            Ok(Value::Date(v))
+            match val {
+                Value::Date(v) => Ok(Value::Date(v)),
+                Value::Text(s) => {
+                    let days = parse_date_str(&s).map_err(fe)?;
+                    Ok(Value::Date(days))
+                }
+                _ => Err(fe("default value must be date")),
+            }
         }
         DataType::Timestamp => {
-            let Some(Value::TimestampMicros(v)) = try_parse_literal(node)? else {
+            let Some(val) = try_parse_literal(node)? else {
                 return Err(fe("default value must be timestamp"));
             };
-            Ok(Value::TimestampMicros(v))
+            match val {
+                Value::TimestampMicros(v) => Ok(Value::TimestampMicros(v)),
+                Value::Text(s) => {
+                    let micros = parse_timestamp_str(&s).map_err(fe)?;
+                    Ok(Value::TimestampMicros(micros))
+                }
+                _ => Err(fe("default value must be timestamp")),
+            }
         }
         DataType::Bytea => {
             let Some(Value::Bytes(v)) = try_parse_literal(node)? else {

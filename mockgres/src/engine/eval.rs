@@ -1,4 +1,7 @@
-use crate::types::{format_bytea, format_date, format_timestamp};
+use crate::types::{
+    date_days_to_postgres, format_bytea, format_date, format_timestamp,
+    timestamp_to_postgres_micros,
+};
 use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
@@ -390,29 +393,31 @@ pub fn to_pgwire_stream(
                             (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
                             (Value::Date(days), DataType::Date) => {
                                 if fmt == FieldFormat::Binary {
-                                    return Some((
-                                        Err(fe("binary date format not supported yet")),
-                                        (node, fields, schema),
-                                    ));
+                                    let pg_days = date_days_to_postgres(days);
+                                    enc.encode_field(&pg_days)
+                                } else {
+                                    let text = match format_date(days) {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            return Some((Err(fe(e)), (node, fields, schema)));
+                                        }
+                                    };
+                                    enc.encode_field(&text)
                                 }
-                                let text = match format_date(days) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some((Err(fe(e)), (node, fields, schema))),
-                                };
-                                enc.encode_field(&text)
                             }
                             (Value::TimestampMicros(micros), DataType::Timestamp) => {
                                 if fmt == FieldFormat::Binary {
-                                    return Some((
-                                        Err(fe("binary timestamp format not supported yet")),
-                                        (node, fields, schema),
-                                    ));
+                                    let pg_micros = timestamp_to_postgres_micros(micros);
+                                    enc.encode_field(&pg_micros)
+                                } else {
+                                    let text = match format_timestamp(micros) {
+                                        Ok(t) => t,
+                                        Err(e) => {
+                                            return Some((Err(fe(e)), (node, fields, schema)));
+                                        }
+                                    };
+                                    enc.encode_field(&text)
                                 }
-                                let text = match format_timestamp(micros) {
-                                    Ok(t) => t,
-                                    Err(e) => return Some((Err(fe(e)), (node, fields, schema))),
-                                };
-                                enc.encode_field(&text)
                             }
                             (Value::Bytes(bytes), DataType::Bytea) => {
                                 if fmt == FieldFormat::Binary {

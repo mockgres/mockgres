@@ -474,19 +474,34 @@ fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
 
 fn rewrite_order_keys_for_projection(keys: &mut [SortKey], exprs: &[(ScalarExpr, String)]) {
     for key in keys {
-        if let SortKey::ByIndex {
-            idx,
-            asc,
-            nulls_first,
-        } = *key
-        {
-            if let Some((expr, _)) = exprs.get(idx) {
-                *key = SortKey::Expr {
-                    expr: expr.clone(),
-                    asc,
-                    nulls_first,
-                };
+        match key {
+            SortKey::ByIndex {
+                idx,
+                asc,
+                nulls_first,
+            } => {
+                if let Some((expr, _)) = exprs.get(*idx) {
+                    *key = SortKey::Expr {
+                        expr: expr.clone(),
+                        asc: *asc,
+                        nulls_first: *nulls_first,
+                    };
+                }
             }
+            SortKey::ByName {
+                col,
+                asc,
+                nulls_first,
+            } => {
+                if let Some((expr, _)) = exprs.iter().find(|(_, name)| name == col) {
+                    *key = SortKey::Expr {
+                        expr: expr.clone(),
+                        asc: *asc,
+                        nulls_first: *nulls_first,
+                    };
+                }
+            }
+            SortKey::Expr { .. } => {}
         }
     }
 }

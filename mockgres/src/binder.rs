@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Field, Plan, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection,
-    SortKey, SqlError, UpdateSet, Value, fe, fe_code,
+    BoolExpr, DataType, Field, InsertSource, Plan, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
+    Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
 use anyhow::Error;
 use pgwire::error::PgWireError;
@@ -38,6 +40,9 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                             .iter()
                             .position(|c| c.name == n)
                             .ok_or_else(|| fe_code("42703", format!("unknown column: {n}")))?;
+                        if out.iter().any(|(existing_idx, _)| *existing_idx == i) {
+                            continue;
+                        }
                         out.push((
                             i,
                             Field {
@@ -109,6 +114,9 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 project_prefix_len: None,
             };
             if let Some(n) = project_prefix_len {
+                if n == 0 {
+                    return Ok(plan);
+                }
                 let schema = plan.schema().clone();
                 let fields = schema.fields[..n].to_vec();
                 let proj_exprs = (0..n)
@@ -145,7 +153,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             for set in sets {
                 match set {
                     UpdateSet::ByIndex(idx, expr) => {
-                        let bound_expr = bind_scalar_expr(&expr, &schema, None)?;
+                        let hint = schema.field(idx).data_type.clone();
+                        let bound_expr = bind_scalar_expr(&expr, &schema, Some(&hint))?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
                     UpdateSet::ByName(name, expr) => {
@@ -156,7 +165,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                                 .ok_or_else(|| {
                                     fe_code("42703", format!("unknown column in UPDATE: {name}"))
                                 })?;
-                        let bound_expr = bind_scalar_expr(&expr, &schema, None)?;
+                        let hint = schema.field(idx).data_type.clone();
+                        let bound_expr = bind_scalar_expr(&expr, &schema, Some(&hint))?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
                 }
@@ -247,6 +257,89 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 input: Box::new(child),
                 limit,
                 offset,
+            })
+        }
+        Plan::InsertValues {
+            table,
+            columns,
+            rows,
+        } => {
+            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let tm = db
+                .resolve_table(schema_name, &table.name)
+                .map_err(map_catalog_err)?;
+            let table_schema = Schema {
+                fields: tm
+                    .columns
+                    .iter()
+                    .map(|c| Field {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                    })
+                    .collect(),
+            };
+            let column_positions = if let Some(cols) = &columns {
+                let mut seen = HashSet::new();
+                let mut positions = Vec::with_capacity(cols.len());
+                for col in cols {
+                    let idx = tm
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *col)
+                        .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
+                    if !seen.insert(idx) {
+                        return Err(fe_code("42701", format!("column {col} specified twice")));
+                    }
+                    positions.push(idx);
+                }
+                positions
+            } else {
+                (0..table_schema.len()).collect()
+            };
+            let expected_len = column_positions.len();
+            let mut bound_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                if row.len() != expected_len {
+                    let msg = if columns.is_some() {
+                        format!(
+                            "INSERT has {} target columns but {} expressions",
+                            expected_len,
+                            row.len()
+                        )
+                    } else {
+                        format!(
+                            "INSERT expects {} expressions, got {}",
+                            expected_len,
+                            row.len()
+                        )
+                    };
+                    return Err(fe_code("21P01", msg));
+                }
+                let mut bound_row = Vec::with_capacity(row.len());
+                for (expr_idx, src) in row.into_iter().enumerate() {
+                    let target_idx = column_positions[expr_idx];
+                    match src {
+                        InsertSource::Default => bound_row.push(InsertSource::Default),
+                        InsertSource::Expr(expr) => {
+                            let field = table_schema.field(target_idx);
+                            let hint = match field.data_type {
+                                DataType::Int4
+                                | DataType::Int8
+                                | DataType::Float8
+                                | DataType::Bool => Some(&field.data_type),
+                                _ => None,
+                            };
+                            let bound = bind_scalar_expr(&expr, &table_schema, hint)?;
+                            bound_row.push(InsertSource::Expr(bound));
+                        }
+                    }
+                }
+                bound_rows.push(bound_row);
+            }
+            Ok(Plan::InsertValues {
+                table,
+                columns,
+                rows: bound_rows,
             })
         }
 
@@ -347,7 +440,13 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
         ScalarExpr::ColumnIdx(i) => Some(schema.field(*i).data_type.clone()),
         ScalarExpr::Param { ty, .. } => ty.clone(),
         ScalarExpr::Literal(v) => match v {
-            Value::Int64(_) => Some(DataType::Int8),
+            Value::Int64(i) => {
+                if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                    Some(DataType::Int4)
+                } else {
+                    Some(DataType::Int8)
+                }
+            }
             Value::Float64Bits(_) => Some(DataType::Float8),
             Value::Text(_) => Some(DataType::Text),
             Value::Bool(_) => Some(DataType::Bool),
@@ -368,9 +467,12 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
                     (Some(DataType::Float8), _) | (_, Some(DataType::Float8)) => {
                         Some(DataType::Float8)
                     }
-                    (Some(DataType::Int4), _) => Some(DataType::Int8),
-                    (_, Some(DataType::Int4)) => Some(DataType::Int8),
-                    (Some(DataType::Int8), Some(DataType::Int8)) => Some(DataType::Int8),
+                    (Some(DataType::Int8), _) | (_, Some(DataType::Int8)) => Some(DataType::Int8),
+                    (Some(DataType::Int4), Some(DataType::Int4)) => Some(DataType::Int4),
+                    (Some(DataType::Int4), None) | (None, Some(DataType::Int4)) => {
+                        Some(DataType::Int4)
+                    }
+                    (Some(dt), None) | (None, Some(dt)) => Some(dt),
                     _ => Some(DataType::Float8),
                 }
             }
@@ -379,7 +481,7 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
         ScalarExpr::Cast { ty, .. } => Some(ty.clone()),
         ScalarExpr::Func { func, args } => match func {
             ScalarFunc::Upper | ScalarFunc::Lower => Some(DataType::Text),
-            ScalarFunc::Length => Some(DataType::Int8),
+            ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::Coalesce => args
                 .iter()
                 .filter_map(|a| scalar_expr_type(a, schema))

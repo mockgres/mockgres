@@ -2,7 +2,9 @@ use crate::engine::{
     BoolExpr, CmpOp, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value, fe,
 };
 use pg_query::NodeEnum;
-use pg_query::protobuf::{AExpr, BoolExprType, ColumnRef, FuncCall, Node, NullTestType, ParamRef};
+use pg_query::protobuf::{
+    AExpr, BoolExprType, CoalesceExpr, ColumnRef, FuncCall, Node, NullTestType, ParamRef,
+};
 use pgwire::error::PgWireResult;
 
 use super::tokens::{const_to_value, parse_type_name, try_parse_literal};
@@ -86,6 +88,7 @@ pub fn parse_scalar_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
         NodeEnum::ParamRef(pr) => parse_param_ref(pr),
         NodeEnum::AExpr(ax) => parse_arithmetic_expr(ax),
         NodeEnum::FuncCall(fc) => parse_function_call(fc),
+        NodeEnum::CoalesceExpr(ce) => parse_coalesce_expr(ce),
         NodeEnum::TypeCast(tc) => {
             let inner = tc
                 .arg
@@ -111,6 +114,24 @@ pub fn parse_scalar_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
             }
         }
     }
+}
+
+fn parse_coalesce_expr(ce: &CoalesceExpr) -> PgWireResult<ScalarExpr> {
+    let mut args = Vec::new();
+    for arg in &ce.args {
+        let node = arg
+            .node
+            .as_ref()
+            .ok_or_else(|| fe("bad coalesce argument"))?;
+        args.push(parse_scalar_expr(node)?);
+    }
+    if args.is_empty() {
+        return Err(fe("coalesce requires at least one argument"));
+    }
+    Ok(ScalarExpr::Func {
+        func: ScalarFunc::Coalesce,
+        args,
+    })
 }
 
 fn parse_param_ref(pr: &ParamRef) -> PgWireResult<ScalarExpr> {

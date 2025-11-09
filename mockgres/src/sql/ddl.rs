@@ -1,7 +1,7 @@
-use crate::engine::{DataType, Field, ObjName, Plan, Schema, fe, fe_code};
+use crate::engine::{DataType, Field, ForeignKeySpec, ObjName, Plan, Schema, fe, fe_code};
 use pg_query::protobuf::{
-    AlterTableStmt, AlterTableType, CreateStmt, DropStmt, IndexStmt, ObjectType, TransactionStmt,
-    VariableSetKind, VariableSetStmt, VariableShowStmt,
+    AlterTableStmt, AlterTableType, Constraint, CreateStmt, DropStmt, IndexStmt, ObjectType,
+    RangeVar, TransactionStmt, VariableSetKind, VariableSetStmt, VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -52,11 +52,14 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
 
     let mut cols = Vec::new();
     let mut pk: Option<Vec<String>> = None;
+    let mut foreign_keys = Vec::new();
 
     for elt in stmt.table_elts {
         match elt.node.unwrap() {
             pg_query::NodeEnum::ColumnDef(cd) => {
                 let (cname, dt, nullable, default) = parse_column_def(&cd)?;
+                let column_fks = collect_column_foreign_keys(&cd, &cname)?;
+                foreign_keys.extend(column_fks);
                 let col_name_clone = cname.clone();
                 cols.push((cname, dt, nullable, default));
                 if cd.constraints.iter().any(|c| {
@@ -79,13 +82,22 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
                         names.push(s.sval);
                     }
                     pk = Some(names);
+                } else if cons.contype == pg_query::protobuf::ConstrType::ConstrForeign as i32 {
+                    if let Some(fk) = parse_foreign_key_constraint(&cons, None)? {
+                        foreign_keys.push(fk);
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    Ok(Plan::CreateTable { table, cols, pk })
+    Ok(Plan::CreateTable {
+        table,
+        cols,
+        pk,
+        foreign_keys,
+    })
 }
 
 pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
@@ -217,4 +229,77 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
         name: name_lower,
         value,
     })
+}
+
+fn collect_column_foreign_keys(
+    cd: &pg_query::protobuf::ColumnDef,
+    column_name: &str,
+) -> PgWireResult<Vec<ForeignKeySpec>> {
+    let mut out = Vec::new();
+    for cons in &cd.constraints {
+        let Some(pg_query::NodeEnum::Constraint(c)) = cons.node.as_ref() else {
+            continue;
+        };
+        if let Some(fk) = parse_foreign_key_constraint(c, Some(column_name))? {
+            out.push(fk);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_foreign_key_constraint(
+    cons: &Constraint,
+    default_column: Option<&str>,
+) -> PgWireResult<Option<ForeignKeySpec>> {
+    if cons.contype != pg_query::protobuf::ConstrType::ConstrForeign as i32 {
+        return Ok(None);
+    }
+    let columns = if !cons.fk_attrs.is_empty() {
+        parse_identifier_list(&cons.fk_attrs)?
+    } else if let Some(col) = default_column {
+        vec![col.to_string()]
+    } else {
+        return Err(fe("FOREIGN KEY requires column list"));
+    };
+    let pktable = cons
+        .pktable
+        .as_ref()
+        .ok_or_else(|| fe("FOREIGN KEY requires referenced table"))?;
+    let referenced_table = range_var_to_obj_name(pktable);
+    let referenced_columns = if cons.pk_attrs.is_empty() {
+        None
+    } else {
+        Some(parse_identifier_list(&cons.pk_attrs)?)
+    };
+    Ok(Some(ForeignKeySpec {
+        columns,
+        referenced_table,
+        referenced_columns,
+    }))
+}
+
+fn parse_identifier_list(nodes: &[pg_query::Node]) -> PgWireResult<Vec<String>> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(n) = node.node.as_ref() else {
+            return Err(fe("bad identifier"));
+        };
+        if let pg_query::NodeEnum::String(s) = n {
+            out.push(s.sval.clone());
+        } else {
+            return Err(fe("identifier must be string"));
+        }
+    }
+    Ok(out)
+}
+
+fn range_var_to_obj_name(rv: &RangeVar) -> ObjName {
+    ObjName {
+        schema: if rv.schemaname.is_empty() {
+            None
+        } else {
+            Some(rv.schemaname.clone())
+        },
+        name: rv.relname.clone(),
+    }
 }

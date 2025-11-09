@@ -1,7 +1,7 @@
-use crate::catalog::{Catalog, TableId, TableMeta};
+use crate::catalog::{Catalog, ForeignKeyMeta, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, ScalarExpr, SqlError, Value, cast_value_to_type, eval_bool_expr,
-    eval_scalar_expr,
+    BoolExpr, Column, DataType, ForeignKeySpec, ScalarExpr, SqlError, Value, cast_value_to_type,
+    eval_bool_expr, eval_scalar_expr,
 };
 use crate::storage::{Row, RowKey, Table};
 use std::collections::HashMap;
@@ -89,6 +89,7 @@ impl Db {
         name: &str,
         cols: Vec<(String, DataType, bool, Option<Value>)>,
         pk_names: Option<Vec<String>>,
+        foreign_keys: Vec<ForeignKeySpec>,
     ) -> anyhow::Result<TableId> {
         self.catalog.ensure_schema(schema);
         if self.catalog.get_table(schema, name).is_some() {
@@ -138,12 +139,15 @@ impl Db {
             }
         };
 
+        let fk_metas = self.build_foreign_keys(schema, name, &columns, foreign_keys)?;
+
         let tm = TableMeta {
             id,
             name: name.to_string(),
             columns: columns.clone(),
             pk,
             indexes: vec![],
+            foreign_keys: fk_metas,
         };
 
         self.catalog
@@ -155,6 +159,136 @@ impl Db {
 
         self.tables.insert(id, Table::default());
         Ok(id)
+    }
+
+    fn build_foreign_keys(
+        &self,
+        table_schema: &str,
+        table_name: &str,
+        columns: &[Column],
+        specs: Vec<ForeignKeySpec>,
+    ) -> anyhow::Result<Vec<ForeignKeyMeta>> {
+        let mut metas = Vec::with_capacity(specs.len());
+        for spec in specs {
+            if spec.columns.is_empty() {
+                return Err(sql_err(
+                    "42830",
+                    format!("foreign key on {table_schema}.{table_name} requires columns"),
+                ));
+            }
+            let mut local_indexes = Vec::with_capacity(spec.columns.len());
+            for col in &spec.columns {
+                let idx = columns
+                    .iter()
+                    .position(|c| &c.name == col)
+                    .ok_or_else(|| {
+                        sql_err(
+                            "42703",
+                            format!(
+                                "foreign key references unknown column {col} on {table_schema}.{table_name}"
+                            ),
+                        )
+                    })?;
+                local_indexes.push(idx);
+            }
+
+            let referenced_schema = spec
+                .referenced_table
+                .schema
+                .clone()
+                .unwrap_or_else(|| "public".to_string());
+            let referenced_table = spec.referenced_table.name.clone();
+            let ref_meta = self
+                .catalog
+                .get_table(&referenced_schema, &referenced_table)
+                .ok_or_else(|| {
+                    sql_err(
+                        "42830",
+                        format!(
+                            "referenced table {}.{} for foreign key on {}.{} does not exist",
+                            referenced_schema, referenced_table, table_schema, table_name
+                        ),
+                    )
+                })?;
+
+            let referenced_indexes: Vec<usize> = if let Some(ref_cols) = spec.referenced_columns {
+                if ref_cols.len() != local_indexes.len() {
+                    return Err(sql_err(
+                        "42830",
+                        format!(
+                            "foreign key on {}.{} has {} columns but referenced list has {}",
+                            table_schema,
+                            table_name,
+                            local_indexes.len(),
+                            ref_cols.len()
+                        ),
+                    ));
+                }
+                let mut idxs = Vec::with_capacity(ref_cols.len());
+                for rc in ref_cols {
+                    let idx = ref_meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name == rc)
+                        .ok_or_else(|| {
+                            sql_err(
+                                "42703",
+                                format!(
+                                    "referenced column {}.{} does not exist on {}.{}",
+                                    rc, referenced_table, referenced_schema, referenced_table
+                                ),
+                            )
+                        })?;
+                    idxs.push(idx);
+                }
+                idxs
+            } else {
+                let Some(pk) = ref_meta.pk.as_ref() else {
+                    return Err(sql_err(
+                        "42830",
+                        format!(
+                            "referenced table {}.{} must have a primary key or explicit column list",
+                            referenced_schema, referenced_table
+                        ),
+                    ));
+                };
+                if pk.len() != local_indexes.len() {
+                    return Err(sql_err(
+                        "42830",
+                        format!(
+                            "foreign key on {}.{} does not match referenced primary key column count",
+                            table_schema, table_name
+                        ),
+                    ));
+                }
+                pk.clone()
+            };
+
+            for (local_idx, ref_idx) in local_indexes.iter().zip(referenced_indexes.iter()) {
+                let local_type = &columns[*local_idx].data_type;
+                let ref_type = &ref_meta.columns[*ref_idx].data_type;
+                if local_type != ref_type {
+                    return Err(sql_err(
+                        "42804",
+                        format!(
+                            "foreign key column {} type {:?} does not match referenced column {} type {:?}",
+                            columns[*local_idx].name,
+                            local_type,
+                            ref_meta.columns[*ref_idx].name,
+                            ref_type
+                        ),
+                    ));
+                }
+            }
+
+            metas.push(ForeignKeyMeta {
+                columns: local_indexes,
+                referenced_schema,
+                referenced_table,
+                referenced_columns: referenced_indexes,
+            });
+        }
+        Ok(metas)
     }
 
     pub fn alter_table_add_column(
@@ -263,6 +397,32 @@ impl Db {
             }
             (meta.id, idx)
         };
+        {
+            let meta = self
+                .catalog
+                .get_table(schema, name)
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
+            if meta
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.columns.contains(&drop_idx))
+            {
+                return Err(sql_err(
+                    "2BP01",
+                    format!("cannot drop column {column} referenced by a foreign key"),
+                ));
+            }
+        }
+        let inbound = self.collect_inbound_foreign_keys(schema, name);
+        if inbound
+            .iter()
+            .any(|fk| fk.referenced_columns.contains(&drop_idx))
+        {
+            return Err(sql_err(
+                "2BP01",
+                format!("cannot drop column {column} referenced by another table"),
+            ));
+        }
         if let Some(table) = self.tables.get_mut(&table_id) {
             for row in table.rows_by_key.values_mut() {
                 if row.len() != drop_idx + 1 {
@@ -401,9 +561,13 @@ impl Db {
         name: &str,
         mut rows: Vec<Vec<CellInput>>,
     ) -> anyhow::Result<usize> {
-        let (meta, tab) = self.resolve_table_mut(schema, name)?;
+        let meta = self
+            .catalog
+            .get_table(schema, name)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
+        let table_id = meta.id;
         let ncols = meta.columns.len();
-        let mut count = 0usize;
+        let mut realized: Vec<(usize, Row)> = Vec::with_capacity(rows.len());
 
         for (ridx, r) in rows.drain(..).enumerate() {
             // arity: number of values must match table columns
@@ -430,12 +594,23 @@ impl Db {
                 let coerced = coerce_value_for_column(value, col, i, meta)?;
                 out.push(coerced);
             }
+            self.ensure_outbound_foreign_keys(schema, name, meta, &out)?;
+            realized.push((ridx, out));
+        }
 
+        let tab = self
+            .tables
+            .get_mut(&table_id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
+        let mut count = 0usize;
+
+        for (_ridx, out) in realized.into_iter() {
+            let row = out;
             // build the row key (pk or hidden rowid)
             let key = if let Some(pkpos) = &meta.pk {
                 let mut vals = Vec::with_capacity(pkpos.len());
                 for i in pkpos {
-                    vals.push(out[*i].clone());
+                    vals.push(row[*i].clone());
                 }
                 RowKey::Pk(vals)
             } else {
@@ -453,7 +628,7 @@ impl Db {
             }
 
             // finally insert
-            tab.insert(key, out);
+            tab.insert(key, row);
             count += 1;
         }
 
@@ -532,12 +707,29 @@ impl Db {
     }
 
     pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
+        let table_exists = self.catalog.get_table(schema, name).is_some();
+        if !table_exists {
+            return if if_exists {
+                Ok(())
+            } else {
+                Err(sql_err("42P01", format!("no such table {schema}.{name}")))
+            };
+        }
+
+        let inbound = self.collect_inbound_foreign_keys(schema, name);
+        if let Some(fk) = inbound.first() {
+            return Err(sql_err(
+                "2BP01",
+                format!(
+                    "cannot drop table {}.{} because it is referenced by {}.{}",
+                    schema, name, fk.schema, fk.table
+                ),
+            ));
+        }
+
         let schema_entry = match self.catalog.schemas.get_mut(schema) {
             Some(entry) => entry,
             None => {
-                if if_exists {
-                    return Ok(());
-                }
                 return Err(sql_err("3F000", format!("no such schema {schema}")));
             }
         };
@@ -551,13 +743,7 @@ impl Db {
                 }
                 Ok(())
             }
-            None => {
-                if if_exists {
-                    Ok(())
-                } else {
-                    Err(sql_err("42P01", format!("no such table {schema}.{name}")))
-                }
-            }
+            None => Ok(()),
         }
     }
 
@@ -568,26 +754,187 @@ impl Db {
         filter: Option<&BoolExpr>,
         params: &[Value],
     ) -> anyhow::Result<usize> {
-        let (_meta, table) = self.resolve_table_mut(schema, name)?;
-        let mut to_remove = Vec::new();
-        if let Some(expr) = filter {
-            for (key, row) in table.rows_by_key.iter() {
-                let passes = eval_bool_expr(row, expr, params)
-                    .map_err(|e| sql_err("XX000", e.to_string()))?
-                    .unwrap_or(false);
-                if passes {
-                    to_remove.push(key.clone());
+        let meta = self.resolve_table(schema, name)?;
+        let table_id = meta.id;
+        let mut to_remove: Vec<(RowKey, Row)> = Vec::new();
+        {
+            let table = self.tables.get(&table_id).ok_or_else(|| {
+                sql_err(
+                    "XX000",
+                    format!("missing storage for table id {}", table_id),
+                )
+            })?;
+            if let Some(expr) = filter {
+                for (key, row) in table.rows_by_key.iter() {
+                    let passes = eval_bool_expr(row, expr, params)
+                        .map_err(|e| sql_err("XX000", e.to_string()))?
+                        .unwrap_or(false);
+                    if passes {
+                        to_remove.push((key.clone(), row.clone()));
+                    }
                 }
+            } else {
+                to_remove.extend(
+                    table
+                        .rows_by_key
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                );
             }
-        } else {
-            to_remove.extend(table.rows_by_key.keys().cloned());
+        }
+        let inbound = self.collect_inbound_foreign_keys(schema, name);
+        if !inbound.is_empty() {
+            for (_, row) in &to_remove {
+                self.ensure_no_inbound_refs(schema, name, &inbound, row)?;
+            }
         }
         let count = to_remove.len();
-        for key in to_remove {
+        let table = self.tables.get_mut(&table_id).ok_or_else(|| {
+            sql_err(
+                "XX000",
+                format!("missing storage for table id {}", table_id),
+            )
+        })?;
+        for (key, _) in to_remove {
             table.rows_by_key.remove(&key);
         }
         Ok(count)
     }
+
+    fn ensure_outbound_foreign_keys(
+        &self,
+        table_schema: &str,
+        table_name: &str,
+        meta: &TableMeta,
+        row: &[Value],
+    ) -> anyhow::Result<()> {
+        for fk in &meta.foreign_keys {
+            let mut values = Vec::with_capacity(fk.columns.len());
+            let mut has_null = false;
+            for idx in &fk.columns {
+                let val = row.get(*idx).cloned().unwrap_or(Value::Null);
+                if matches!(val, Value::Null) {
+                    has_null = true;
+                    break;
+                }
+                values.push(val);
+            }
+            if has_null {
+                continue;
+            }
+            if !self.referenced_row_exists(
+                &fk.referenced_schema,
+                &fk.referenced_table,
+                &fk.referenced_columns,
+                &values,
+            )? {
+                return Err(sql_err(
+                    "23503",
+                    format!(
+                        "insert on {}.{} violates foreign key referencing {}.{}",
+                        table_schema, table_name, fk.referenced_schema, fk.referenced_table
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn referenced_row_exists(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[usize],
+        values: &[Value],
+    ) -> anyhow::Result<bool> {
+        let meta = self.catalog.get_table(schema, table).ok_or_else(|| {
+            sql_err(
+                "42830",
+                format!("referenced table {}.{} missing", schema, table),
+            )
+        })?;
+        let storage = self
+            .tables
+            .get(&meta.id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", meta.id)))?;
+        'outer: for row in storage.rows_by_key.values() {
+            for (col, val) in columns.iter().zip(values.iter()) {
+                if row[*col] != *val {
+                    continue 'outer;
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn collect_inbound_foreign_keys(&self, schema: &str, table: &str) -> Vec<InboundForeignKey> {
+        let mut out = Vec::new();
+        for (schema_name, schema_entry) in &self.catalog.schemas {
+            for (table_name, meta) in &schema_entry.tables {
+                for fk in &meta.foreign_keys {
+                    if fk.referenced_schema == schema && fk.referenced_table == table {
+                        out.push(InboundForeignKey {
+                            schema: schema_name.clone(),
+                            table: table_name.clone(),
+                            table_id: meta.id,
+                            columns: fk.columns.clone(),
+                            referenced_columns: fk.referenced_columns.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn ensure_no_inbound_refs(
+        &self,
+        schema: &str,
+        table: &str,
+        inbound: &[InboundForeignKey],
+        parent_row: &[Value],
+    ) -> anyhow::Result<()> {
+        for fk in inbound {
+            let child = match self.tables.get(&fk.table_id) {
+                Some(t) => t,
+                None => {
+                    return Err(sql_err(
+                        "XX000",
+                        format!("missing storage for table id {}", fk.table_id),
+                    ));
+                }
+            };
+            for row in child.rows_by_key.values() {
+                let mut matches = true;
+                for (child_idx, parent_idx) in fk.columns.iter().zip(fk.referenced_columns.iter()) {
+                    if row[*child_idx] != parent_row[*parent_idx] {
+                        matches = false;
+                        break;
+                    }
+                }
+                if matches {
+                    return Err(sql_err(
+                        "23503",
+                        format!(
+                            "operation on {}.{} violates foreign key from {}.{}",
+                            schema, table, fk.schema, fk.table
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct InboundForeignKey {
+    schema: String,
+    table: String,
+    table_id: TableId,
+    columns: Vec<usize>,
+    referenced_columns: Vec<usize>,
 }
 
 fn coerce_value_for_column(

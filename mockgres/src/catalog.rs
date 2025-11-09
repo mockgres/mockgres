@@ -12,12 +12,21 @@ pub struct IndexMeta {
 }
 
 #[derive(Clone, Debug)]
+pub struct ForeignKeyMeta {
+    pub columns: Vec<usize>,
+    pub referenced_schema: String,
+    pub referenced_table: String,
+    pub referenced_columns: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct TableMeta {
     pub id: TableId,
     pub name: TableName,
     pub columns: Vec<Column>,
     pub pk: Option<Vec<usize>>,
     pub indexes: Vec<IndexMeta>,
+    pub foreign_keys: Vec<ForeignKeyMeta>,
 }
 
 #[derive(Clone, Debug, Default)]

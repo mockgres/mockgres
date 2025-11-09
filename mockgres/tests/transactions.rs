@@ -56,11 +56,12 @@ async fn commit_persists_and_errors_on_misuse() {
 
     let rows = ctx
         .client
-        .query("select count(*) from tx_books", &[])
+        .query("select id from tx_books order by id", &[])
         .await
-        .expect("count rows");
-    let count: i64 = rows[0].get(0);
-    assert_eq!(count, 2);
+        .expect("load rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
 
     // COMMIT without BEGIN should error.
     let err = ctx.client.execute("commit", &[]).await.expect_err("no txn");

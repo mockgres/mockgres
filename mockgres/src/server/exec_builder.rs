@@ -114,6 +114,9 @@ pub fn build_executor(
             ));
 
             if let Some(n) = *project_prefix_len {
+                if n == 0 {
+                    return Ok((node, None, None));
+                }
                 let proj_fields = child_schema.fields[..n].to_vec();
                 let proj_schema = Schema {
                     fields: proj_fields.clone(),
@@ -177,11 +180,22 @@ pub fn build_executor(
             ))
         }
 
-        Plan::CreateTable { table, cols, pk } => {
+        Plan::CreateTable {
+            table,
+            cols,
+            pk,
+            foreign_keys,
+        } => {
             let mut db = db.write();
             let schema_name = table.schema.as_deref().unwrap_or("public");
-            db.create_table(schema_name, &table.name, cols.clone(), pk.clone())
-                .map_err(map_db_err)?;
+            db.create_table(
+                schema_name,
+                &table.name,
+                cols.clone(),
+                pk.clone(),
+                foreign_keys.clone(),
+            )
+            .map_err(map_db_err)?;
             drop(db);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),

@@ -102,6 +102,13 @@ pub struct ObjName {
 }
 
 #[derive(Clone, Debug)]
+pub struct ForeignKeySpec {
+    pub columns: Vec<String>,
+    pub referenced_table: ObjName,
+    pub referenced_columns: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug)]
 pub enum Plan {
     Values {
         rows: Vec<Vec<Expr>>,
@@ -148,6 +155,7 @@ pub enum Plan {
         table: ObjName,
         cols: Vec<(String, DataType, bool, Option<Value>)>,
         pk: Option<Vec<String>>,
+        foreign_keys: Vec<ForeignKeySpec>,
     },
     AlterTableAddColumn {
         table: ObjName,

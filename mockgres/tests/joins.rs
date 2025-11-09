@@ -5,12 +5,15 @@ async fn cross_join_with_where_clause() {
     let ctx = common::start().await;
 
     ctx.client
-        .execute("create table authors(id int primary key, name text)", &[])
+        .execute(
+            "create table authors(author_id int primary key, name text)",
+            &[],
+        )
         .await
         .expect("create authors");
     ctx.client
         .execute(
-            "create table books(id int primary key, author_id int, title text)",
+            "create table books(book_id int primary key, writer_id int, title text)",
             &[],
         )
         .await
@@ -30,7 +33,7 @@ async fn cross_join_with_where_clause() {
     let rows = ctx
         .client
         .query(
-            "select name, title from authors, books where authors.id = books.author_id",
+            "select name, title from authors, books where authors.author_id = books.writer_id",
             &[],
         )
         .await
