@@ -1,4 +1,5 @@
 use crate::engine::Value;
+use crate::txn::TxId;
 use std::collections::HashMap;
 
 #[derive(Hash, Eq, PartialEq, Clone, Debug)]
@@ -10,8 +11,15 @@ pub enum RowKey {
 pub type Row = Vec<Value>;
 
 #[derive(Clone, Debug)]
+pub struct VersionedRow {
+    pub xmin: TxId,
+    pub xmax: Option<TxId>,
+    pub data: Row,
+}
+
+#[derive(Clone, Debug)]
 pub struct Table {
-    pub rows_by_key: HashMap<RowKey, Row>,
+    pub rows_by_key: HashMap<RowKey, Vec<VersionedRow>>,
     pub next_rowid: u64,
 }
 
@@ -25,10 +33,10 @@ impl Default for Table {
 }
 
 impl Table {
-    pub fn insert(&mut self, k: RowKey, r: Row) {
-        self.rows_by_key.insert(k, r);
+    pub fn insert(&mut self, k: RowKey, r: VersionedRow) {
+        self.rows_by_key.insert(k, vec![r]);
     }
-    pub fn scan_all(&self) -> impl Iterator<Item = (&RowKey, &Row)> {
+    pub fn scan_all(&self) -> impl Iterator<Item = (&RowKey, &Vec<VersionedRow>)> {
         self.rows_by_key.iter()
     }
 

@@ -3,7 +3,9 @@ use crate::engine::{
     BoolExpr, Column, DataType, ForeignKeySpec, ScalarExpr, SqlError, Value, cast_value_to_type,
     eval_bool_expr, eval_scalar_expr,
 };
-use crate::storage::{Row, RowKey, Table};
+use crate::session::{RowPointer, TxnChanges};
+use crate::storage::{Row, RowKey, Table, VersionedRow};
+use crate::txn::{TxId, VisibilityContext};
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -16,19 +18,11 @@ fn sql_err(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(SqlError::new(code, msg.into()))
 }
 
-#[derive(Clone, Debug)]
-struct DbSnapshot {
-    catalog: Catalog,
-    tables: HashMap<TableId, Table>,
-    next_tid: u64,
-}
-
 #[derive(Debug)]
 pub struct Db {
     pub catalog: Catalog,
     pub tables: HashMap<TableId, Table>,
     pub next_tid: u64,
-    txn_stack: Vec<DbSnapshot>,
 }
 
 impl Default for Db {
@@ -39,50 +33,10 @@ impl Default for Db {
             catalog,
             tables: HashMap::new(),
             next_tid: 1,
-            txn_stack: Vec::new(),
         }
     }
 }
-
 impl Db {
-    pub fn begin_transaction(&mut self) -> anyhow::Result<()> {
-        if self.in_transaction() {
-            return Err(sql_err("25001", "transaction already in progress"));
-        }
-        let snapshot = self.snapshot();
-        self.txn_stack.push(snapshot);
-        Ok(())
-    }
-
-    pub fn commit_transaction(&mut self) -> anyhow::Result<()> {
-        if self.txn_stack.pop().is_none() {
-            return Err(sql_err("25P01", "no transaction in progress"));
-        }
-        Ok(())
-    }
-
-    pub fn rollback_transaction(&mut self) -> anyhow::Result<()> {
-        let Some(snapshot) = self.txn_stack.pop() else {
-            return Err(sql_err("25P01", "no transaction in progress"));
-        };
-        self.catalog = snapshot.catalog;
-        self.tables = snapshot.tables;
-        self.next_tid = snapshot.next_tid;
-        Ok(())
-    }
-
-    pub fn in_transaction(&self) -> bool {
-        !self.txn_stack.is_empty()
-    }
-
-    fn snapshot(&self) -> DbSnapshot {
-        DbSnapshot {
-            catalog: self.catalog.clone(),
-            tables: self.tables.clone(),
-            next_tid: self.next_tid,
-        }
-    }
-
     pub fn create_table(
         &mut self,
         schema: &str,
@@ -337,8 +291,10 @@ impl Db {
             let table = self.tables.get_mut(&table_id).ok_or_else(|| {
                 sql_err("XX000", format!("missing storage for table id {table_id}"))
             })?;
-            for row in table.rows_by_key.values_mut() {
-                row.push(append_value.clone());
+            for versions in table.rows_by_key.values_mut() {
+                for version in versions.iter_mut() {
+                    version.data.push(append_value.clone());
+                }
             }
         }
         let schema_entry = self
@@ -424,14 +380,16 @@ impl Db {
             ));
         }
         if let Some(table) = self.tables.get_mut(&table_id) {
-            for row in table.rows_by_key.values_mut() {
-                if row.len() != drop_idx + 1 {
-                    return Err(sql_err(
-                        "XX000",
-                        format!("row length mismatch while dropping column {column}"),
-                    ));
+            for versions in table.rows_by_key.values_mut() {
+                for version in versions.iter_mut() {
+                    if version.data.len() != drop_idx + 1 {
+                        return Err(sql_err(
+                            "XX000",
+                            format!("row length mismatch while dropping column {column}"),
+                        ));
+                    }
+                    version.data.pop();
                 }
-                row.pop();
             }
         } else {
             return Err(sql_err(
@@ -560,7 +518,8 @@ impl Db {
         schema: &str,
         name: &str,
         mut rows: Vec<Vec<CellInput>>,
-    ) -> anyhow::Result<(usize, Vec<Row>)> {
+        txid: TxId,
+    ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self
             .catalog
             .get_table(schema, name)
@@ -604,6 +563,7 @@ impl Db {
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
         let mut count = 0usize;
         let mut inserted_rows = Vec::with_capacity(realized.len());
+        let mut inserted_ptrs = Vec::with_capacity(realized.len());
 
         for (_ridx, out) in realized.into_iter() {
             let row = out;
@@ -630,11 +590,17 @@ impl Db {
 
             // finally insert
             inserted_rows.push(row.clone());
-            tab.insert(key, row);
+            let version = VersionedRow {
+                xmin: txid,
+                xmax: None,
+                data: row,
+            };
+            tab.rows_by_key.insert(key.clone(), vec![version]);
+            inserted_ptrs.push(RowPointer { table_id, key });
             count += 1;
         }
 
-        Ok((count, inserted_rows))
+        Ok((count, inserted_rows, inserted_ptrs))
     }
 
     pub fn scan_bound_positions(
@@ -642,6 +608,7 @@ impl Db {
         schema: &str,
         name: &str,
         positions: &[usize],
+        visibility: &VisibilityContext,
     ) -> anyhow::Result<(Vec<Row>, Vec<(usize, String)>)> {
         let tm = self.resolve_table(schema, name)?;
         let table = self
@@ -650,8 +617,10 @@ impl Db {
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
 
         let mut out_rows = Vec::new();
-        for (_k, r) in table.scan_all() {
-            out_rows.push(positions.iter().map(|i| r[*i].clone()).collect());
+        for (_k, versions) in table.scan_all() {
+            if let Some(version) = select_visible_version(versions, visibility) {
+                out_rows.push(positions.iter().map(|i| version.data[*i].clone()).collect());
+            }
         }
         let cols = positions
             .iter()
@@ -667,10 +636,12 @@ impl Db {
         sets: &[(usize, ScalarExpr)],
         filter: Option<&BoolExpr>,
         params: &[Value],
-    ) -> anyhow::Result<(usize, Vec<Row>)> {
+        visibility: &VisibilityContext,
+        txid: TxId,
+    ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)> {
         let (meta, table) = self.resolve_table_mut(schema, name)?;
         if sets.is_empty() {
-            return Ok((0, Vec::new()));
+            return Ok((0, Vec::new(), Vec::new(), Vec::new()));
         }
         if let Some(pkpos) = &meta.pk {
             for (idx, _) in sets {
@@ -684,9 +655,15 @@ impl Db {
         }
         let mut count = 0usize;
         let mut updated_rows = Vec::new();
-        for row in table.rows_by_key.values_mut() {
+        let mut inserted_ptrs = Vec::new();
+        let mut touched_ptrs = Vec::new();
+        for (key, versions) in table.rows_by_key.iter_mut() {
+            let Some(idx) = select_visible_version_idx(versions, visibility) else {
+                continue;
+            };
+            let snapshot = versions[idx].data.clone();
             let passes = if let Some(expr) = filter {
-                eval_bool_expr(row, expr, params)
+                eval_bool_expr(&snapshot, expr, params)
                     .map_err(|e| sql_err("XX000", e.to_string()))?
                     .unwrap_or(false)
             } else {
@@ -695,19 +672,35 @@ impl Db {
             if !passes {
                 continue;
             }
-            let original = row.clone();
-            let mut updated = original.clone();
+            let mut updated = snapshot.clone();
             for (idx, expr) in sets {
-                let value = eval_scalar_expr(&original, expr, params)
+                let value = eval_scalar_expr(&snapshot, expr, params)
                     .map_err(|e| sql_err("XX000", e.to_string()))?;
                 let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, meta)?;
                 updated[*idx] = coerced;
             }
-            *row = updated.clone();
+            if versions[idx].xmax.is_some() {
+                continue;
+            }
+            versions[idx].xmax = Some(txid);
+            let new_version = VersionedRow {
+                xmin: txid,
+                xmax: None,
+                data: updated.clone(),
+            };
+            versions.push(new_version);
             updated_rows.push(updated);
+            touched_ptrs.push(RowPointer {
+                table_id: meta.id,
+                key: key.clone(),
+            });
+            inserted_ptrs.push(RowPointer {
+                table_id: meta.id,
+                key: key.clone(),
+            });
             count += 1;
         }
-        Ok((count, updated_rows))
+        Ok((count, updated_rows, inserted_ptrs, touched_ptrs))
     }
 
     pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
@@ -757,7 +750,9 @@ impl Db {
         name: &str,
         filter: Option<&BoolExpr>,
         params: &[Value],
-    ) -> anyhow::Result<(usize, Vec<Row>)> {
+        visibility: &VisibilityContext,
+        txid: TxId,
+    ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self.resolve_table(schema, name)?;
         let table_id = meta.id;
         let mut to_remove: Vec<(RowKey, Row)> = Vec::new();
@@ -769,7 +764,11 @@ impl Db {
                 )
             })?;
             if let Some(expr) = filter {
-                for (key, row) in table.rows_by_key.iter() {
+                for (key, versions) in table.rows_by_key.iter() {
+                    let Some(idx) = select_visible_version_idx(versions, visibility) else {
+                        continue;
+                    };
+                    let row = &versions[idx].data;
                     let passes = eval_bool_expr(row, expr, params)
                         .map_err(|e| sql_err("XX000", e.to_string()))?
                         .unwrap_or(false);
@@ -778,12 +777,11 @@ impl Db {
                     }
                 }
             } else {
-                to_remove.extend(
-                    table
-                        .rows_by_key
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone())),
-                );
+                for (key, versions) in table.rows_by_key.iter() {
+                    if let Some(version) = select_visible_version(versions, visibility) {
+                        to_remove.push((key.clone(), version.data.clone()));
+                    }
+                }
             }
         }
         let inbound = self.collect_inbound_foreign_keys(schema, name);
@@ -800,11 +798,20 @@ impl Db {
             )
         })?;
         let mut removed_rows = Vec::with_capacity(count);
+        let mut touched_ptrs = Vec::with_capacity(count);
         for (key, row) in to_remove {
-            table.rows_by_key.remove(&key);
+            if let Some(versions) = table.rows_by_key.get_mut(&key) {
+                if let Some(idx) = select_visible_version_idx(versions, visibility) {
+                    versions[idx].xmax = Some(txid);
+                    touched_ptrs.push(RowPointer {
+                        table_id,
+                        key: key.clone(),
+                    });
+                }
+            }
             removed_rows.push(row);
         }
-        Ok((count, removed_rows))
+        Ok((count, removed_rows, touched_ptrs))
     }
 
     fn ensure_outbound_foreign_keys(
@@ -863,9 +870,12 @@ impl Db {
             .tables
             .get(&meta.id)
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", meta.id)))?;
-        'outer: for row in storage.rows_by_key.values() {
+        'outer: for versions in storage.rows_by_key.values() {
+            let Some(row) = versions.last() else {
+                continue;
+            };
             for (col, val) in columns.iter().zip(values.iter()) {
-                if row[*col] != *val {
+                if row.data[*col] != *val {
                     continue 'outer;
                 }
             }
@@ -911,10 +921,13 @@ impl Db {
                     ));
                 }
             };
-            for row in child.rows_by_key.values() {
+            for versions in child.rows_by_key.values() {
+                let Some(row) = versions.last() else {
+                    continue;
+                };
                 let mut matches = true;
                 for (child_idx, parent_idx) in fk.columns.iter().zip(fk.referenced_columns.iter()) {
-                    if row[*child_idx] != parent_row[*parent_idx] {
+                    if row.data[*child_idx] != parent_row[*parent_idx] {
                         matches = false;
                         break;
                     }
@@ -932,6 +945,45 @@ impl Db {
         }
         Ok(())
     }
+
+    pub fn rollback_transaction_changes(
+        &mut self,
+        changes: &TxnChanges,
+        txid: TxId,
+    ) -> anyhow::Result<()> {
+        self.rollback_inserts(&changes.inserted, txid)?;
+        self.rollback_xmax(&changes.updated_old, txid)?;
+        Ok(())
+    }
+
+    fn rollback_inserts(&mut self, ptrs: &[RowPointer], txid: TxId) -> anyhow::Result<()> {
+        for ptr in ptrs {
+            if let Some(table) = self.tables.get_mut(&ptr.table_id) {
+                if let Some(versions) = table.rows_by_key.get_mut(&ptr.key) {
+                    versions.retain(|v| v.xmin != txid);
+                    if versions.is_empty() {
+                        table.rows_by_key.remove(&ptr.key);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_xmax(&mut self, ptrs: &[RowPointer], txid: TxId) -> anyhow::Result<()> {
+        for ptr in ptrs {
+            if let Some(table) = self.tables.get_mut(&ptr.table_id) {
+                if let Some(versions) = table.rows_by_key.get_mut(&ptr.key) {
+                    for version in versions.iter_mut() {
+                        if version.xmax == Some(txid) {
+                            version.xmax = None;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -941,6 +993,25 @@ struct InboundForeignKey {
     table_id: TableId,
     columns: Vec<usize>,
     referenced_columns: Vec<usize>,
+}
+
+fn select_visible_version_idx(
+    versions: &[VersionedRow],
+    visibility: &VisibilityContext,
+) -> Option<usize> {
+    versions
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, version)| visibility.is_visible(version))
+        .map(|(idx, _)| idx)
+}
+
+fn select_visible_version<'a>(
+    versions: &'a [VersionedRow],
+    visibility: &VisibilityContext,
+) -> Option<&'a VersionedRow> {
+    select_visible_version_idx(versions, visibility).map(|idx| &versions[idx])
 }
 
 fn coerce_value_for_column(

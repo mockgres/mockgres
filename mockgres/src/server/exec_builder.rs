@@ -8,7 +8,9 @@ use crate::engine::{
     ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec,
     eval_scalar_expr, fe, fe_code,
 };
+use crate::session::{RowPointer, Session};
 use crate::storage::Row;
+use crate::txn::{TransactionManager, TxId, TxnStatus, VisibilityContext};
 
 use super::errors::map_db_err;
 use super::insert::evaluate_insert_source;
@@ -43,6 +45,9 @@ pub fn command_tag(plan: &Plan) -> &'static str {
 
 pub fn build_executor(
     db: &Arc<parking_lot::RwLock<Db>>,
+    txn_manager: &Arc<TransactionManager>,
+    session: &Arc<Session>,
+    snapshot_xid: TxId,
     p: &Plan,
     params: Arc<Vec<Value>>,
 ) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
@@ -61,7 +66,14 @@ pub fn build_executor(
             exprs,
             schema,
         } => {
-            let (child, _tag, cnt) = build_executor(db, input, params.clone())?;
+            let (child, _tag, cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
             Ok((
                 Box::new(ProjectExec::new(
                     schema.clone(),
@@ -85,11 +97,13 @@ pub fn build_executor(
                 .resolve_table(schema_name, &table.name)
                 .map_err(map_db_err)?;
             let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
+            let current_tx = session.current_tx();
+            let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
             let (rows, _) = if positions.is_empty() && schema.fields.is_empty() {
                 (vec![], vec![])
             } else {
                 db_read
-                    .scan_bound_positions(schema_name, &table.name, &positions)
+                    .scan_bound_positions(schema_name, &table.name, &positions, &visibility)
                     .map_err(map_db_err)?
             };
             drop(db_read);
@@ -106,7 +120,14 @@ pub fn build_executor(
             expr,
             project_prefix_len,
         } => {
-            let (child, _tag, _cnt) = build_executor(db, input, params.clone())?;
+            let (child, _tag, _cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
             let child_schema = child.schema().clone();
             let mut node: Box<dyn ExecNode> = Box::new(FilterExec::new(
                 child_schema.clone(),
@@ -133,7 +154,14 @@ pub fn build_executor(
         }
 
         Plan::Order { input, keys } => {
-            let (child, _tag, cnt) = build_executor(db, input, params.clone())?;
+            let (child, _tag, cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
             let schema = child.schema().clone();
             let exec = Box::new(OrderExec::new(schema, child, keys.clone(), params.clone())?);
             Ok((exec, None, cnt))
@@ -146,7 +174,14 @@ pub fn build_executor(
         } => {
             let limit_val = *limit;
             let offset_val = *offset;
-            let (child, _tag, cnt) = build_executor(db, input, params.clone())?;
+            let (child, _tag, cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
             let remaining_after_offset = cnt.map(|c| c.saturating_sub(offset_val));
             let out_cnt = match (remaining_after_offset, limit_val) {
                 (Some(c), Some(lim)) => Some(c.min(lim)),
@@ -165,8 +200,16 @@ pub fn build_executor(
             right,
             schema,
         } => {
-            let (left_exec, _ltag, left_cnt) = build_executor(db, left, params.clone())?;
-            let (right_exec, _rtag, right_cnt) = build_executor(db, right, params.clone())?;
+            let (left_exec, _ltag, left_cnt) =
+                build_executor(db, txn_manager, session, snapshot_xid, left, params.clone())?;
+            let (right_exec, _rtag, right_cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                right,
+                params.clone(),
+            )?;
             let out_cnt = match (left_cnt, right_cnt) {
                 (Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
                 _ => None,
@@ -365,18 +408,33 @@ pub fn build_executor(
                 }
                 realized.push(full);
             }
-            let mut db = db.write();
-            let (inserted, inserted_rows) = db
-                .insert_full_rows(schema_name, &table.name, realized)
-                .map_err(map_db_err)?;
-            drop(db);
+            let (txid, autocommit) = writer_txid(session, txn_manager);
+            let (inserted, inserted_rows, inserted_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
+                let mut db = db.write();
+                match db.insert_full_rows(schema_name, &table.name, realized, txid) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        finish_writer_tx(txn_manager, txid, autocommit, false);
+                        return Err(map_db_err(e));
+                    }
+                }
+            };
+            if autocommit {
+                finish_writer_tx(txn_manager, txid, true, true);
+            } else {
+                session.record_inserts(inserted_ptrs);
+            }
             let tag = format!("INSERT 0 {}", inserted);
             if let Some(clause) = returning.clone() {
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for INSERT");
                 let rows = materialize_returning_rows(&clause, &inserted_rows, &params)?;
-                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+                Ok((
+                    Box::new(ValuesExec::from_values(schema, rows)),
+                    Some(tag),
+                    None,
+                ))
             } else {
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -401,25 +459,50 @@ pub fn build_executor(
                     }
                 })
                 .collect::<PgWireResult<Vec<_>>>()?;
-            let mut db = db.write();
             let schema_name = table.schema.as_deref().unwrap_or("public");
-            let (count, updated_rows) = db
-                .update_rows(
+            let (txid, autocommit) = writer_txid(session, txn_manager);
+            let current_tx = session.current_tx();
+            let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+            let (count, updated_rows, inserted_ptrs, touched_ptrs): (
+                usize,
+                Vec<Row>,
+                Vec<RowPointer>,
+                Vec<RowPointer>,
+            ) = {
+                let mut db = db.write();
+                match db.update_rows(
                     schema_name,
                     &table.name,
                     &assignments,
                     filter.as_ref(),
                     &params,
-                )
-                .map_err(map_db_err)?;
-            drop(db);
+                    &visibility,
+                    txid,
+                ) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        finish_writer_tx(txn_manager, txid, autocommit, false);
+                        return Err(map_db_err(e));
+                    }
+                }
+            };
+            if autocommit {
+                finish_writer_tx(txn_manager, txid, true, true);
+            } else {
+                session.record_inserts(inserted_ptrs);
+                session.record_touched(touched_ptrs);
+            }
             let tag = format!("UPDATE {}", count);
             if let Some(clause) = returning.clone() {
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for UPDATE");
                 let rows = materialize_returning_rows(&clause, &updated_rows, &params)?;
-                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+                Ok((
+                    Box::new(ValuesExec::from_values(schema, rows)),
+                    Some(tag),
+                    None,
+                ))
             } else {
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -434,19 +517,43 @@ pub fn build_executor(
             returning,
             returning_schema,
         } => {
-            let mut db = db.write();
             let schema_name = table.schema.as_deref().unwrap_or("public");
-            let (count, removed_rows) = db
-                .delete_rows(schema_name, &table.name, filter.as_ref(), &params)
-                .map_err(map_db_err)?;
-            drop(db);
+            let (txid, autocommit) = writer_txid(session, txn_manager);
+            let current_tx = session.current_tx();
+            let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+            let (count, removed_rows, touched_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
+                let mut db = db.write();
+                match db.delete_rows(
+                    schema_name,
+                    &table.name,
+                    filter.as_ref(),
+                    &params,
+                    &visibility,
+                    txid,
+                ) {
+                    Ok(res) => res,
+                    Err(e) => {
+                        finish_writer_tx(txn_manager, txid, autocommit, false);
+                        return Err(map_db_err(e));
+                    }
+                }
+            };
+            if autocommit {
+                finish_writer_tx(txn_manager, txid, true, true);
+            } else {
+                session.record_touched(touched_ptrs);
+            }
             let tag = format!("DELETE {}", count);
             if let Some(clause) = returning.clone() {
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for DELETE");
                 let rows = materialize_returning_rows(&clause, &removed_rows, &params)?;
-                Ok((Box::new(ValuesExec::from_values(schema, rows)), Some(tag), None))
+                Ok((
+                    Box::new(ValuesExec::from_values(schema, rows)),
+                    Some(tag),
+                    None,
+                ))
             } else {
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -475,9 +582,7 @@ pub fn build_executor(
             ))
         }
         Plan::BeginTransaction => {
-            let mut db = db.write();
-            db.begin_transaction().map_err(map_db_err)?;
-            drop(db);
+            begin_transaction(session, txn_manager)?;
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("BEGIN".into()),
@@ -485,9 +590,7 @@ pub fn build_executor(
             ))
         }
         Plan::CommitTransaction => {
-            let mut db = db.write();
-            db.commit_transaction().map_err(map_db_err)?;
-            drop(db);
+            commit_transaction(session, txn_manager)?;
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("COMMIT".into()),
@@ -495,9 +598,7 @@ pub fn build_executor(
             ))
         }
         Plan::RollbackTransaction => {
-            let mut db = db.write();
-            db.rollback_transaction().map_err(map_db_err)?;
-            drop(db);
+            rollback_transaction(session, txn_manager, db)?;
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("ROLLBACK".into()),
@@ -532,4 +633,76 @@ fn materialize_returning_rows(
         out.push(projected);
     }
     Ok(out)
+}
+
+fn writer_txid(session: &Arc<Session>, txn_manager: &Arc<TransactionManager>) -> (TxId, bool) {
+    if let Some(txid) = session.current_tx() {
+        (txid, false)
+    } else {
+        let txid = txn_manager.allocate();
+        txn_manager.set_status(txid, TxnStatus::InProgress);
+        (txid, true)
+    }
+}
+
+fn finish_writer_tx(
+    txn_manager: &Arc<TransactionManager>,
+    txid: TxId,
+    autocommit: bool,
+    success: bool,
+) {
+    if autocommit {
+        let status = if success {
+            TxnStatus::Committed
+        } else {
+            TxnStatus::Aborted
+        };
+        txn_manager.set_status(txid, status);
+    }
+}
+
+fn begin_transaction(
+    session: &Arc<Session>,
+    txn_manager: &Arc<TransactionManager>,
+) -> PgWireResult<()> {
+    if session.current_tx().is_some() {
+        return Err(fe_code("25001", "transaction already in progress"));
+    }
+    let txid = txn_manager.allocate();
+    txn_manager.set_status(txid, TxnStatus::InProgress);
+    session.set_current_tx(Some(txid));
+    session.reset_changes();
+    Ok(())
+}
+
+fn commit_transaction(
+    session: &Arc<Session>,
+    txn_manager: &Arc<TransactionManager>,
+) -> PgWireResult<()> {
+    let Some(txid) = session.current_tx() else {
+        return Err(fe_code("25P01", "no transaction in progress"));
+    };
+    txn_manager.set_status(txid, TxnStatus::Committed);
+    session.set_current_tx(None);
+    session.reset_changes();
+    Ok(())
+}
+
+fn rollback_transaction(
+    session: &Arc<Session>,
+    txn_manager: &Arc<TransactionManager>,
+    db: &Arc<parking_lot::RwLock<Db>>,
+) -> PgWireResult<()> {
+    let Some(txid) = session.current_tx() else {
+        return Err(fe_code("25P01", "no transaction in progress"));
+    };
+    let changes = session.take_changes();
+    session.set_current_tx(None);
+    {
+        let mut db = db.write();
+        db.rollback_transaction_changes(&changes, txid)
+            .map_err(map_db_err)?;
+    }
+    txn_manager.set_status(txid, TxnStatus::Aborted);
+    Ok(())
 }

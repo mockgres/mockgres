@@ -35,7 +35,11 @@ impl ValuesExec {
     }
 
     pub fn from_values(schema: Schema, rows: Vec<Vec<Value>>) -> Self {
-        Self { schema, rows, idx: 0 }
+        Self {
+            schema,
+            rows,
+            idx: 0,
+        }
     }
 }
 impl ExecNode for ValuesExec {

@@ -16,12 +16,15 @@ use pgwire::api::{
     store::PortalStore,
 };
 use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::startup::SecretKey;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::binder::bind;
 use crate::db::Db;
-use crate::engine::{Plan, Value, to_pgwire_stream};
+use crate::engine::{Plan, Value, fe, to_pgwire_stream};
+use crate::session::{Session, SessionManager};
 use crate::sql::Planner;
+use crate::txn::{TransactionManager, TxId};
 
 use super::describe::plan_fields;
 use super::exec_builder::{build_executor, command_tag};
@@ -30,11 +33,17 @@ use super::params::{build_params_for_portal, plan_parameter_types};
 #[derive(Clone)]
 pub struct Mockgres {
     pub db: Arc<RwLock<Db>>,
+    session_manager: Arc<SessionManager>,
+    pub txn_manager: Arc<TransactionManager>,
 }
 
 impl Mockgres {
     pub fn new(db: Arc<RwLock<Db>>) -> Self {
-        Self { db }
+        Self {
+            db,
+            session_manager: Arc::new(SessionManager::new()),
+            txn_manager: Arc::new(TransactionManager::new()),
+        }
     }
 
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
@@ -53,7 +62,7 @@ impl Mockgres {
 impl NoopStartupHandler for Mockgres {
     async fn post_startup<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         _message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
@@ -61,6 +70,7 @@ impl NoopStartupHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.init_session(client);
         Ok(())
     }
 }
@@ -73,7 +83,7 @@ impl Default for Mockgres {
 
 #[async_trait::async_trait]
 impl SimpleQueryHandler for Mockgres {
-    async fn do_query<'a, C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<'a, C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -87,7 +97,16 @@ impl SimpleQueryHandler for Mockgres {
                 drop(db_read);
 
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
-                let (exec, tag, row_count) = build_executor(&self.db, &bound, params)?;
+                let session = self.session_for_client(client)?;
+                let snapshot_xid = self.capture_statement_snapshot(&session);
+                let (exec, tag, row_count) = build_executor(
+                    &self.db,
+                    &self.txn_manager,
+                    &session,
+                    snapshot_xid,
+                    &bound,
+                    params,
+                )?;
                 let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text)?;
                 let mut qr = QueryResponse::new(fields, rows);
                 if let Some(t) = tag {
@@ -150,7 +169,7 @@ impl ExtendedQueryHandler for Mockgres {
     }
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &pgwire::api::portal::Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
@@ -170,7 +189,16 @@ impl ExtendedQueryHandler for Mockgres {
         drop(db);
 
         let params = build_params_for_portal(&bound, portal)?;
-        let (exec, tag, row_count) = build_executor(&self.db, &bound, params.clone())?;
+        let session = self.session_for_client(client)?;
+        let snapshot_xid = self.capture_statement_snapshot(&session);
+        let (exec, tag, row_count) = build_executor(
+            &self.db,
+            &self.txn_manager,
+            &session,
+            snapshot_xid,
+            &bound,
+            params.clone(),
+        )?;
         let (fields, rows) = to_pgwire_stream(exec, fmt)?;
         let mut qr = QueryResponse::new(fields, rows);
         if let Some(t) = tag {
@@ -210,6 +238,37 @@ impl Mockgres {
         let db = self.db.read();
         let bound = bind(&db, plan.clone())?;
         Ok(plan_fields(&bound))
+    }
+
+    fn session_for_client<C>(&self, client: &C) -> PgWireResult<Arc<Session>>
+    where
+        C: ClientInfo,
+    {
+        let (pid, _) = client.pid_and_secret_key();
+        self.session_manager
+            .get(pid)
+            .ok_or_else(|| fe("session not initialized"))
+    }
+
+    fn init_session<C>(&self, client: &mut C) -> Arc<Session>
+    where
+        C: ClientInfo,
+    {
+        let (pid, _) = client.pid_and_secret_key();
+        if pid != 0 {
+            if let Some(existing) = self.session_manager.get(pid) {
+                return existing;
+            }
+        }
+        let session = self.session_manager.create_session();
+        client.set_pid_and_secret_key(session.id(), SecretKey::I32(session.id()));
+        session
+    }
+
+    fn capture_statement_snapshot(&self, session: &Arc<Session>) -> TxId {
+        let snapshot = self.txn_manager.snapshot_xid();
+        session.set_statement_xid(snapshot);
+        snapshot
     }
 }
 
