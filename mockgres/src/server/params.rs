@@ -62,7 +62,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             collect_param_hints_from_plan(input, out);
             collect_param_hints_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } => {
+        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::LockRows { input, .. } => {
             collect_param_hints_from_plan(input, out)
         }
         Plan::Projection { input, exprs, .. } => {
@@ -197,7 +197,9 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             collect_param_indexes(input, out);
             collect_param_indexes_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } => collect_param_indexes(input, out),
+        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::LockRows { input, .. } => {
+            collect_param_indexes(input, out)
+        }
         Plan::Projection { input, exprs, .. } => {
             collect_param_indexes(input, out);
             for (expr, _) in exprs {

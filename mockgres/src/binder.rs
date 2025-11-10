@@ -2,15 +2,20 @@ use std::collections::HashSet;
 
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Field, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp,
-    ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
+    BoolExpr, DataType, Field, InsertSource, LockSpec, Plan, ReturningClause, ReturningExpr,
+    ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError, UpdateSet, Value,
+    fe, fe_code,
 };
 use anyhow::Error;
 use pgwire::error::PgWireError;
 
 pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
     match p {
-        Plan::UnboundSeqScan { table, selection } => {
+        Plan::UnboundSeqScan {
+            table,
+            selection,
+            lock,
+        } => {
             let schema_name = table.schema.as_deref().unwrap_or("public");
             let tm = db
                 .resolve_table(schema_name, &table.name)
@@ -54,14 +59,26 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                     out
                 }
             };
-            let schema = Schema {
+            let mut schema = Schema {
                 fields: cols.iter().map(|(_, f)| f.clone()).collect(),
             };
+            if lock.is_some() {
+                schema.fields.push(Field {
+                    name: "__mockgres_row_id".to_string(),
+                    data_type: DataType::Int8,
+                });
+            }
+            let lock = lock.map(|req| LockSpec {
+                mode: req.mode,
+                skip_locked: req.skip_locked,
+                target: tm.id,
+            });
 
             Ok(Plan::SeqScan {
                 table,
                 cols,
                 schema,
+                lock,
             })
         }
         Plan::UnboundJoin { left, right } => {
@@ -104,6 +121,40 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let child = bind(db, *input)?;
             Ok(Plan::CountRows {
                 input: Box::new(child),
+                schema,
+            })
+        }
+        Plan::LockRows {
+            table,
+            input,
+            lock,
+            row_id_idx: _,
+            schema: _,
+        } => {
+            let bound_child = bind(db, *input)?;
+            let child_schema = bound_child.schema().clone();
+            if child_schema.fields.is_empty() {
+                return Err(fe("FOR UPDATE requires row identifier column"));
+            }
+            let row_id_idx = child_schema.fields.len() - 1;
+            let mut visible_fields = child_schema.fields.clone();
+            visible_fields.remove(row_id_idx);
+            let schema = Schema {
+                fields: visible_fields,
+            };
+            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let tm = db
+                .resolve_table(schema_name, &table.name)
+                .map_err(map_catalog_err)?;
+            Ok(Plan::LockRows {
+                table,
+                input: Box::new(bound_child),
+                lock: LockSpec {
+                    mode: lock.mode,
+                    skip_locked: lock.skip_locked,
+                    target: tm.id,
+                },
+                row_id_idx,
                 schema,
             })
         }

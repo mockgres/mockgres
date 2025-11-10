@@ -3,9 +3,10 @@ use crate::engine::{
     BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ReferentialAction, ScalarExpr,
     SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
 };
-use crate::session::{RowPointer, TxnChanges};
+use crate::session::{RowPointer, SessionId, TxnChanges};
 use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
 use crate::txn::{TxId, VisibilityContext};
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
@@ -23,6 +24,7 @@ pub struct Db {
     pub catalog: Catalog,
     pub tables: HashMap<TableId, Table>,
     pub next_tid: u64,
+    locks: LockRegistry,
 }
 
 impl Default for Db {
@@ -33,10 +35,96 @@ impl Default for Db {
             catalog,
             tables: HashMap::new(),
             next_tid: 1,
+            locks: LockRegistry::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LockOwner {
+    pub session_id: SessionId,
+    pub epoch: u64,
+}
+
+impl LockOwner {
+    pub fn new(session_id: SessionId, epoch: u64) -> Self {
+        Self { session_id, epoch }
+    }
+}
+
+#[derive(Debug)]
+struct LockRegistry {
+    inner: Mutex<LockState>,
+}
+
+#[derive(Debug)]
+struct LockState {
+    holders: HashMap<(TableId, RowId), LockOwner>,
+    owned: HashMap<LockOwner, HashSet<(TableId, RowId)>>,
+}
+
+impl LockRegistry {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(LockState {
+                holders: HashMap::new(),
+                owned: HashMap::new(),
+            }),
+        }
+    }
+
+    fn acquire(
+        &self,
+        key: (TableId, RowId),
+        owner: LockOwner,
+        skip_locked: bool,
+    ) -> anyhow::Result<bool> {
+        let mut state = self.inner.lock();
+        if let Some(existing) = state.holders.get(&key) {
+            if *existing == owner {
+                return Ok(true);
+            }
+            if skip_locked {
+                return Ok(false);
+            }
+            return Err(sql_err(
+                "55P03",
+                "could not obtain lock on target row (locked by another transaction)",
+            ));
+        }
+        state.holders.insert(key, owner);
+        state.owned.entry(owner).or_default().insert(key);
+        Ok(true)
+    }
+
+    fn release_owner(&self, owner: LockOwner) {
+        let mut state = self.inner.lock();
+        if let Some(keys) = state.owned.remove(&owner) {
+            for key in keys {
+                if let Some(existing) = state.holders.get(&key) {
+                    if *existing == owner {
+                        state.holders.remove(&key);
+                    }
+                }
+            }
         }
     }
 }
 impl Db {
+    pub fn release_locks(&self, owner: LockOwner) {
+        self.locks.release_owner(owner);
+    }
+
+    pub fn lock_row(
+        &self,
+        table_id: TableId,
+        row_id: RowId,
+        owner: LockOwner,
+        skip_locked: bool,
+    ) -> anyhow::Result<bool> {
+        self.locks.acquire((table_id, row_id), owner, skip_locked)
+    }
+
     pub fn create_table(
         &mut self,
         schema: &str,
@@ -726,7 +814,7 @@ impl Db {
         name: &str,
         positions: &[usize],
         visibility: &VisibilityContext,
-    ) -> anyhow::Result<(Vec<Row>, Vec<(usize, String)>)> {
+    ) -> anyhow::Result<(Vec<Row>, Vec<(usize, String)>, Vec<RowId>)> {
         let tm = self.resolve_table(schema, name)?;
         let table = self
             .tables
@@ -734,16 +822,19 @@ impl Db {
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
 
         let mut out_rows = Vec::new();
-        for (_k, versions) in table.scan_all() {
+        let mut row_ids = Vec::new();
+        for (key, versions) in table.scan_all() {
             if let Some(version) = select_visible_version(versions, visibility) {
                 out_rows.push(positions.iter().map(|i| version.data[*i].clone()).collect());
+                let row_id = row_key_to_row_id(key)?;
+                row_ids.push(row_id);
             }
         }
         let cols = positions
             .iter()
             .map(|i| (*i, tm.columns[*i].name.clone()))
             .collect();
-        Ok((out_rows, cols))
+        Ok((out_rows, cols, row_ids))
     }
 
     pub fn update_rows(
@@ -755,6 +846,7 @@ impl Db {
         params: &[Value],
         visibility: &VisibilityContext,
         txid: TxId,
+        lock_owner: LockOwner,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)> {
         let meta = self
             .catalog
@@ -850,6 +942,8 @@ impl Db {
                     let Some(idx) = select_visible_version_idx(versions, visibility) else {
                         continue;
                     };
+                    let row_id = row_key_to_row_id(&pending_update.key)?;
+                    self.lock_row(meta.id, row_id, lock_owner, false)?;
                     if versions[idx].xmax.is_some() {
                         continue;
                     }
@@ -859,7 +953,6 @@ impl Db {
                         xmax: None,
                         data: pending_update.updated.clone(),
                     });
-                    let row_id = row_key_to_row_id(&pending_update.key)?;
                     updated_rows.push(pending_update.updated.clone());
                     if let Some(pk_meta) = pk_meta {
                         self.update_pk_map_for_row(
@@ -945,6 +1038,7 @@ impl Db {
         params: &[Value],
         visibility: &VisibilityContext,
         txid: TxId,
+        lock_owner: LockOwner,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self
             .catalog
@@ -1002,7 +1096,7 @@ impl Db {
             return Ok((0, removed_rows, Vec::new()));
         }
         let plan = self.build_delete_plan(seeds, visibility)?;
-        let touched_ptrs = self.apply_delete_plan(plan, visibility, txid)?;
+        let touched_ptrs = self.apply_delete_plan(plan, visibility, txid, lock_owner)?;
         Ok((removed_rows.len(), removed_rows, touched_ptrs))
     }
 
@@ -1114,6 +1208,7 @@ impl Db {
         plan: Vec<DeleteTarget>,
         visibility: &VisibilityContext,
         txid: TxId,
+        lock_owner: LockOwner,
     ) -> anyhow::Result<Vec<RowPointer>> {
         let mut table_cache: HashMap<TableId, Table> = HashMap::new();
         let result = (|| {
@@ -1135,6 +1230,7 @@ impl Db {
                 };
                 if let Some(versions) = table_entry.rows_by_key.get_mut(&target.row_key) {
                     if let Some(idx) = select_visible_version_idx(versions, visibility) {
+                        self.lock_row(target.meta.id, target.row_id, lock_owner, false)?;
                         if versions[idx].xmax.is_some() {
                             continue;
                         }

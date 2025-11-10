@@ -1,10 +1,12 @@
 use crate::engine::{
-    DataType, Field, InsertSource, ObjName, Plan, ReturningClause, ReturningExpr, ScalarExpr,
-    Schema, Selection, SortKey, UpdateSet, Value, fe,
+    DataType, Field, InsertSource, LockMode, LockRequest, LockSpec, ObjName, Plan, ReturningClause,
+    ReturningExpr, ScalarExpr, Schema, Selection, SortKey, UpdateSet, Value, fe, fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
-use pg_query::protobuf::{DeleteStmt, InsertStmt, ResTarget, SelectStmt, UpdateStmt};
+use pg_query::protobuf::{
+    DeleteStmt, InsertStmt, LockClauseStrength, LockWaitPolicy, ResTarget, SelectStmt, UpdateStmt,
+};
 use pgwire::error::PgWireResult;
 
 use super::expr::{
@@ -27,6 +29,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
     let from_count = sel.from_clause.len();
     let multi_from = from_count > 1;
+    let lock_request = parse_locking_clause(&mut sel.locking_clause, multi_from)?;
 
     let (mut selection, projection_items) = if count_star {
         (Selection::Star, None)
@@ -65,21 +68,27 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         order_keys = Some(keys);
     }
 
+    if lock_request.is_some() {
+        project_prefix_len = None;
+    }
+
     let mut from_clause = sel.from_clause;
     let first_table = parse_range_var(from_clause.remove(0))?;
     let mut plan = Plan::UnboundSeqScan {
-        table: first_table,
+        table: first_table.clone(),
         selection: if multi_from {
             Selection::Star
         } else {
             selection
         },
+        lock: if multi_from { None } else { lock_request },
     };
     for rv in from_clause {
         let table = parse_range_var(rv)?;
         let right = Plan::UnboundSeqScan {
             table,
             selection: Selection::Star,
+            lock: None,
         };
         plan = Plan::UnboundJoin {
             left: Box::new(plan),
@@ -99,6 +108,27 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         plan = Plan::Order {
             input: Box::new(plan),
             keys,
+        };
+    }
+
+    if lock_request.is_some() && count_star {
+        return Err(fe_code(
+            "0A000",
+            "FOR UPDATE with aggregates is not supported",
+        ));
+    }
+
+    if let Some(req) = lock_request {
+        plan = Plan::LockRows {
+            table: first_table,
+            input: Box::new(plan),
+            lock: LockSpec {
+                mode: req.mode,
+                skip_locked: req.skip_locked,
+                target: 0,
+            },
+            row_id_idx: 0,
+            schema: Schema { fields: vec![] },
         };
     }
 
@@ -147,6 +177,58 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     Ok(plan)
+}
+
+fn parse_locking_clause(
+    locking_clause: &mut Vec<pg_query::Node>,
+    multi_from: bool,
+) -> PgWireResult<Option<LockRequest>> {
+    if locking_clause.is_empty() {
+        return Ok(None);
+    }
+    if multi_from {
+        return Err(fe_code(
+            "0A000",
+            "FOR UPDATE is only supported for single-table SELECT statements",
+        ));
+    }
+    if locking_clause.len() != 1 {
+        return Err(fe_code(
+            "0A000",
+            "only one locking clause is supported per SELECT",
+        ));
+    }
+    let clause_node = locking_clause
+        .remove(0)
+        .node
+        .ok_or_else(|| fe("missing locking clause"))?;
+    let NodeEnum::LockingClause(clause) = clause_node else {
+        return Err(fe("malformed locking clause"));
+    };
+    if !clause.locked_rels.is_empty() {
+        return Err(fe_code(
+            "0A000",
+            "locking specific relations is not supported",
+        ));
+    }
+    let strength =
+        LockClauseStrength::try_from(clause.strength).map_err(|_| fe("bad locking strength"))?;
+    if strength != LockClauseStrength::LcsForupdate {
+        return Err(fe_code("0A000", "only FOR UPDATE is supported"));
+    }
+    let wait_policy =
+        LockWaitPolicy::try_from(clause.wait_policy).map_err(|_| fe("bad wait policy"))?;
+    let skip_locked = match wait_policy {
+        LockWaitPolicy::LockWaitBlock | LockWaitPolicy::Undefined => false,
+        LockWaitPolicy::LockWaitSkip => true,
+        LockWaitPolicy::LockWaitError => {
+            return Err(fe_code("0A000", "FOR UPDATE NOWAIT is not supported"));
+        }
+    };
+    Ok(Some(LockRequest {
+        mode: LockMode::Update,
+        skip_locked,
+    }))
 }
 
 fn detect_count_star(node: &pg_query::Node) -> Option<String> {

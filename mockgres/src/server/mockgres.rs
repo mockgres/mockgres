@@ -20,7 +20,7 @@ use pgwire::messages::startup::SecretKey;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::binder::bind;
-use crate::db::Db;
+use crate::db::{Db, LockOwner};
 use crate::engine::{Plan, Value, fe, to_pgwire_stream};
 use crate::session::{Session, SessionManager};
 use crate::sql::Planner;
@@ -98,6 +98,7 @@ impl SimpleQueryHandler for Mockgres {
 
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
                 let session = self.session_for_client(client)?;
+                let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
                 let snapshot_xid = self.capture_statement_snapshot(&session);
                 let (exec, tag, row_count) = build_executor(
                     &self.db,
@@ -190,6 +191,7 @@ impl ExtendedQueryHandler for Mockgres {
 
         let params = build_params_for_portal(&bound, portal)?;
         let session = self.session_for_client(client)?;
+        let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
         let snapshot_xid = self.capture_statement_snapshot(&session);
         let (exec, tag, row_count) = build_executor(
             &self.db,
@@ -230,6 +232,34 @@ impl PgWireServerHandlers for Mockgres {
     }
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
         Arc::new(NoopHandler)
+    }
+}
+
+struct StatementEpochGuard {
+    session: Arc<Session>,
+    db: Arc<RwLock<Db>>,
+    active: bool,
+}
+
+impl StatementEpochGuard {
+    fn new(session: Arc<Session>, db: Arc<RwLock<Db>>) -> Self {
+        let active = session.enter_statement();
+        Self {
+            session,
+            db,
+            active,
+        }
+    }
+}
+
+impl Drop for StatementEpochGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Some(epoch) = self.session.exit_statement() {
+                let db_read = self.db.read();
+                db_read.release_locks(LockOwner::new(self.session.id(), epoch));
+            }
+        }
     }
 }
 

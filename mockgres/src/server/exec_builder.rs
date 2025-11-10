@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use pgwire::error::PgWireResult;
 
-use crate::db::Db;
+use crate::db::{Db, LockOwner};
 use crate::engine::{
-    CountExec, ExecNode, Expr, FilterExec, LimitExec, NestedLoopJoinExec, OrderExec, Plan,
-    ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value,
-    ValuesExec, eval_scalar_expr, fe, fe_code,
+    CountExec, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec, OrderExec,
+    Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet,
+    Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::session::{RowPointer, Session};
-use crate::storage::Row;
+use crate::storage::{Row, RowId};
 use crate::txn::{TransactionManager, TxId, TxnStatus, VisibilityContext};
 
 use super::errors::map_db_err;
@@ -24,6 +24,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Filter { .. }
         | Plan::Order { .. }
         | Plan::Limit { .. }
+        | Plan::LockRows { .. }
         | Plan::UnboundJoin { .. }
         | Plan::Join { .. } => "SELECT 0",
 
@@ -107,6 +108,7 @@ pub fn build_executor(
             table,
             cols,
             schema,
+            lock,
         } => {
             let db_read = db.read();
             let schema_name = table.schema.as_deref().unwrap_or("public");
@@ -116,20 +118,48 @@ pub fn build_executor(
             let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
-            let (rows, _) = if positions.is_empty() && schema.fields.is_empty() {
-                (vec![], vec![])
+            let (mut rows, _cols, row_ids) = if positions.is_empty() && schema.fields.is_empty() {
+                (vec![], vec![], Vec::new())
             } else {
                 db_read
                     .scan_bound_positions(schema_name, &table.name, &positions, &visibility)
                     .map_err(map_db_err)?
             };
             drop(db_read);
+            if lock.is_some() {
+                for (row, row_id) in rows.iter_mut().zip(row_ids.iter()) {
+                    row.push(Value::Int64(*row_id as i64));
+                }
+            }
             let cnt = rows.len();
             Ok((
                 Box::new(SeqScanExec::new(schema.clone(), rows)),
                 None,
                 Some(cnt),
             ))
+        }
+        Plan::LockRows {
+            table: _,
+            input,
+            lock,
+            row_id_idx,
+            schema,
+        } => {
+            let (child, _tag, _cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+            )?;
+            let epoch = session
+                .current_epoch()
+                .ok_or_else(|| fe("FOR UPDATE requires an active transaction"))?;
+            let owner = LockOwner::new(session.id(), epoch);
+            let exec =
+                LockApplyExec::new(schema.clone(), child, *lock, *row_id_idx, owner, db.clone());
+            Ok((Box::new(exec), None, None))
         }
 
         Plan::Filter {
@@ -480,6 +510,10 @@ pub fn build_executor(
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+            let epoch = session
+                .current_epoch()
+                .ok_or_else(|| fe("missing transaction context for UPDATE"))?;
+            let lock_owner = LockOwner::new(session.id(), epoch);
             let (count, updated_rows, inserted_ptrs, touched_ptrs): (
                 usize,
                 Vec<Row>,
@@ -495,6 +529,7 @@ pub fn build_executor(
                     &params,
                     &visibility,
                     txid,
+                    lock_owner,
                 ) {
                     Ok(res) => res,
                     Err(e) => {
@@ -538,6 +573,10 @@ pub fn build_executor(
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+            let epoch = session
+                .current_epoch()
+                .ok_or_else(|| fe("missing transaction context for DELETE"))?;
+            let lock_owner = LockOwner::new(session.id(), epoch);
             let (count, removed_rows, touched_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
                 let mut db = db.write();
                 match db.delete_rows(
@@ -547,6 +586,7 @@ pub fn build_executor(
                     &params,
                     &visibility,
                     txid,
+                    lock_owner,
                 ) {
                     Ok(res) => res,
                     Err(e) => {
@@ -607,7 +647,7 @@ pub fn build_executor(
             ))
         }
         Plan::CommitTransaction => {
-            commit_transaction(session, txn_manager)?;
+            commit_transaction(session, txn_manager, db)?;
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("COMMIT".into()),
@@ -652,6 +692,82 @@ fn materialize_returning_rows(
     Ok(out)
 }
 
+struct LockApplyExec {
+    schema: Schema,
+    child: Box<dyn ExecNode>,
+    lock_spec: LockSpec,
+    row_id_idx: usize,
+    owner: LockOwner,
+    db: Arc<parking_lot::RwLock<Db>>,
+}
+
+impl LockApplyExec {
+    fn new(
+        schema: Schema,
+        child: Box<dyn ExecNode>,
+        lock_spec: LockSpec,
+        row_id_idx: usize,
+        owner: LockOwner,
+        db: Arc<parking_lot::RwLock<Db>>,
+    ) -> Self {
+        Self {
+            schema,
+            child,
+            lock_spec,
+            row_id_idx,
+            owner,
+            db,
+        }
+    }
+}
+
+impl ExecNode for LockApplyExec {
+    fn open(&mut self) -> PgWireResult<()> {
+        self.child.open()
+    }
+
+    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+        loop {
+            let Some(mut row) = self.child.next()? else {
+                return Ok(None);
+            };
+            if row.len() <= self.row_id_idx {
+                return Err(fe("row identifier column missing from plan output"));
+            }
+            let row_id_value = row.remove(self.row_id_idx);
+            let Value::Int64(raw_id) = row_id_value else {
+                return Err(fe("row identifier column has unexpected type"));
+            };
+            if raw_id < 0 {
+                return Err(fe("row identifier cannot be negative"));
+            }
+            let row_id = raw_id as RowId;
+            let acquired = {
+                let db_read = self.db.read();
+                db_read.lock_row(
+                    self.lock_spec.target,
+                    row_id,
+                    self.owner,
+                    self.lock_spec.skip_locked,
+                )
+            };
+            match acquired {
+                Ok(true) => return Ok(Some(row)),
+                Ok(false) => continue,
+                Err(e) => return Err(map_db_err(e)),
+            }
+        }
+    }
+
+    fn close(&mut self) -> PgWireResult<()> {
+        self.child.close()
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
+}
+
 fn writer_txid(session: &Arc<Session>, txn_manager: &Arc<TransactionManager>) -> (TxId, bool) {
     if let Some(txid) = session.current_tx() {
         (txid, false)
@@ -687,6 +803,7 @@ fn begin_transaction(
     }
     let txid = txn_manager.allocate();
     txn_manager.set_status(txid, TxnStatus::InProgress);
+    session.begin_transaction_epoch();
     session.set_current_tx(Some(txid));
     session.reset_changes();
     Ok(())
@@ -695,6 +812,7 @@ fn begin_transaction(
 fn commit_transaction(
     session: &Arc<Session>,
     txn_manager: &Arc<TransactionManager>,
+    db: &Arc<parking_lot::RwLock<Db>>,
 ) -> PgWireResult<()> {
     let Some(txid) = session.current_tx() else {
         return Err(fe_code("25P01", "no transaction in progress"));
@@ -702,6 +820,10 @@ fn commit_transaction(
     txn_manager.set_status(txid, TxnStatus::Committed);
     session.set_current_tx(None);
     session.reset_changes();
+    if let Some(epoch) = session.end_transaction_epoch() {
+        let db_read = db.read();
+        db_read.release_locks(LockOwner::new(session.id(), epoch));
+    }
     Ok(())
 }
 
@@ -721,5 +843,9 @@ fn rollback_transaction(
             .map_err(map_db_err)?;
     }
     txn_manager.set_status(txid, TxnStatus::Aborted);
+    if let Some(epoch) = session.end_transaction_epoch() {
+        let db_read = db.read();
+        db_read.release_locks(LockOwner::new(session.id(), epoch));
+    }
     Ok(())
 }

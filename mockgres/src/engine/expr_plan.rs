@@ -1,4 +1,5 @@
 use super::{DataType, Field, Schema, Value};
+use crate::catalog::TableId;
 
 #[derive(Clone, Copy, Debug)]
 pub enum CmpOp {
@@ -118,6 +119,24 @@ pub enum ReferentialAction {
     Cascade,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    Update,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockRequest {
+    pub mode: LockMode,
+    pub skip_locked: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LockSpec {
+    pub mode: LockMode,
+    pub skip_locked: bool,
+    pub target: TableId,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrimaryKeySpec {
     pub name: Option<String>,
@@ -142,6 +161,7 @@ pub enum Plan {
     UnboundSeqScan {
         table: ObjName,
         selection: Selection,
+        lock: Option<LockRequest>,
     },
     Filter {
         input: Box<Plan>,
@@ -169,6 +189,14 @@ pub enum Plan {
     SeqScan {
         table: ObjName,
         cols: Vec<(usize, Field)>,
+        schema: Schema,
+        lock: Option<LockSpec>,
+    },
+    LockRows {
+        table: ObjName,
+        input: Box<Plan>,
+        lock: LockSpec,
+        row_id_idx: usize,
         schema: Schema,
     },
     Projection {
@@ -273,6 +301,7 @@ impl Plan {
         match self {
             Plan::Values { schema, .. }
             | Plan::SeqScan { schema, .. }
+            | Plan::LockRows { schema, .. }
             | Plan::Projection { schema, .. }
             | Plan::CountRows { schema, .. }
             | Plan::Join { schema, .. } => schema,

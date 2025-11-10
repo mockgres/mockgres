@@ -24,12 +24,28 @@ pub struct TxnChanges {
     pub updated_old: Vec<RowPointer>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SessionState {
     pub current_tx: Option<TxId>,
     pub statement_xid: Option<TxId>,
     #[allow(dead_code)]
     pub changes: TxnChanges,
+    pub next_epoch: u64,
+    pub txn_epoch: Option<u64>,
+    pub statement_epoch: Option<u64>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            current_tx: None,
+            statement_xid: None,
+            changes: TxnChanges::default(),
+            next_epoch: 1,
+            txn_epoch: None,
+            statement_epoch: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -98,6 +114,40 @@ impl Session {
     pub fn take_changes(&self) -> TxnChanges {
         let mut guard = self.state.lock();
         std::mem::take(&mut guard.changes)
+    }
+
+    pub fn enter_statement(&self) -> bool {
+        let mut guard = self.state.lock();
+        if guard.txn_epoch.is_some() {
+            return false;
+        }
+        let epoch = guard.next_epoch;
+        guard.next_epoch += 1;
+        guard.statement_epoch = Some(epoch);
+        true
+    }
+
+    pub fn exit_statement(&self) -> Option<u64> {
+        let mut guard = self.state.lock();
+        guard.statement_epoch.take()
+    }
+
+    pub fn current_epoch(&self) -> Option<u64> {
+        let guard = self.state.lock();
+        guard.txn_epoch.or(guard.statement_epoch)
+    }
+
+    pub fn begin_transaction_epoch(&self) -> u64 {
+        let mut guard = self.state.lock();
+        let epoch = guard.next_epoch;
+        guard.next_epoch += 1;
+        guard.txn_epoch = Some(epoch);
+        epoch
+    }
+
+    pub fn end_transaction_epoch(&self) -> Option<u64> {
+        let mut guard = self.state.lock();
+        guard.txn_epoch.take()
     }
 }
 
