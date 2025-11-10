@@ -327,14 +327,14 @@ fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
     })
 }
 
-pub fn to_pgwire_stream(
+pub async fn to_pgwire_stream(
     mut node: Box<dyn ExecNode>,
     fmt: FieldFormat,
 ) -> PgWireResult<(
     Arc<Vec<FieldInfo>>,
     impl Stream<Item = PgWireResult<DataRow>> + Send + 'static,
 )> {
-    node.open()?;
+    node.open().await?;
     let schema = node.schema().clone();
     let fields = Arc::new(
         schema
@@ -347,13 +347,11 @@ pub fn to_pgwire_stream(
     let s = stream::unfold(
         (node, fields.clone(), schema),
         move |(mut node, fields, schema)| async move {
-            let next = node.next();
-            match next {
+            match node.next().await {
                 Ok(Some(vals)) => {
                     let mut enc = DataRowEncoder::new(fields.clone());
                     for (i, v) in vals.into_iter().enumerate() {
                         let dt = &schema.field(i).data_type;
-                        // encode by declared column type; allow null for any type
                         let res = match (v, dt) {
                             (Value::Null, DataType::Int4) => enc.encode_field(&Option::<i32>::None),
                             (Value::Null, DataType::Int8) => enc.encode_field(&Option::<i64>::None),
@@ -386,10 +384,7 @@ pub fn to_pgwire_stream(
                                 let f = f64::from_bits(b);
                                 enc.encode_field(&f)
                             }
-                            (Value::Text(s), DataType::Text) => {
-                                let owned = s;
-                                enc.encode_field(&owned)
-                            }
+                            (Value::Text(s), DataType::Text) => enc.encode_field(&s),
                             (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
                             (Value::Date(days), DataType::Date) => {
                                 if fmt == FieldFormat::Binary {
@@ -442,10 +437,10 @@ pub fn to_pgwire_stream(
                         Err(e) => Some((Err(e), (node, fields, schema))),
                     }
                 }
-                Ok(None) => {
-                    let _ = node.close();
-                    None
-                }
+                Ok(None) => match node.close().await {
+                    Ok(()) => None,
+                    Err(e) => Some((Err(e), (node, fields, schema))),
+                },
                 Err(e) => Some((Err(e), (node, fields, schema))),
             }
         },

@@ -1,7 +1,7 @@
 use super::expr_plan::ScalarExpr;
 use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
 use pgwire::api::Type;
-use pgwire::error::PgWireError;
+use pgwire::error::{ErrorInfo, PgWireError};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -29,11 +29,19 @@ impl fmt::Display for SqlError {
 impl std::error::Error for SqlError {}
 
 pub fn fe(msg: impl Into<String>) -> PgWireError {
-    PgWireError::ApiError(Box::new(SqlError::new("XX000", msg.into())))
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "XX000".to_owned(),
+        msg.into(),
+    )))
 }
 
 pub fn fe_code(code: &'static str, msg: impl Into<String>) -> PgWireError {
-    PgWireError::ApiError(Box::new(SqlError::new(code, msg.into())))
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        code.to_owned(),
+        msg.into(),
+    )))
 }
 
 #[derive(Clone, Debug, PartialEq)]

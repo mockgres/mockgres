@@ -125,6 +125,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             lock: LockSpec {
                 mode: req.mode,
                 skip_locked: req.skip_locked,
+                nowait: req.nowait,
                 target: 0,
             },
             row_id_idx: 0,
@@ -218,16 +219,15 @@ fn parse_locking_clause(
     }
     let wait_policy =
         LockWaitPolicy::try_from(clause.wait_policy).map_err(|_| fe("bad wait policy"))?;
-    let skip_locked = match wait_policy {
-        LockWaitPolicy::LockWaitBlock | LockWaitPolicy::Undefined => false,
-        LockWaitPolicy::LockWaitSkip => true,
-        LockWaitPolicy::LockWaitError => {
-            return Err(fe_code("0A000", "FOR UPDATE NOWAIT is not supported"));
-        }
+    let (skip_locked, nowait) = match wait_policy {
+        LockWaitPolicy::LockWaitBlock | LockWaitPolicy::Undefined => (false, false),
+        LockWaitPolicy::LockWaitSkip => (true, false),
+        LockWaitPolicy::LockWaitError => (false, true),
     };
     Ok(Some(LockRequest {
         mode: LockMode::Update,
         skip_locked,
+        nowait,
     }))
 }
 
@@ -636,13 +636,7 @@ fn parse_insert_value_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
 
 fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
     match expr {
-        ScalarExpr::Column(name) => {
-            if name.eq_ignore_ascii_case("nan") {
-                Ok(ScalarExpr::Literal(Value::from_f64(f64::NAN)))
-            } else {
-                Err(fe("INSERT expressions cannot reference columns"))
-            }
-        }
+        ScalarExpr::Column(_) => Err(fe("INSERT expressions cannot reference columns")),
         ScalarExpr::BinaryOp { op, left, right } => Ok(ScalarExpr::BinaryOp {
             op,
             left: Box::new(sanitize_insert_expr(*left)?),

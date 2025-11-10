@@ -1,5 +1,6 @@
 mod common;
 
+use tokio_postgres::error::SqlState;
 use tokio_postgres::Row;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -13,7 +14,10 @@ async fn nan_equality_and_comparison_via_filters() {
 
     // insert constants only: 1, 2, NaN, 3, NaN
     ctx.client
-        .execute("insert into t values (1.0),(2.0),(nan),(3.0),(nan)", &[])
+        .execute(
+            "insert into t values (1.0),(2.0),(float8 'NaN'),(3.0),(float8 'NaN')",
+            &[],
+        )
         .await
         .expect("insert");
 
@@ -56,7 +60,10 @@ async fn order_by_with_nan_and_nulls_extended() {
 
     // constants: 2.0, null, NaN, 1.0
     ctx.client
-        .execute("insert into t values (2.0),(null),(nan),(1.0)", &[])
+        .execute(
+            "insert into t values (2.0),(null),(float8 'NaN'),(1.0)",
+            &[],
+        )
         .await
         .expect("insert");
 
@@ -91,6 +98,34 @@ async fn order_by_with_nan_and_nulls_extended() {
     assert!(desc_vals[1].map(|x| x.is_nan()).unwrap_or(false));
     assert!(desc_vals[2] == Some(2.0));
     assert!(desc_vals[3] == Some(1.0));
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_nan_requires_explicit_literal() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute("create table nan_insert(v float8)", &[])
+        .await
+        .expect("create table");
+
+    ctx.client
+        .execute("insert into nan_insert values (float8 'NaN')", &[])
+        .await
+        .expect("literal NaN insert");
+
+    let err = ctx
+        .client
+        .execute("insert into nan_insert values (nan)", &[])
+        .await
+        .expect_err("bare identifier nan should fail");
+    assert_eq!(err.code(), Some(&SqlState::INTERNAL_ERROR));
+    assert!(
+        err.to_string()
+            .contains("INSERT expressions cannot reference columns"),
+        "unexpected error message: {err}"
+    );
 
     let _ = ctx.shutdown.send(());
 }

@@ -17,6 +17,7 @@ pub enum TxnStatus {
 #[derive(Debug, Default)]
 pub struct TransactionManager {
     next_xid: AtomicU64,
+    // We never evict entries so tuple metadata never references an unknown XID.
     statuses: DashMap<TxId, TxnStatus>,
 }
 
@@ -50,15 +51,8 @@ impl TransactionManager {
         if txid == SYSTEM_TXID {
             return true;
         }
-        match self.status(txid) {
-            Some(TxnStatus::Committed) => true,
-            Some(TxnStatus::Aborted | TxnStatus::InProgress) => false,
-            None => true,
-        }
-    }
-
-    pub fn remove(&self, txid: TxId) {
-        self.statuses.remove(&txid);
+        // Treat unknown txids as not committed so missed status transitions fail reads loudly.
+        matches!(self.status(txid), Some(TxnStatus::Committed))
     }
 }
 

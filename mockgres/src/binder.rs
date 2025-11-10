@@ -71,6 +71,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let lock = lock.map(|req| LockSpec {
                 mode: req.mode,
                 skip_locked: req.skip_locked,
+                nowait: req.nowait,
                 target: tm.id,
             });
 
@@ -152,6 +153,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 lock: LockSpec {
                     mode: lock.mode,
                     skip_locked: lock.skip_locked,
+                    nowait: lock.nowait,
                     target: tm.id,
                 },
                 row_id_idx,
@@ -406,7 +408,10 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                                 DataType::Int4
                                 | DataType::Int8
                                 | DataType::Float8
-                                | DataType::Bool => Some(&field.data_type),
+                                | DataType::Bool
+                                | DataType::Date
+                                | DataType::Timestamp
+                                | DataType::Bytea => Some(&field.data_type),
                                 _ => None,
                             };
                             let bound = bind_scalar_expr(&expr, &table_schema, hint)?;

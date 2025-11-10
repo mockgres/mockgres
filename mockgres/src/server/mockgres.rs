@@ -92,9 +92,10 @@ impl SimpleQueryHandler for Mockgres {
         match Planner::plan_sql(query) {
             Ok(lp0) => {
                 // bind (names -> positions) using catalog
-                let db_read = self.db.read();
-                let bound = bind(&db_read, lp0)?;
-                drop(db_read);
+                let bound = {
+                    let db_read = self.db.read();
+                    bind(&db_read, lp0)?
+                };
 
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
                 let session = self.session_for_client(client)?;
@@ -108,7 +109,7 @@ impl SimpleQueryHandler for Mockgres {
                     &bound,
                     params,
                 )?;
-                let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text)?;
+                let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text).await?;
                 let mut qr = QueryResponse::new(fields, rows);
                 let tag_text = if let Some(t) = tag {
                     t
@@ -145,9 +146,10 @@ impl ExtendedQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let db = self.db.read();
-        let bound = bind(&db, target.statement.clone())?;
-        drop(db);
+        let bound = {
+            let db = self.db.read();
+            bind(&db, target.statement.clone())?
+        };
         let params = plan_parameter_types(&bound);
         let fields = plan_fields(&bound);
         Ok(DescribeStatementResponse::new(params, fields))
@@ -184,9 +186,10 @@ impl ExtendedQueryHandler for Mockgres {
             _ => FieldFormat::Text,
         };
 
-        let db = self.db.read();
-        let bound = bind(&db, portal.statement.statement.clone())?;
-        drop(db);
+        let bound = {
+            let db = self.db.read();
+            bind(&db, portal.statement.statement.clone())?
+        };
 
         let params = build_params_for_portal(&bound, portal)?;
         let session = self.session_for_client(client)?;
@@ -200,7 +203,7 @@ impl ExtendedQueryHandler for Mockgres {
             &bound,
             params.clone(),
         )?;
-        let (fields, rows) = to_pgwire_stream(exec, fmt)?;
+        let (fields, rows) = to_pgwire_stream(exec, fmt).await?;
         let mut qr = QueryResponse::new(fields, rows);
         let tag_text = if let Some(t) = tag {
             t

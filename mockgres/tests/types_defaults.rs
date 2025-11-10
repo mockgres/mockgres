@@ -68,14 +68,20 @@ async fn date_timestamp_bytea_roundtrip() {
         .prepare("insert into events values ($1, $2, $3, $4, $5)")
         .await
         .expect("prepare");
+    let param_date = NaiveDate::from_ymd_opt(2024, 5, 5).expect("valid date");
+    let param_ts = NaiveDate::from_ymd_opt(2024, 5, 5)
+        .expect("valid date")
+        .and_hms_micro_opt(5, 5, 5, 0)
+        .expect("valid timestamp");
+    let param_payload = b"123".to_vec();
     ctx.client
         .execute(
             &stmt,
             &[
                 &3,
-                &"2024-05-05",
-                &"2024-05-05 05:05:05",
-                &"\\x313233",
+                &param_date,
+                &param_ts,
+                &param_payload,
                 &"param",
             ],
         )
@@ -134,6 +140,52 @@ async fn insert_default_keyword() {
     let desc: Option<String> = row.get(0);
     assert_eq!(desc.as_deref(), Some("pending"));
     assert!(row.get::<_, bool>(1));
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn binary_params_for_date_and_timestamp() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute(
+            "create table ts_params(
+                id int primary key,
+                occurred date not null,
+                happened_at timestamp not null
+            )",
+            &[],
+        )
+        .await
+        .expect("create ts_params");
+
+    let stmt = ctx
+        .client
+        .prepare("insert into ts_params values ($1, $2, $3)")
+        .await
+        .expect("prepare ts_params insert");
+    let day = NaiveDate::from_ymd_opt(2024, 2, 3).expect("valid date");
+    let ts = NaiveDate::from_ymd_opt(2024, 2, 3)
+        .expect("valid date")
+        .and_hms_micro_opt(4, 5, 6, 789)
+        .expect("valid timestamp");
+    ctx.client
+        .execute(&stmt, &[&1, &day, &ts])
+        .await
+        .expect("insert via params");
+
+    let row = ctx
+        .client
+        .query_one(
+            "select occurred, happened_at from ts_params where id = 1",
+            &[],
+        )
+        .await
+        .expect("select inserted row");
+    let stored_day: NaiveDate = row.get(0);
+    let stored_ts: NaiveDateTime = row.get(1);
+    assert_eq!(stored_day, day, "date round trips via binary params");
+    assert_eq!(stored_ts, ts, "timestamp round trips via binary params");
 
     let _ = ctx.shutdown.send(());
 }

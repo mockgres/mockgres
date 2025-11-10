@@ -1,14 +1,16 @@
 use crate::storage::Row;
+use async_trait::async_trait;
 use pgwire::error::PgWireResult;
 use std::sync::Arc;
 
 use super::eval::{eval_bool_expr, eval_scalar_expr};
 use super::{BoolExpr, Expr, ScalarExpr, Schema, SortKey, Value, fe};
 
+#[async_trait]
 pub trait ExecNode: Send {
-    fn open(&mut self) -> PgWireResult<()>;
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>>;
-    fn close(&mut self) -> PgWireResult<()>;
+    async fn open(&mut self) -> PgWireResult<()>;
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>>;
+    async fn close(&mut self) -> PgWireResult<()>;
     fn schema(&self) -> &Schema;
 }
 
@@ -42,11 +44,12 @@ impl ValuesExec {
         }
     }
 }
+#[async_trait]
 impl ExecNode for ValuesExec {
-    fn open(&mut self) -> PgWireResult<()> {
+    async fn open(&mut self) -> PgWireResult<()> {
         Ok(())
     }
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
         if self.idx >= self.rows.len() {
             return Ok(None);
         }
@@ -54,7 +57,7 @@ impl ExecNode for ValuesExec {
         self.idx += 1;
         Ok(Some(row))
     }
-    fn close(&mut self) -> PgWireResult<()> {
+    async fn close(&mut self) -> PgWireResult<()> {
         Ok(())
     }
     fn schema(&self) -> &Schema {
@@ -84,12 +87,13 @@ impl ProjectExec {
         }
     }
 }
+#[async_trait]
 impl ExecNode for ProjectExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        self.input.open()
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.input.open().await
     }
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
-        if let Some(in_row) = self.input.next()? {
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+        if let Some(in_row) = self.input.next().await? {
             let mut out = Vec::with_capacity(self.exprs.len());
             for e in &self.exprs {
                 out.push(eval_scalar_expr(&in_row, e, &self.params)?);
@@ -99,8 +103,8 @@ impl ExecNode for ProjectExec {
             Ok(None)
         }
     }
-    fn close(&mut self) -> PgWireResult<()> {
-        self.input.close()
+    async fn close(&mut self) -> PgWireResult<()> {
+        self.input.close().await
     }
     fn schema(&self) -> &Schema {
         &self.schema
@@ -123,25 +127,26 @@ impl CountExec {
     }
 }
 
+#[async_trait]
 impl ExecNode for CountExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        self.input.open()
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.input.open().await
     }
 
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
         if self.produced {
             return Ok(None);
         }
         let mut count: i64 = 0;
-        while let Some(_) = self.input.next()? {
+        while let Some(_) = self.input.next().await? {
             count += 1;
         }
         self.produced = true;
         Ok(Some(vec![Value::Int64(count)]))
     }
 
-    fn close(&mut self) -> PgWireResult<()> {
-        self.input.close()
+    async fn close(&mut self) -> PgWireResult<()> {
+        self.input.close().await
     }
 
     fn schema(&self) -> &Schema {
@@ -164,11 +169,12 @@ impl SeqScanExec {
         }
     }
 }
+#[async_trait]
 impl ExecNode for SeqScanExec {
-    fn open(&mut self) -> PgWireResult<()> {
+    async fn open(&mut self) -> PgWireResult<()> {
         Ok(())
     }
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
         if self.idx >= self.rows.len() {
             return Ok(None);
         }
@@ -176,7 +182,7 @@ impl ExecNode for SeqScanExec {
         self.idx += 1;
         Ok(Some(row))
     }
-    fn close(&mut self) -> PgWireResult<()> {
+    async fn close(&mut self) -> PgWireResult<()> {
         Ok(())
     }
     fn schema(&self) -> &Schema {
@@ -186,29 +192,44 @@ impl ExecNode for SeqScanExec {
 
 pub struct NestedLoopJoinExec {
     schema: Schema,
+    left: Option<Box<dyn ExecNode>>,
+    right: Option<Box<dyn ExecNode>>,
     rows: Vec<Row>,
     pos: usize,
+    built: bool,
 }
 
 impl NestedLoopJoinExec {
-    pub fn new(
-        schema: Schema,
-        mut left: Box<dyn ExecNode>,
-        mut right: Box<dyn ExecNode>,
-    ) -> PgWireResult<Self> {
-        left.open()?;
+    pub fn new(schema: Schema, left: Box<dyn ExecNode>, right: Box<dyn ExecNode>) -> Self {
+        Self {
+            schema,
+            left: Some(left),
+            right: Some(right),
+            rows: Vec::new(),
+            pos: 0,
+            built: false,
+        }
+    }
+
+    async fn ensure_materialized(&mut self) -> PgWireResult<()> {
+        if self.built {
+            return Ok(());
+        }
+        let mut left = self.left.take().expect("left exec missing");
+        let mut right = self.right.take().expect("right exec missing");
+        left.open().await?;
         let mut left_rows = Vec::new();
-        while let Some(row) = left.next()? {
+        while let Some(row) = left.next().await? {
             left_rows.push(row);
         }
-        left.close()?;
+        left.close().await?;
 
-        right.open()?;
+        right.open().await?;
         let mut right_rows = Vec::new();
-        while let Some(row) = right.next()? {
+        while let Some(row) = right.next().await? {
             right_rows.push(row);
         }
-        right.close()?;
+        right.close().await?;
 
         let mut rows = Vec::with_capacity(left_rows.len() * right_rows.len());
         if !left_rows.is_empty() && !right_rows.is_empty() {
@@ -221,19 +242,21 @@ impl NestedLoopJoinExec {
             }
         }
 
-        Ok(Self {
-            schema,
-            rows,
-            pos: 0,
-        })
+        self.rows = rows;
+        self.built = true;
+        Ok(())
     }
 }
 
+#[async_trait]
 impl ExecNode for NestedLoopJoinExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        Ok(())
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.ensure_materialized().await
     }
-    fn next(&mut self) -> PgWireResult<Option<Row>> {
+    async fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if !self.built {
+            self.ensure_materialized().await?;
+        }
         if self.pos >= self.rows.len() {
             return Ok(None);
         }
@@ -241,7 +264,7 @@ impl ExecNode for NestedLoopJoinExec {
         self.pos += 1;
         Ok(Some(row))
     }
-    fn close(&mut self) -> PgWireResult<()> {
+    async fn close(&mut self) -> PgWireResult<()> {
         Ok(())
     }
     fn schema(&self) -> &Schema {
@@ -272,13 +295,14 @@ impl FilterExec {
     }
 }
 
+#[async_trait]
 impl ExecNode for FilterExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        self.child.open()
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.child.open().await
     }
-    fn next(&mut self) -> PgWireResult<Option<Row>> {
+    async fn next(&mut self) -> PgWireResult<Option<Row>> {
         loop {
-            match self.child.next()? {
+            match self.child.next().await? {
                 Some(row) => {
                     let pass = eval_bool_expr(&row, &self.expr, &self.params)?.unwrap_or(false);
                     if pass {
@@ -289,8 +313,8 @@ impl ExecNode for FilterExec {
             }
         }
     }
-    fn close(&mut self) -> PgWireResult<()> {
-        self.child.close()
+    async fn close(&mut self) -> PgWireResult<()> {
+        self.child.close().await
     }
     fn schema(&self) -> &Schema {
         &self.schema
@@ -300,8 +324,13 @@ impl ExecNode for FilterExec {
 // order exec: materializes child rows, sorts them, then yields
 pub struct OrderExec {
     schema: Schema,
+    child: Option<Box<dyn ExecNode>>,
     rows: Vec<(Row, Vec<Value>)>,
     pos: usize,
+    resolved_keys: Vec<OrderKeySpec>,
+    expr_specs: Vec<ScalarExpr>,
+    params: Arc<Vec<Value>>,
+    sorted: bool,
 }
 
 struct OrderKeySpec {
@@ -318,12 +347,10 @@ enum OrderKeyKind {
 impl OrderExec {
     pub fn new(
         schema: Schema,
-        mut child: Box<dyn ExecNode>,
+        child: Box<dyn ExecNode>,
         keys: Vec<SortKey>,
         params: Arc<Vec<Value>>,
     ) -> PgWireResult<Self> {
-        child.open()?;
-
         let mut expr_specs = Vec::new();
         let mut resolved_keys = Vec::with_capacity(keys.len());
         for key in keys {
@@ -374,19 +401,38 @@ impl OrderExec {
             }
         }
 
+        Ok(Self {
+            schema,
+            child: Some(child),
+            rows: Vec::new(),
+            pos: 0,
+            resolved_keys,
+            expr_specs,
+            params,
+            sorted: false,
+        })
+    }
+
+    async fn ensure_sorted(&mut self) -> PgWireResult<()> {
+        if self.sorted {
+            return Ok(());
+        }
+        let mut child = self.child.take().expect("order child missing");
+        child.open().await?;
+
         let mut buf = Vec::new();
-        while let Some(r) = child.next()? {
-            let mut expr_vals = Vec::with_capacity(expr_specs.len());
-            for expr in &expr_specs {
-                expr_vals.push(eval_scalar_expr(&r, expr, &params)?);
+        while let Some(r) = child.next().await? {
+            let mut expr_vals = Vec::with_capacity(self.expr_specs.len());
+            for expr in &self.expr_specs {
+                expr_vals.push(eval_scalar_expr(&r, expr, &self.params)?);
             }
             buf.push((r, expr_vals));
         }
-        child.close()?;
+        child.close().await?;
 
         buf.sort_by(|(row_a, exprs_a), (row_b, exprs_b)| {
             use std::cmp::Ordering;
-            for spec in &resolved_keys {
+            for spec in &self.resolved_keys {
                 let ord = match spec.kind {
                     OrderKeyKind::Column(idx) => {
                         let av = row_a.get(idx);
@@ -406,19 +452,21 @@ impl OrderExec {
             Ordering::Equal
         });
 
-        Ok(Self {
-            schema,
-            rows: buf,
-            pos: 0,
-        })
+        self.rows = buf;
+        self.sorted = true;
+        Ok(())
     }
 }
 
+#[async_trait]
 impl ExecNode for OrderExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        Ok(())
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.ensure_sorted().await
     }
-    fn next(&mut self) -> PgWireResult<Option<Row>> {
+    async fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if !self.sorted {
+            self.ensure_sorted().await?;
+        }
         if self.pos >= self.rows.len() {
             return Ok(None);
         }
@@ -426,7 +474,7 @@ impl ExecNode for OrderExec {
         self.pos += 1;
         Ok(Some(row))
     }
-    fn close(&mut self) -> PgWireResult<()> {
+    async fn close(&mut self) -> PgWireResult<()> {
         Ok(())
     }
     fn schema(&self) -> &Schema {
@@ -587,13 +635,14 @@ impl LimitExec {
     }
 }
 
+#[async_trait]
 impl ExecNode for LimitExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        self.child.open()
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.child.open().await
     }
-    fn next(&mut self) -> PgWireResult<Option<Row>> {
+    async fn next(&mut self) -> PgWireResult<Option<Row>> {
         while self.skipped < self.offset {
-            match self.child.next()? {
+            match self.child.next().await? {
                 Some(_) => self.skipped += 1,
                 None => return Ok(None),
             }
@@ -603,7 +652,7 @@ impl ExecNode for LimitExec {
                 return Ok(None);
             }
         }
-        match self.child.next()? {
+        match self.child.next().await? {
             Some(r) => {
                 if let Some(rem) = &mut self.remaining {
                     *rem -= 1;
@@ -613,8 +662,8 @@ impl ExecNode for LimitExec {
             None => Ok(None),
         }
     }
-    fn close(&mut self) -> PgWireResult<()> {
-        self.child.close()
+    async fn close(&mut self) -> PgWireResult<()> {
+        self.child.close().await
     }
     fn schema(&self) -> &Schema {
         &self.schema

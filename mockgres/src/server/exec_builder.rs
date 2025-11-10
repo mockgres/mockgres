@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use pgwire::error::PgWireResult;
 
-use crate::db::{Db, LockOwner};
+use crate::db::{Db, LockHandle, LockOwner};
 use crate::engine::{
     CountExec, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec, OrderExec,
     Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet,
@@ -157,8 +158,18 @@ pub fn build_executor(
                 .current_epoch()
                 .ok_or_else(|| fe("FOR UPDATE requires an active transaction"))?;
             let owner = LockOwner::new(session.id(), epoch);
-            let exec =
-                LockApplyExec::new(schema.clone(), child, *lock, *row_id_idx, owner, db.clone());
+            let lock_handle = {
+                let db_read = db.read();
+                db_read.lock_handle()
+            };
+            let exec = LockApplyExec::new(
+                schema.clone(),
+                child,
+                *lock,
+                *row_id_idx,
+                owner,
+                lock_handle,
+            );
             Ok((Box::new(exec), None, None))
         }
 
@@ -266,7 +277,7 @@ pub fn build_executor(
                     schema.clone(),
                     left_exec,
                     right_exec,
-                )?),
+                )),
                 None,
                 out_cnt,
             ))
@@ -698,7 +709,12 @@ struct LockApplyExec {
     lock_spec: LockSpec,
     row_id_idx: usize,
     owner: LockOwner,
-    db: Arc<parking_lot::RwLock<Db>>,
+    locks: LockHandle,
+}
+
+enum AcquireOutcome {
+    Acquired,
+    Skipped,
 }
 
 impl LockApplyExec {
@@ -708,7 +724,7 @@ impl LockApplyExec {
         lock_spec: LockSpec,
         row_id_idx: usize,
         owner: LockOwner,
-        db: Arc<parking_lot::RwLock<Db>>,
+        locks: LockHandle,
     ) -> Self {
         Self {
             schema,
@@ -716,19 +732,20 @@ impl LockApplyExec {
             lock_spec,
             row_id_idx,
             owner,
-            db,
+            locks,
         }
     }
 }
 
+#[async_trait]
 impl ExecNode for LockApplyExec {
-    fn open(&mut self) -> PgWireResult<()> {
-        self.child.open()
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.child.open().await
     }
 
-    fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
+    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
         loop {
-            let Some(mut row) = self.child.next()? else {
+            let Some(mut row) = self.child.next().await? else {
                 return Ok(None);
             };
             if row.len() <= self.row_id_idx {
@@ -742,25 +759,36 @@ impl ExecNode for LockApplyExec {
                 return Err(fe("row identifier cannot be negative"));
             }
             let row_id = raw_id as RowId;
-            let acquired = {
-                let db_read = self.db.read();
-                db_read.lock_row(
-                    self.lock_spec.target,
-                    row_id,
-                    self.owner,
-                    self.lock_spec.skip_locked,
-                )
+            let acquire_result = if self.lock_spec.skip_locked {
+                self.locks
+                    .lock_row_skip_locked(self.lock_spec.target, row_id, self.owner)
+                    .map(|acquired| {
+                        if acquired {
+                            AcquireOutcome::Acquired
+                        } else {
+                            AcquireOutcome::Skipped
+                        }
+                    })
+            } else if self.lock_spec.nowait {
+                self.locks
+                    .lock_row_nowait(self.lock_spec.target, row_id, self.owner)
+                    .map(|_| AcquireOutcome::Acquired)
+            } else {
+                self.locks
+                    .lock_row_blocking(self.lock_spec.target, row_id, self.owner)
+                    .await
+                    .map(|_| AcquireOutcome::Acquired)
             };
-            match acquired {
-                Ok(true) => return Ok(Some(row)),
-                Ok(false) => continue,
+            match acquire_result {
+                Ok(AcquireOutcome::Acquired) => return Ok(Some(row)),
+                Ok(AcquireOutcome::Skipped) => continue,
                 Err(e) => return Err(map_db_err(e)),
             }
         }
     }
 
-    fn close(&mut self) -> PgWireResult<()> {
-        self.child.close()
+    async fn close(&mut self) -> PgWireResult<()> {
+        self.child.close().await
     }
 
     fn schema(&self) -> &Schema {

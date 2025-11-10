@@ -1,5 +1,8 @@
 mod common;
 
+use tokio::time::{Duration, sleep};
+use tokio_postgres::error::SqlState;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn for_update_skip_locked_splits_between_sessions() {
     let ctx = common::start().await;
@@ -130,6 +133,94 @@ async fn update_conflicts_with_locked_row() {
         .execute("rollback", &[])
         .await
         .expect("rollback locker");
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn for_update_nowait_errors_immediately() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute("create table locks(id int primary key)", &[])
+        .await
+        .expect("create locks");
+    ctx.client
+        .execute("insert into locks values (1)", &[])
+        .await
+        .expect("seed locks");
+
+    let other = ctx.new_client().await;
+
+    ctx.client
+        .execute("begin", &[])
+        .await
+        .expect("begin locker");
+    ctx.client
+        .query("select id from locks for update", &[])
+        .await
+        .expect("lock row");
+
+    let err = other
+        .query("select id from locks for update nowait", &[])
+        .await
+        .expect_err("NOWAIT should error");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::LOCK_NOT_AVAILABLE),
+        "expected 55P03"
+    );
+
+    ctx.client
+        .execute("rollback", &[])
+        .await
+        .expect("rollback locker");
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn for_update_blocks_until_row_is_free() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute("create table blocking(id int primary key)", &[])
+        .await
+        .expect("create blocking");
+    ctx.client
+        .execute("insert into blocking values (1)", &[])
+        .await
+        .expect("seed blocking");
+    let blocked_client = ctx.new_client().await;
+
+    ctx.client
+        .execute("begin", &[])
+        .await
+        .expect("begin holder");
+    ctx.client
+        .query("select id from blocking for update", &[])
+        .await
+        .expect("lock row");
+
+    let runner = tokio::spawn(async move {
+        blocked_client
+            .query("select id from blocking for update", &[])
+            .await
+    });
+
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !runner.is_finished(),
+        "second FOR UPDATE should block while lock held"
+    );
+
+    ctx.client
+        .execute("commit", &[])
+        .await
+        .expect("commit holder");
+
+    let rows = runner
+        .await
+        .expect("join spawned query")
+        .expect("blocking select succeeds");
+    assert_eq!(rows.len(), 1, "second reader runs after commit");
+
     let _ = ctx.shutdown.send(());
 }
 

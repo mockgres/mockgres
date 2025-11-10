@@ -10,7 +10,10 @@ use crate::engine::{
     BoolExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr, UpdateSet,
     Value, fe,
 };
-use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
+use crate::types::{
+    parse_bytea_text, parse_date_str, parse_timestamp_str, postgres_days_to_date,
+    postgres_micros_to_timestamp,
+};
 
 use super::mapping::{map_datatype_to_pg_type, map_pg_type_to_datatype};
 
@@ -410,8 +413,21 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
             Ok(Value::Text(s.to_string()))
         }
         DataType::Bytea => Ok(Value::Bytes(bytes.to_vec())),
-        DataType::Date | DataType::Timestamp => {
-            Err(fe("binary parameters for date/timestamp not supported"))
+        DataType::Date => {
+            let arr: [u8; 4] = bytes
+                .try_into()
+                .map_err(|_| fe("binary date must be 4 bytes"))?;
+            let pg_days = i32::from_be_bytes(arr);
+            let days = postgres_days_to_date(pg_days);
+            Ok(Value::Date(days))
+        }
+        DataType::Timestamp => {
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| fe("binary timestamp must be 8 bytes"))?;
+            let pg_micros = i64::from_be_bytes(arr);
+            let micros = postgres_micros_to_timestamp(pg_micros);
+            Ok(Value::TimestampMicros(micros))
         }
     }
 }

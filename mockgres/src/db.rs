@@ -8,6 +8,8 @@ use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
 use crate::txn::{TxId, VisibilityContext};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
 pub enum CellInput {
@@ -24,7 +26,7 @@ pub struct Db {
     pub catalog: Catalog,
     pub tables: HashMap<TableId, Table>,
     pub next_tid: u64,
-    locks: LockRegistry,
+    locks: Arc<LockRegistry>,
 }
 
 impl Default for Db {
@@ -35,7 +37,7 @@ impl Default for Db {
             catalog,
             tables: HashMap::new(),
             next_tid: 1,
-            locks: LockRegistry::new(),
+            locks: Arc::new(LockRegistry::new()),
         }
     }
 }
@@ -55,6 +57,7 @@ impl LockOwner {
 #[derive(Debug)]
 struct LockRegistry {
     inner: Mutex<LockState>,
+    notify: Notify,
 }
 
 #[derive(Debug)]
@@ -70,31 +73,59 @@ impl LockRegistry {
                 holders: HashMap::new(),
                 owned: HashMap::new(),
             }),
+            notify: Notify::new(),
         }
     }
 
-    fn acquire(
-        &self,
-        key: (TableId, RowId),
-        owner: LockOwner,
-        skip_locked: bool,
-    ) -> anyhow::Result<bool> {
+    fn acquire_skip_locked(&self, key: (TableId, RowId), owner: LockOwner) -> anyhow::Result<bool> {
         let mut state = self.inner.lock();
         if let Some(existing) = state.holders.get(&key) {
             if *existing == owner {
                 return Ok(true);
             }
-            if skip_locked {
-                return Ok(false);
-            }
-            return Err(sql_err(
-                "55P03",
-                "could not obtain lock on target row (locked by another transaction)",
-            ));
+            return Ok(false);
         }
         state.holders.insert(key, owner);
         state.owned.entry(owner).or_default().insert(key);
         Ok(true)
+    }
+
+    fn acquire_nowait(&self, key: (TableId, RowId), owner: LockOwner) -> anyhow::Result<()> {
+        let mut state = self.inner.lock();
+        if let Some(existing) = state.holders.get(&key) {
+            if *existing == owner {
+                return Ok(());
+            }
+            return Err(sql_err(
+                "55P03",
+                "could not obtain lock on target row (NOWAIT)",
+            ));
+        }
+        state.holders.insert(key, owner);
+        state.owned.entry(owner).or_default().insert(key);
+        Ok(())
+    }
+
+    async fn acquire_blocking(
+        &self,
+        key: (TableId, RowId),
+        owner: LockOwner,
+    ) -> anyhow::Result<()> {
+        loop {
+            {
+                let mut state = self.inner.lock();
+                match state.holders.get(&key) {
+                    Some(existing) if *existing == owner => return Ok(()),
+                    Some(_) => {}
+                    None => {
+                        state.holders.insert(key, owner);
+                        state.owned.entry(owner).or_default().insert(key);
+                        return Ok(());
+                    }
+                }
+            }
+            self.notify.notified().await;
+        }
     }
 
     fn release_owner(&self, owner: LockOwner) {
@@ -108,6 +139,45 @@ impl LockRegistry {
                 }
             }
         }
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone)]
+pub struct LockHandle {
+    inner: Arc<LockRegistry>,
+}
+
+impl LockHandle {
+    fn new(inner: Arc<LockRegistry>) -> Self {
+        Self { inner }
+    }
+
+    pub fn lock_row_skip_locked(
+        &self,
+        table_id: TableId,
+        row_id: RowId,
+        owner: LockOwner,
+    ) -> anyhow::Result<bool> {
+        self.inner.acquire_skip_locked((table_id, row_id), owner)
+    }
+
+    pub fn lock_row_nowait(
+        &self,
+        table_id: TableId,
+        row_id: RowId,
+        owner: LockOwner,
+    ) -> anyhow::Result<()> {
+        self.inner.acquire_nowait((table_id, row_id), owner)
+    }
+
+    pub async fn lock_row_blocking(
+        &self,
+        table_id: TableId,
+        row_id: RowId,
+        owner: LockOwner,
+    ) -> anyhow::Result<()> {
+        self.inner.acquire_blocking((table_id, row_id), owner).await
     }
 }
 impl Db {
@@ -115,14 +185,8 @@ impl Db {
         self.locks.release_owner(owner);
     }
 
-    pub fn lock_row(
-        &self,
-        table_id: TableId,
-        row_id: RowId,
-        owner: LockOwner,
-        skip_locked: bool,
-    ) -> anyhow::Result<bool> {
-        self.locks.acquire((table_id, row_id), owner, skip_locked)
+    pub fn lock_handle(&self) -> LockHandle {
+        LockHandle::new(Arc::clone(&self.locks))
     }
 
     pub fn create_table(
@@ -857,6 +921,7 @@ impl Db {
             .tables
             .remove(&meta.id)
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", meta.id)))?;
+        let lock_handle = self.lock_handle();
         let result = (|| {
             if sets.is_empty() {
                 return Ok((0, Vec::new(), Vec::new(), Vec::new()));
@@ -943,7 +1008,7 @@ impl Db {
                         continue;
                     };
                     let row_id = row_key_to_row_id(&pending_update.key)?;
-                    self.lock_row(meta.id, row_id, lock_owner, false)?;
+                    lock_handle.lock_row_nowait(meta.id, row_id, lock_owner)?;
                     if versions[idx].xmax.is_some() {
                         continue;
                     }
@@ -1211,6 +1276,7 @@ impl Db {
         lock_owner: LockOwner,
     ) -> anyhow::Result<Vec<RowPointer>> {
         let mut table_cache: HashMap<TableId, Table> = HashMap::new();
+        let lock_handle = self.lock_handle();
         let result = (|| {
             let mut touched_ptrs = Vec::with_capacity(plan.len());
             for target in plan {
@@ -1230,7 +1296,7 @@ impl Db {
                 };
                 if let Some(versions) = table_entry.rows_by_key.get_mut(&target.row_key) {
                     if let Some(idx) = select_visible_version_idx(versions, visibility) {
-                        self.lock_row(target.meta.id, target.row_id, lock_owner, false)?;
+                        lock_handle.lock_row_nowait(target.meta.id, target.row_id, lock_owner)?;
                         if versions[idx].xmax.is_some() {
                             continue;
                         }

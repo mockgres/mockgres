@@ -128,12 +128,14 @@ pub enum LockMode {
 pub struct LockRequest {
     pub mode: LockMode,
     pub skip_locked: bool,
+    pub nowait: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LockSpec {
     pub mode: LockMode,
     pub skip_locked: bool,
+    pub nowait: bool,
     pub target: TableId,
 }
 
