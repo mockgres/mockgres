@@ -110,15 +110,14 @@ impl SimpleQueryHandler for Mockgres {
                 )?;
                 let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text)?;
                 let mut qr = QueryResponse::new(fields, rows);
-                if let Some(t) = tag {
-                    // explicit tag from executor (e.g., insert)
-                    qr.set_command_tag(&t);
+                let tag_text = if let Some(t) = tag {
+                    t
                 } else if let Some(n) = row_count {
-                    // dynamic select row count
-                    qr.set_command_tag(&format!("SELECT {}", n));
+                    format!("{} {}", command_tag(&bound), n)
                 } else {
-                    qr.set_command_tag(command_tag(&bound));
-                }
+                    command_tag(&bound).to_string()
+                };
+                qr.set_command_tag(&tag_text);
                 Ok(vec![Response::Query(qr)])
             }
             Err(e) => Err(e),
@@ -203,13 +202,14 @@ impl ExtendedQueryHandler for Mockgres {
         )?;
         let (fields, rows) = to_pgwire_stream(exec, fmt)?;
         let mut qr = QueryResponse::new(fields, rows);
-        if let Some(t) = tag {
-            qr.set_command_tag(&t);
+        let tag_text = if let Some(t) = tag {
+            t
         } else if let Some(n) = row_count {
-            qr.set_command_tag(&format!("SELECT {}", n));
+            format!("{} {}", command_tag(&bound), n)
         } else {
-            qr.set_command_tag(command_tag(&bound));
-        }
+            command_tag(&bound).to_string()
+        };
+        qr.set_command_tag(&tag_text);
         Ok(Response::Query(qr))
     }
 }

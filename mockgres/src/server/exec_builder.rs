@@ -26,7 +26,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Limit { .. }
         | Plan::LockRows { .. }
         | Plan::UnboundJoin { .. }
-        | Plan::Join { .. } => "SELECT 0",
+        | Plan::Join { .. } => "SELECT",
 
         Plan::CreateTable { .. } => "CREATE TABLE",
         Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
@@ -35,10 +35,10 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::DropTable { .. } => "DROP TABLE",
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
-        Plan::InsertValues { .. } => "INSERT 0",
-        Plan::Update { .. } => "UPDATE 0",
-        Plan::Delete { .. } => "DELETE 0",
-        Plan::UnboundSeqScan { .. } => "SELECT 0",
+        Plan::InsertValues { .. } => "INSERT",
+        Plan::Update { .. } => "UPDATE",
+        Plan::Delete { .. } => "DELETE",
+        Plan::UnboundSeqScan { .. } => "SELECT",
         Plan::BeginTransaction => "BEGIN",
         Plan::CommitTransaction => "COMMIT",
         Plan::RollbackTransaction => "ROLLBACK",
