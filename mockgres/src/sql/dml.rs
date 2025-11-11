@@ -1,3 +1,4 @@
+use crate::catalog::{SchemaName, TableId};
 use crate::engine::{
     DataType, Field, InsertSource, LockMode, LockRequest, LockSpec, ObjName, Plan, ReturningClause,
     ReturningExpr, ScalarExpr, Schema, Selection, SortKey, UpdateSet, Value, fe, fe_code,
@@ -13,7 +14,6 @@ use super::expr::{
     collect_columns_from_bool_expr, collect_columns_from_scalar_expr, derive_expr_name,
     last_colref_name, parse_bool_expr, parse_scalar_expr,
 };
-use super::tokens::parse_numeric_const;
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     if sel.from_clause.is_empty() {
@@ -126,7 +126,10 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
                 mode: req.mode,
                 skip_locked: req.skip_locked,
                 nowait: req.nowait,
-                target: 0,
+                target: TableId {
+                    schema_id: 0,
+                    rel_id: 0,
+                },
             },
             row_id_idx: 0,
             schema: Schema { fields: vec![] },
@@ -267,9 +270,7 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
     if tl.is_empty() {
         return Err(fe("at least one column required"));
     }
-    let mut out_fields = Vec::with_capacity(tl.len());
     let mut out_exprs = Vec::with_capacity(tl.len());
-
     for t in tl {
         let tgt = t.node.as_ref().ok_or_else(|| fe("unexpected target"))?;
         let NodeEnum::ResTarget(rt) = tgt else {
@@ -280,52 +281,34 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or_else(|| fe("missing expr"))?;
-        let lit = parse_numeric_const(expr_node)?;
-        let (dt, expr) = match lit {
-            Value::Int64(i) => {
-                let dt = if (i32::MIN as i64..=i32::MAX as i64).contains(&i) {
-                    DataType::Int4
-                } else {
-                    DataType::Int8
-                };
-                (dt, ScalarExpr::Literal(Value::Int64(i)))
-            }
-            Value::Float64Bits(b) => (DataType::Float8, ScalarExpr::Literal(Value::Float64Bits(b))),
-            Value::Null => return Err(fe("null not allowed here")),
-            _ => return Err(fe("only numeric literals supported here")),
-        };
+        let expr = parse_scalar_expr(expr_node)?;
         let name = if rt.name.is_empty() {
-            "?column?".to_string()
+            derive_expr_name(&expr)
         } else {
             rt.name.clone()
         };
-        out_fields.push(Field {
-            name: name.clone(),
-            data_type: dt,
-        });
         out_exprs.push((expr, name));
     }
-
     let input = Plan::Values {
         rows: vec![vec![]],
         schema: Schema { fields: vec![] },
     };
-    let out_schema = Schema { fields: out_fields };
     Ok(Plan::Projection {
         input: Box::new(input),
         exprs: out_exprs,
-        schema: out_schema,
+        schema: Schema { fields: vec![] },
     })
 }
 
 pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
     let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname))
+    };
     let table = ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname)
-        },
+        schema,
         name: rv.relname,
     };
     let insert_columns = parse_insert_columns(&ins.cols)?;
@@ -365,12 +348,13 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
 
 pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
     let rv = upd.relation.ok_or_else(|| fe("missing target table"))?;
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname))
+    };
     let table = ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname)
-        },
+        schema,
         name: rv.relname,
     };
 
@@ -413,12 +397,13 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
 
 pub fn plan_delete(del: DeleteStmt) -> PgWireResult<Plan> {
     let rv = del.relation.ok_or_else(|| fe("missing target table"))?;
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname))
+    };
     let table = ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname)
-        },
+        schema,
         name: rv.relname,
     };
     let filter = if let Some(w) = del.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
@@ -537,12 +522,13 @@ fn parse_returning_clause(
 fn parse_range_var(node: pg_query::Node) -> PgWireResult<ObjName> {
     let from = node.node.ok_or_else(|| fe("missing from"))?;
     if let NodeEnum::RangeVar(rv) = from {
+        let schema = if rv.schemaname.is_empty() {
+            None
+        } else {
+            Some(SchemaName::new(rv.schemaname))
+        };
         Ok(ObjName {
-            schema: if rv.schemaname.is_empty() {
-                None
-            } else {
-                Some(rv.schemaname)
-            },
+            schema,
             name: rv.relname,
         })
     } else {

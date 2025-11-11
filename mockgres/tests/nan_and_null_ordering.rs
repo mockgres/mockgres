@@ -1,7 +1,7 @@
 mod common;
 
-use tokio_postgres::error::SqlState;
 use tokio_postgres::Row;
+use tokio_postgres::error::SqlState;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn nan_equality_and_comparison_via_filters() {

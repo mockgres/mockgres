@@ -1,25 +1,32 @@
 use std::collections::HashSet;
 
+use crate::catalog::SchemaId;
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, Field, InsertSource, LockSpec, Plan, ReturningClause, ReturningExpr,
-    ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError, UpdateSet, Value,
-    fe, fe_code,
+    BoolExpr, DataType, Field, InsertSource, LockSpec, ObjName, Plan, ReturningClause,
+    ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError,
+    UpdateSet, Value, fe, fe_code,
 };
+use crate::session::Session;
 use anyhow::Error;
-use pgwire::error::PgWireError;
+use pgwire::error::{PgWireError, PgWireResult};
 
-pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
+pub fn bind(db: &Db, session: &Session, p: Plan) -> PgWireResult<Plan> {
+    let search_path = session.search_path();
+    bind_with_search_path(db, &search_path, p)
+}
+
+fn bind_with_search_path(db: &Db, search_path: &[SchemaId], p: Plan) -> PgWireResult<Plan> {
     match p {
         Plan::UnboundSeqScan {
-            table,
+            mut table,
             selection,
             lock,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            let tm = db
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_catalog_err)?;
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
 
             // build (idx, Field) for executor + compose output schema
             let cols: Vec<(usize, Field)> = match selection {
@@ -83,8 +90,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
         Plan::UnboundJoin { left, right } => {
-            let left_bound = bind(db, *left)?;
-            let right_bound = bind(db, *right)?;
+            let left_bound = bind_with_search_path(db, search_path, *left)?;
+            let right_bound = bind_with_search_path(db, search_path, *right)?;
             let mut fields = left_bound.schema().fields.clone();
             fields.extend(right_bound.schema().fields.clone());
             Ok(Plan::Join {
@@ -99,11 +106,11 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             exprs,
             schema: _,
         } => {
-            let child = bind(db, *input)?;
+            let child = bind_with_search_path(db, search_path, *input)?;
             let mut bound_exprs = Vec::with_capacity(exprs.len());
             let mut fields = Vec::with_capacity(exprs.len());
             for (expr, name) in exprs {
-                let bound = bind_scalar_expr(&expr, child.schema(), None)?;
+                let bound = bind_scalar_expr(&expr, child.schema(), None, db, search_path)?;
                 let dt = scalar_expr_type(&bound, child.schema()).unwrap_or(DataType::Text);
                 fields.push(Field {
                     name: name.clone(),
@@ -119,20 +126,20 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
         }
 
         Plan::CountRows { input, schema } => {
-            let child = bind(db, *input)?;
+            let child = bind_with_search_path(db, search_path, *input)?;
             Ok(Plan::CountRows {
                 input: Box::new(child),
                 schema,
             })
         }
         Plan::LockRows {
-            table,
+            mut table,
             input,
             lock,
             row_id_idx: _,
             schema: _,
         } => {
-            let bound_child = bind(db, *input)?;
+            let bound_child = bind_with_search_path(db, search_path, *input)?;
             let child_schema = bound_child.schema().clone();
             if child_schema.fields.is_empty() {
                 return Err(fe("FOR UPDATE requires row identifier column"));
@@ -143,10 +150,10 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             let schema = Schema {
                 fields: visible_fields,
             };
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            let tm = db
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_catalog_err)?;
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
             Ok(Plan::LockRows {
                 table,
                 input: Box::new(bound_child),
@@ -167,8 +174,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             expr,
             project_prefix_len,
         } => {
-            let child = bind(db, *input)?;
-            let bound_expr = bind_bool_expr(&expr, child.schema())?;
+            let child = bind_with_search_path(db, search_path, *input)?;
+            let bound_expr = bind_bool_expr(&expr, child.schema(), db, search_path)?;
             let mut plan = Plan::Filter {
                 input: Box::new(child),
                 expr: bound_expr,
@@ -192,16 +199,16 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             Ok(plan)
         }
         Plan::Update {
-            table,
+            mut table,
             sets,
             filter,
             mut returning,
             mut returning_schema,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            let tm = db
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_catalog_err)?;
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
             let schema = Schema {
                 fields: tm
                     .columns
@@ -217,7 +224,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 match set {
                     UpdateSet::ByIndex(idx, expr) => {
                         let hint = schema.field(idx).data_type.clone();
-                        let bound_expr = bind_scalar_expr(&expr, &schema, Some(&hint))?;
+                        let bound_expr =
+                            bind_scalar_expr(&expr, &schema, Some(&hint), db, search_path)?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
                     UpdateSet::ByName(name, expr) => {
@@ -229,17 +237,18 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                                     fe_code("42703", format!("unknown column in UPDATE: {name}"))
                                 })?;
                         let hint = schema.field(idx).data_type.clone();
-                        let bound_expr = bind_scalar_expr(&expr, &schema, Some(&hint))?;
+                        let bound_expr =
+                            bind_scalar_expr(&expr, &schema, Some(&hint), db, search_path)?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
                 }
             }
             let bound_filter = match filter {
-                Some(f) => Some(bind_bool_expr(&f, &schema)?),
+                Some(f) => Some(bind_bool_expr(&f, &schema, db, search_path)?),
                 None => None,
             };
             returning_schema = match returning.as_mut() {
-                Some(clause) => Some(bind_returning_clause(clause, &schema)?),
+                Some(clause) => Some(bind_returning_clause(clause, &schema, db, search_path)?),
                 None => None,
             };
             Ok(Plan::Update {
@@ -251,15 +260,15 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
         Plan::Delete {
-            table,
+            mut table,
             filter,
             mut returning,
             mut returning_schema,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            let tm = db
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_catalog_err)?;
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
             let schema = Schema {
                 fields: tm
                     .columns
@@ -271,11 +280,11 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                     .collect(),
             };
             let bound_filter = match filter {
-                Some(f) => Some(bind_bool_expr(&f, &schema)?),
+                Some(f) => Some(bind_bool_expr(&f, &schema, db, search_path)?),
                 None => None,
             };
             returning_schema = match returning.as_mut() {
-                Some(clause) => Some(bind_returning_clause(clause, &schema)?),
+                Some(clause) => Some(bind_returning_clause(clause, &schema, db, search_path)?),
                 None => None,
             };
             Ok(Plan::Delete {
@@ -286,7 +295,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
         Plan::Order { input, keys } => {
-            let child = bind(db, *input)?;
+            let child = bind_with_search_path(db, search_path, *input)?;
             let child_schema = child.schema().clone();
             let mut bound_keys = Vec::with_capacity(keys.len());
             for key in keys {
@@ -312,7 +321,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                         asc,
                         nulls_first,
                     } => {
-                        let bound = bind_scalar_expr(&expr, &child_schema, None)?;
+                        let bound = bind_scalar_expr(&expr, &child_schema, None, db, search_path)?;
                         bound_keys.push(SortKey::Expr {
                             expr: bound,
                             asc,
@@ -332,7 +341,7 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             limit,
             offset,
         } => {
-            let child = bind(db, *input)?;
+            let child = bind_with_search_path(db, search_path, *input)?;
             Ok(Plan::Limit {
                 input: Box::new(child),
                 limit,
@@ -340,16 +349,16 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
             })
         }
         Plan::InsertValues {
-            table,
+            mut table,
             columns,
             rows,
             mut returning,
             mut returning_schema,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            let tm = db
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_catalog_err)?;
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
             let table_schema = Schema {
                 fields: tm
                     .columns
@@ -414,7 +423,8 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                                 | DataType::Bytea => Some(&field.data_type),
                                 _ => None,
                             };
-                            let bound = bind_scalar_expr(&expr, &table_schema, hint)?;
+                            let bound =
+                                bind_scalar_expr(&expr, &table_schema, hint, db, search_path)?;
                             bound_row.push(InsertSource::Expr(bound));
                         }
                     }
@@ -422,7 +432,12 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
                 bound_rows.push(bound_row);
             }
             returning_schema = match returning.as_mut() {
-                Some(clause) => Some(bind_returning_clause(clause, &table_schema)?),
+                Some(clause) => Some(bind_returning_clause(
+                    clause,
+                    &table_schema,
+                    db,
+                    search_path,
+                )?),
                 None => None,
             };
             Ok(Plan::InsertValues {
@@ -438,9 +453,45 @@ pub fn bind(db: &Db, p: Plan) -> pgwire::error::PgWireResult<Plan> {
     }
 }
 
+fn resolve_table_meta<'a>(
+    db: &'a Db,
+    search_path: &[SchemaId],
+    table: &ObjName,
+) -> anyhow::Result<&'a crate::catalog::TableMeta> {
+    if let Some(schema) = &table.schema {
+        db.resolve_table(schema.as_str(), &table.name)
+    } else {
+        db.resolve_table_in_search_path(search_path, &table.name)
+    }
+}
+
+fn current_schema_name(db: &Db, search_path: &[SchemaId]) -> String {
+    for schema_id in search_path {
+        if let Some(entry) = db.catalog.schemas.get(schema_id) {
+            return entry.name.as_str().to_string();
+        }
+    }
+    "public".to_string()
+}
+
+fn schema_names_for_path(db: &Db, search_path: &[SchemaId]) -> Vec<String> {
+    let mut names = Vec::new();
+    for schema_id in search_path {
+        if let Some(entry) = db.catalog.schemas.get(schema_id) {
+            names.push(entry.name.as_str().to_string());
+        }
+    }
+    if names.is_empty() {
+        names.push("public".to_string());
+    }
+    names
+}
+
 fn bind_returning_clause(
     clause: &mut ReturningClause,
     schema: &Schema,
+    db: &Db,
+    search_path: &[SchemaId],
 ) -> pgwire::error::PgWireResult<Schema> {
     let mut expanded = Vec::new();
     for item in clause.exprs.drain(..) {
@@ -462,7 +513,7 @@ fn bind_returning_clause(
     let mut fields = Vec::with_capacity(clause.exprs.len());
     for item in clause.exprs.iter_mut() {
         if let ReturningExpr::Expr { expr, alias } = item {
-            let bound = bind_scalar_expr(expr, schema, None)?;
+            let bound = bind_scalar_expr(expr, schema, None, db, search_path)?;
             let dt = scalar_expr_type(&bound, schema).unwrap_or(DataType::Text);
             fields.push(Field {
                 name: alias.clone(),
@@ -474,12 +525,17 @@ fn bind_returning_clause(
     Ok(Schema { fields })
 }
 
-fn bind_bool_expr(expr: &BoolExpr, schema: &Schema) -> pgwire::error::PgWireResult<BoolExpr> {
+fn bind_bool_expr(
+    expr: &BoolExpr,
+    schema: &Schema,
+    db: &Db,
+    search_path: &[SchemaId],
+) -> pgwire::error::PgWireResult<BoolExpr> {
     Ok(match expr {
         BoolExpr::Literal(b) => BoolExpr::Literal(*b),
         BoolExpr::Comparison { lhs, op, rhs } => {
-            let mut lhs_bound = bind_scalar_expr(lhs, schema, None)?;
-            let mut rhs_bound = bind_scalar_expr(rhs, schema, None)?;
+            let mut lhs_bound = bind_scalar_expr(lhs, schema, None, db, search_path)?;
+            let mut rhs_bound = bind_scalar_expr(rhs, schema, None, db, search_path)?;
             let lhs_hint = scalar_expr_type(&lhs_bound, schema);
             let rhs_hint = scalar_expr_type(&rhs_bound, schema);
             apply_param_hint(&mut lhs_bound, rhs_hint.as_ref());
@@ -493,18 +549,20 @@ fn bind_bool_expr(expr: &BoolExpr, schema: &Schema) -> pgwire::error::PgWireResu
         BoolExpr::And(exprs) => BoolExpr::And(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema))
+                .map(|e| bind_bool_expr(e, schema, db, search_path))
                 .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
         ),
         BoolExpr::Or(exprs) => BoolExpr::Or(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema))
+                .map(|e| bind_bool_expr(e, schema, db, search_path))
                 .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
         ),
-        BoolExpr::Not(inner) => BoolExpr::Not(Box::new(bind_bool_expr(inner, schema)?)),
+        BoolExpr::Not(inner) => {
+            BoolExpr::Not(Box::new(bind_bool_expr(inner, schema, db, search_path)?))
+        }
         BoolExpr::IsNull { expr, negated } => BoolExpr::IsNull {
-            expr: bind_scalar_expr(expr, schema, None)?,
+            expr: bind_scalar_expr(expr, schema, None, db, search_path)?,
             negated: *negated,
         },
     })
@@ -514,6 +572,8 @@ fn bind_scalar_expr(
     expr: &ScalarExpr,
     schema: &Schema,
     hint: Option<&DataType>,
+    db: &Db,
+    search_path: &[SchemaId],
 ) -> pgwire::error::PgWireResult<ScalarExpr> {
     Ok(match expr {
         ScalarExpr::Literal(v) => ScalarExpr::Literal(v.clone()),
@@ -541,24 +601,48 @@ fn bind_scalar_expr(
         },
         ScalarExpr::BinaryOp { op, left, right } => ScalarExpr::BinaryOp {
             op: *op,
-            left: Box::new(bind_scalar_expr(left, schema, hint)?),
-            right: Box::new(bind_scalar_expr(right, schema, hint)?),
+            left: Box::new(bind_scalar_expr(left, schema, hint, db, search_path)?),
+            right: Box::new(bind_scalar_expr(right, schema, hint, db, search_path)?),
         },
         ScalarExpr::UnaryOp { op, expr } => ScalarExpr::UnaryOp {
             op: *op,
-            expr: Box::new(bind_scalar_expr(expr, schema, hint)?),
+            expr: Box::new(bind_scalar_expr(expr, schema, hint, db, search_path)?),
         },
         ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
-            expr: Box::new(bind_scalar_expr(expr, schema, Some(ty))?),
+            expr: Box::new(bind_scalar_expr(expr, schema, Some(ty), db, search_path)?),
             ty: ty.clone(),
         },
-        ScalarExpr::Func { func, args } => ScalarExpr::Func {
-            func: *func,
-            args: args
+        ScalarExpr::Func { func, args } => {
+            let bound_args = args
                 .iter()
-                .map(|a| bind_scalar_expr(a, schema, hint))
-                .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
-        },
+                .map(|a| bind_scalar_expr(a, schema, hint, db, search_path))
+                .collect::<pgwire::error::PgWireResult<Vec<_>>>()?;
+            match func {
+                ScalarFunc::CurrentSchema => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("current_schema() takes no arguments"));
+                    }
+                    ScalarExpr::Literal(Value::Text(current_schema_name(db, search_path)))
+                }
+                ScalarFunc::CurrentSchemas => {
+                    if bound_args.len() != 1 {
+                        return Err(fe("current_schemas(boolean) requires one argument"));
+                    }
+                    match &bound_args[0] {
+                        ScalarExpr::Literal(Value::Bool(_)) => {
+                            let names = schema_names_for_path(db, search_path);
+                            let array_text = format!("{{{}}}", names.join(","));
+                            ScalarExpr::Literal(Value::Text(array_text))
+                        }
+                        _ => return Err(fe("current_schemas argument must be boolean literal")),
+                    }
+                }
+                _ => ScalarExpr::Func {
+                    func: *func,
+                    args: bound_args,
+                },
+            }
+        }
     })
 }
 
@@ -607,7 +691,10 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
         ScalarExpr::UnaryOp { expr, .. } => scalar_expr_type(expr.as_ref(), schema),
         ScalarExpr::Cast { ty, .. } => Some(ty.clone()),
         ScalarExpr::Func { func, args } => match func {
-            ScalarFunc::Upper | ScalarFunc::Lower => Some(DataType::Text),
+            ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::CurrentSchema => {
+                Some(DataType::Text)
+            }
+            ScalarFunc::CurrentSchemas => Some(DataType::Text),
             ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::Coalesce => args
                 .iter()

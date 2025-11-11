@@ -3,11 +3,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pgwire::error::PgWireResult;
 
+use crate::catalog::{SchemaId, SchemaName};
 use crate::db::{Db, LockHandle, LockOwner};
 use crate::engine::{
-    CountExec, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec, OrderExec,
-    Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet,
-    Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    CountExec, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec, ObjName,
+    OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec,
+    UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::session::{RowPointer, Session};
 use crate::storage::{Row, RowId};
@@ -15,6 +16,108 @@ use crate::txn::{TransactionManager, TxId, TxnStatus, VisibilityContext};
 
 use super::errors::map_db_err;
 use super::insert::evaluate_insert_source;
+
+fn schema_or_public(schema: &Option<SchemaName>) -> &str {
+    schema.as_ref().map(|s| s.as_str()).unwrap_or("public")
+}
+
+fn resolve_table_schema(
+    db: &Db,
+    session: &Session,
+    table: &ObjName,
+) -> PgWireResult<Option<String>> {
+    if let Some(schema) = &table.schema {
+        if db.catalog.schema_entry(schema.as_str()).is_none() {
+            return Err(fe_code(
+                "3F000",
+                format!("schema \"{}\" does not exist", schema.as_str()),
+            ));
+        }
+        if db.catalog.get_table(schema.as_str(), &table.name).is_some() {
+            return Ok(Some(schema.as_str().to_string()));
+        }
+        return Ok(None);
+    }
+    let search_path = session.search_path();
+    for schema_id in search_path {
+        if let Some(entry) = db.catalog.schemas.get(&schema_id) {
+            if entry.objects.contains_key(&table.name) {
+                return Ok(Some(entry.name.as_str().to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_schema_for_create(
+    db: &Db,
+    session: &Session,
+    explicit: Option<&SchemaName>,
+) -> PgWireResult<String> {
+    if let Some(schema) = explicit {
+        if db.catalog.schema_entry(schema.as_str()).is_none() {
+            return Err(fe_code(
+                "3F000",
+                format!("schema \"{}\" does not exist", schema.as_str()),
+            ));
+        }
+        return Ok(schema.as_str().to_string());
+    }
+    let search_path = session.search_path();
+    if let Some(first) = search_path.first() {
+        if let Some(entry) = db.catalog.schemas.get(first) {
+            return Ok(entry.name.as_str().to_string());
+        } else {
+            return Err(fe_code(
+                "3F000",
+                "first schema in search_path does not exist",
+            ));
+        }
+    }
+    if db.catalog.schema_entry("public").is_some() {
+        return Ok("public".to_string());
+    }
+    Err(fe("no schema available in search_path"))
+}
+
+fn resolve_index_schema(
+    db: &Db,
+    session: &Session,
+    index: &ObjName,
+) -> PgWireResult<Option<String>> {
+    if let Some(schema) = &index.schema {
+        if db.catalog.schema_entry(schema.as_str()).is_none() {
+            return Err(fe_code(
+                "3F000",
+                format!("schema \"{}\" does not exist", schema.as_str()),
+            ));
+        }
+        return Ok(Some(schema.as_str().to_string()));
+    }
+    let search_path = session.search_path();
+    for schema_id in search_path {
+        if schema_contains_index(db, schema_id, &index.name) {
+            if let Some(entry) = db.catalog.schemas.get(&schema_id) {
+                return Ok(Some(entry.name.as_str().to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn schema_contains_index(db: &Db, schema_id: SchemaId, index_name: &str) -> bool {
+    let Some(entry) = db.catalog.schemas.get(&schema_id) else {
+        return false;
+    };
+    for table_id in entry.objects.values() {
+        if let Some(meta) = db.catalog.tables_by_id.get(table_id) {
+            if meta.indexes.iter().any(|idx| idx.name == index_name) {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 pub fn command_tag(plan: &Plan) -> &'static str {
     match plan {
@@ -34,6 +137,9 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
         Plan::DropTable { .. } => "DROP TABLE",
+        Plan::CreateSchema { .. } => "CREATE SCHEMA",
+        Plan::DropSchema { .. } => "DROP SCHEMA",
+        Plan::AlterSchemaRename { .. } => "ALTER SCHEMA",
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
         Plan::InsertValues { .. } => "INSERT",
@@ -112,7 +218,7 @@ pub fn build_executor(
             lock,
         } => {
             let db_read = db.read();
-            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let schema_name = schema_or_public(&table.schema);
             let _tm = db_read
                 .resolve_table(schema_name, &table.name)
                 .map_err(map_db_err)?;
@@ -289,17 +395,23 @@ pub fn build_executor(
             pk,
             foreign_keys,
         } => {
-            let mut db = db.write();
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            db.create_table(
-                schema_name,
-                &table.name,
-                cols.clone(),
-                pk.clone(),
-                foreign_keys.clone(),
-            )
-            .map_err(map_db_err)?;
-            drop(db);
+            let schema_name = {
+                let db_read = db.read();
+                resolve_schema_for_create(&db_read, session, table.schema.as_ref())?
+            };
+            let search_path = session.search_path();
+            let mut db_write = db.write();
+            db_write
+                .create_table(
+                    &schema_name,
+                    &table.name,
+                    cols.clone(),
+                    pk.clone(),
+                    foreign_keys.clone(),
+                    &search_path,
+                )
+                .map_err(map_db_err)?;
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("CREATE TABLE".into()),
@@ -312,11 +424,18 @@ pub fn build_executor(
             column,
             if_not_exists,
         } => {
-            let mut db = db.write();
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            db.alter_table_add_column(schema_name, &table.name, column.clone(), *if_not_exists)
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .alter_table_add_column(&schema_name, &table.name, column.clone(), *if_not_exists)
                 .map_err(map_db_err)?;
-            drop(db);
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("ALTER TABLE".into()),
@@ -329,11 +448,27 @@ pub fn build_executor(
             column,
             if_exists,
         } => {
-            let mut db = db.write();
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            db.alter_table_drop_column(schema_name, &table.name, column, *if_exists)
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => {
+                        if *if_exists {
+                            return Ok((
+                                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                                Some("ALTER TABLE".into()),
+                                None,
+                            ));
+                        }
+                        return Err(fe_code("42P01", format!("no such table {}", table.name)));
+                    }
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .alter_table_drop_column(&schema_name, &table.name, column, *if_exists)
                 .map_err(map_db_err)?;
-            drop(db);
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("ALTER TABLE".into()),
@@ -347,17 +482,24 @@ pub fn build_executor(
             columns,
             if_not_exists,
         } => {
-            let mut db = db.write();
-            let schema_name = table.schema.as_deref().unwrap_or("public");
-            db.create_index(
-                schema_name,
-                &table.name,
-                name,
-                columns.clone(),
-                *if_not_exists,
-            )
-            .map_err(map_db_err)?;
-            drop(db);
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .create_index(
+                    &schema_name,
+                    &table.name,
+                    name,
+                    columns.clone(),
+                    *if_not_exists,
+                )
+                .map_err(map_db_err)?;
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("CREATE INDEX".into()),
@@ -366,13 +508,26 @@ pub fn build_executor(
         }
 
         Plan::DropIndex { indexes, if_exists } => {
-            let mut db = db.write();
+            let mut db_write = db.write();
             for idx in indexes {
-                let schema_name = idx.schema.as_deref().unwrap_or("public");
-                db.drop_index(schema_name, &idx.name, *if_exists)
-                    .map_err(map_db_err)?;
+                let schema_name = resolve_index_schema(&db_write, session, idx)?;
+                match schema_name {
+                    Some(schema) => {
+                        db_write
+                            .drop_index(&schema, &idx.name, *if_exists)
+                            .map_err(map_db_err)?;
+                    }
+                    None => {
+                        if !if_exists {
+                            return Err(fe_code(
+                                "42704",
+                                format!("index {} does not exist", idx.name),
+                            ));
+                        }
+                    }
+                }
             }
-            drop(db);
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("DROP INDEX".into()),
@@ -380,16 +535,71 @@ pub fn build_executor(
             ))
         }
         Plan::DropTable { tables, if_exists } => {
-            let mut db = db.write();
+            let mut db_write = db.write();
             for table in tables {
-                let schema_name = table.schema.as_deref().unwrap_or("public");
-                db.drop_table(schema_name, &table.name, *if_exists)
-                    .map_err(map_db_err)?;
+                let schema_name = resolve_table_schema(&db_write, session, table)?;
+                match schema_name {
+                    Some(schema) => {
+                        db_write
+                            .drop_table(&schema, &table.name, *if_exists, false)
+                            .map_err(map_db_err)?;
+                    }
+                    None => {
+                        if !if_exists {
+                            return Err(fe_code("42P01", format!("no such table {}", table.name)));
+                        }
+                    }
+                }
             }
-            drop(db);
+            drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("DROP TABLE".into()),
+                None,
+            ))
+        }
+        Plan::CreateSchema {
+            name,
+            if_not_exists,
+        } => {
+            let mut db_write = db.write();
+            db_write
+                .create_schema(name.as_str(), *if_not_exists)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("CREATE SCHEMA".into()),
+                None,
+            ))
+        }
+        Plan::DropSchema {
+            schemas,
+            if_exists,
+            cascade,
+        } => {
+            let mut db_write = db.write();
+            for schema in schemas {
+                db_write
+                    .drop_schema(schema.as_str(), *cascade, *if_exists)
+                    .map_err(map_db_err)?;
+            }
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("DROP SCHEMA".into()),
+                None,
+            ))
+        }
+        Plan::AlterSchemaRename { name, new_name } => {
+            let mut db_write = db.write();
+            db_write
+                .rename_schema(name.as_str(), new_name.as_str())
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER SCHEMA".into()),
                 None,
             ))
         }
@@ -401,7 +611,7 @@ pub fn build_executor(
             returning,
             returning_schema,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let schema_name = schema_or_public(&table.schema);
             let table_meta = {
                 let db = db.read();
                 db.resolve_table(schema_name, &table.name)
@@ -517,7 +727,7 @@ pub fn build_executor(
                     }
                 })
                 .collect::<PgWireResult<Vec<_>>>()?;
-            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let schema_name = schema_or_public(&table.schema);
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
@@ -580,7 +790,7 @@ pub fn build_executor(
             returning,
             returning_schema,
         } => {
-            let schema_name = table.schema.as_deref().unwrap_or("public");
+            let schema_name = schema_or_public(&table.schema);
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
@@ -631,24 +841,71 @@ pub fn build_executor(
             }
         }
         Plan::ShowVariable { name, schema } => {
-            let value = match super::mapping::lookup_show_value(name) {
-                Some(v) => v,
-                None => return Err(fe_code("0A000", format!("SHOW {} not supported", name))),
+            let value = if name == "search_path" {
+                let ids = session.search_path();
+                let parts = {
+                    let db_read = db.read();
+                    ids.into_iter()
+                        .filter_map(|sid| db_read.catalog.schema_name(sid))
+                        .map(|schema_name| schema_name.as_str().to_string())
+                        .collect::<Vec<_>>()
+                };
+                parts.join(", ")
+            } else {
+                match super::mapping::lookup_show_value(name) {
+                    Some(v) => v,
+                    None => return Err(fe_code("0A000", format!("SHOW {} not supported", name))),
+                }
             };
             let rows = vec![vec![Expr::Literal(Value::Text(value))]];
             let exec = ValuesExec::new(schema.clone(), rows)?;
             Ok((Box::new(exec), Some("SHOW".into()), Some(1)))
         }
-        Plan::SetVariable { name, .. } => {
-            if name != "client_min_messages" {
-                return Err(fe_code("0A000", format!("SET {} not supported", name)));
-            }
-            Ok((
+        Plan::SetVariable { name, value } => match name.as_str() {
+            "client_min_messages" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("SET".into()),
                 None,
-            ))
-        }
+            )),
+            "search_path" => {
+                let schema_ids = {
+                    let db_read = db.read();
+                    match value {
+                        Some(values) => {
+                            if values.is_empty() {
+                                return Err(fe("SET search_path requires at least one schema"));
+                            }
+                            let mut resolved = Vec::with_capacity(values.len());
+                            for schema_name in values {
+                                let id =
+                                    db_read.catalog.schema_id(&schema_name).ok_or_else(|| {
+                                        fe_code(
+                                            "3F000",
+                                            format!("schema \"{}\" does not exist", schema_name),
+                                        )
+                                    })?;
+                                resolved.push(id);
+                            }
+                            resolved
+                        }
+                        None => {
+                            let public_id = db_read
+                                .catalog
+                                .schema_id("public")
+                                .ok_or_else(|| fe("public schema not found"))?;
+                            vec![public_id]
+                        }
+                    }
+                };
+                session.set_search_path(schema_ids);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
+            _ => Err(fe_code("0A000", format!("SET {} not supported", name))),
+        },
         Plan::BeginTransaction => {
             begin_transaction(session, txn_manager)?;
             Ok((

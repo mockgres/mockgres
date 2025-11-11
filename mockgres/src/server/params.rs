@@ -126,6 +126,9 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
+        | Plan::CreateSchema { .. }
+        | Plan::DropSchema { .. }
+        | Plan::AlterSchemaRename { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::BeginTransaction
@@ -261,6 +264,9 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
+        | Plan::CreateSchema { .. }
+        | Plan::DropSchema { .. }
+        | Plan::AlterSchemaRename { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::BeginTransaction

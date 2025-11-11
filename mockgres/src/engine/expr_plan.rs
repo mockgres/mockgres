@@ -1,5 +1,5 @@
 use super::{DataType, Field, Schema, Value};
-use crate::catalog::TableId;
+use crate::catalog::{QualifiedName, SchemaName, TableId};
 
 #[derive(Clone, Copy, Debug)]
 pub enum CmpOp {
@@ -65,6 +65,8 @@ pub enum ScalarFunc {
     Upper,
     Lower,
     Length,
+    CurrentSchema,
+    CurrentSchemas,
 }
 
 #[derive(Clone, Debug)]
@@ -107,11 +109,7 @@ pub enum Selection {
     Columns(Vec<String>),
 }
 
-#[derive(Clone, Debug)]
-pub struct ObjName {
-    pub schema: Option<String>,
-    pub name: String,
-}
+pub type ObjName = QualifiedName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferentialAction {
@@ -240,13 +238,26 @@ pub enum Plan {
         tables: Vec<ObjName>,
         if_exists: bool,
     },
+    CreateSchema {
+        name: SchemaName,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        schemas: Vec<SchemaName>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    AlterSchemaRename {
+        name: SchemaName,
+        new_name: SchemaName,
+    },
     ShowVariable {
         name: String,
         schema: Schema,
     },
     SetVariable {
         name: String,
-        value: Option<String>,
+        value: Option<Vec<String>>,
     },
     InsertValues {
         table: ObjName,
@@ -331,6 +342,9 @@ impl Plan {
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
             | Plan::DropTable { .. }
+            | Plan::CreateSchema { .. }
+            | Plan::DropSchema { .. }
+            | Plan::AlterSchemaRename { .. }
             | Plan::SetVariable { .. }
             | Plan::BeginTransaction
             | Plan::CommitTransaction

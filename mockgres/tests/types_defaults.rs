@@ -77,13 +77,7 @@ async fn date_timestamp_bytea_roundtrip() {
     ctx.client
         .execute(
             &stmt,
-            &[
-                &3,
-                &param_date,
-                &param_ts,
-                &param_payload,
-                &"param",
-            ],
+            &[&3, &param_date, &param_ts, &param_payload, &"param"],
         )
         .await
         .expect("insert via params");

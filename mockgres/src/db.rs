@@ -1,4 +1,6 @@
-use crate::catalog::{Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, TableId, TableMeta};
+use crate::catalog::{
+    Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, SchemaId, SchemaName, TableId, TableMeta,
+};
 use crate::engine::{
     BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ReferentialAction, ScalarExpr,
     SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
@@ -25,20 +27,20 @@ fn sql_err(code: &'static str, msg: impl Into<String>) -> anyhow::Error {
 pub struct Db {
     pub catalog: Catalog,
     pub tables: HashMap<TableId, Table>,
-    pub next_tid: u64,
+    pub next_rel_id: u32,
     locks: Arc<LockRegistry>,
 }
 
 impl Default for Db {
     fn default() -> Self {
-        let mut catalog = Catalog::default();
-        catalog.ensure_schema("public");
-        Self {
-            catalog,
+        let mut db = Self {
+            catalog: Catalog::default(),
             tables: HashMap::new(),
-            next_tid: 1,
+            next_rel_id: 1,
             locks: Arc::new(LockRegistry::new()),
-        }
+        };
+        db.init_builtin_catalog();
+        db
     }
 }
 
@@ -181,6 +183,26 @@ impl LockHandle {
     }
 }
 impl Db {
+    fn init_builtin_catalog(&mut self) {
+        self.catalog.ensure_schema("public");
+        self.catalog.ensure_schema("pg_catalog");
+        self.create_table(
+            "pg_catalog",
+            "pg_namespace",
+            vec![("nspname".to_string(), DataType::Text, false, None)],
+            None,
+            Vec::new(),
+            &[],
+        )
+        .expect("create pg_catalog.pg_namespace");
+    }
+
+    fn alloc_table_id(&mut self, schema_id: SchemaId) -> TableId {
+        let rel_id = self.next_rel_id;
+        self.next_rel_id = self.next_rel_id.checked_add(1).expect("table id overflow");
+        TableId { schema_id, rel_id }
+    }
+
     pub fn release_locks(&self, owner: LockOwner) {
         self.locks.release_owner(owner);
     }
@@ -196,8 +218,9 @@ impl Db {
         cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
         pk_spec: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
+        search_path: &[SchemaId],
     ) -> anyhow::Result<TableId> {
-        self.catalog.ensure_schema(schema);
+        let schema_id = self.catalog.ensure_schema(schema);
         if self.catalog.get_table(schema, name).is_some() {
             return Err(sql_err(
                 "42P07",
@@ -205,8 +228,7 @@ impl Db {
             ));
         }
 
-        let id = self.next_tid;
-        self.next_tid += 1;
+        let id = self.alloc_table_id(schema_id);
 
         let mut columns: Vec<Column> = Vec::with_capacity(cols.len());
         for (n, t, nullable, default_expr) in cols.into_iter() {
@@ -230,11 +252,19 @@ impl Db {
 
         let pk_meta = self.build_primary_key_meta(name, &mut columns, pk_spec)?;
 
-        let fk_metas =
-            self.build_foreign_keys(schema, name, id, &columns, pk_meta.as_ref(), foreign_keys)?;
+        let fk_metas = self.build_foreign_keys(
+            schema,
+            name,
+            id,
+            &columns,
+            pk_meta.as_ref(),
+            foreign_keys,
+            search_path,
+        )?;
 
         let tm = TableMeta {
             id,
+            schema: SchemaName::new(schema),
             name: name.to_string(),
             columns: columns.clone(),
             primary_key: pk_meta,
@@ -244,26 +274,14 @@ impl Db {
 
         let has_pk = tm.primary_key.is_some();
 
-        self.catalog
-            .schemas
-            .get_mut(schema)
-            .expect("schema exists after ensure")
-            .tables
-            .insert(name.to_string(), tm);
+        self.catalog.insert_table(schema_id, name, tm);
 
         self.tables.insert(id, Table::with_pk(has_pk));
         Ok(id)
     }
 
     fn table_meta_by_id(&self, id: TableId) -> Option<&TableMeta> {
-        for schema in self.catalog.schemas.values() {
-            for meta in schema.tables.values() {
-                if meta.id == id {
-                    return Some(meta);
-                }
-            }
-        }
-        None
+        self.catalog.tables_by_id.get(&id)
     }
 
     fn build_primary_key_meta(
@@ -322,6 +340,7 @@ impl Db {
         columns: &[Column],
         self_pk: Option<&PrimaryKeyMeta>,
         specs: Vec<ForeignKeySpec>,
+        search_path: &[SchemaId],
     ) -> anyhow::Result<Vec<ForeignKeyMeta>> {
         let mut metas = Vec::with_capacity(specs.len());
         for (spec_idx, spec) in specs.into_iter().enumerate() {
@@ -347,16 +366,17 @@ impl Db {
                 local_indexes.push(idx);
             }
 
-            let referenced_schema = spec
-                .referenced_table
-                .schema
-                .clone()
-                .unwrap_or_else(|| "public".to_string());
             let referenced_table_name = spec.referenced_table.name.clone();
-            let self_reference =
-                referenced_schema == table_schema && referenced_table_name == table_name;
+            let referenced_schema_hint = spec.referenced_table.schema.clone();
+            let self_reference = referenced_table_name == table_name
+                && match referenced_schema_hint.as_ref() {
+                    Some(schema) => schema.as_str() == table_schema,
+                    None => true,
+                };
             let mut build_meta = |parent_pk: &PrimaryKeyMeta,
                                   parent_columns: &[Column],
+                                  referenced_schema: &SchemaName,
+                                  referenced_table_name: &str,
                                   referenced_table_id: TableId|
              -> anyhow::Result<()> {
                 if parent_pk.columns.len() != local_indexes.len() {
@@ -394,7 +414,9 @@ impl Db {
                                     "42703",
                                     format!(
                                         "referenced column {} does not exist on {}.{}",
-                                        rc, referenced_schema, referenced_table_name
+                                        rc,
+                                        referenced_schema.as_str(),
+                                        referenced_table_name
                                     ),
                                 )
                             })?;
@@ -411,7 +433,7 @@ impl Db {
                     parent_pk,
                     table_schema,
                     table_name,
-                    &referenced_schema,
+                    referenced_schema.as_str(),
                     &referenced_table_name,
                 )?;
 
@@ -442,7 +464,7 @@ impl Db {
                     local_columns: ordered_local,
                     referenced_table: referenced_table_id,
                     referenced_schema: referenced_schema.clone(),
-                    referenced_table_name: referenced_table_name.clone(),
+                    referenced_table_name: referenced_table_name.to_string(),
                     referenced_columns: parent_pk.columns.clone(),
                     on_delete: spec.on_delete,
                 });
@@ -450,39 +472,60 @@ impl Db {
             };
 
             if self_reference {
+                let self_schema = SchemaName::new(table_schema);
                 let parent_pk = self_pk.ok_or_else(|| {
                     sql_err(
                         "42830",
                         format!(
                             "referenced table {}.{} must have a primary key",
-                            referenced_schema, referenced_table_name
+                            self_schema.as_str(),
+                            table_name
                         ),
                     )
                 })?;
-                build_meta(parent_pk, columns, table_id)?;
+                build_meta(parent_pk, columns, &self_schema, table_name, table_id)?;
             } else {
-                let ref_meta = self
-                    .catalog
-                    .get_table(&referenced_schema, &referenced_table_name)
-                    .ok_or_else(|| {
-                        sql_err(
-                            "42830",
-                            format!(
-                                "referenced table {}.{} for foreign key on {}.{} does not exist",
-                                referenced_schema, referenced_table_name, table_schema, table_name
-                            ),
-                        )
-                    })?;
+                let (ref_meta, resolved_schema) = if let Some(schema) =
+                    referenced_schema_hint.as_ref()
+                {
+                    let meta = self
+                            .catalog
+                            .get_table(schema.as_str(), &referenced_table_name)
+                            .ok_or_else(|| {
+                                sql_err(
+                                    "42830",
+                                    format!(
+                                        "referenced table {}.{} for foreign key on {}.{} does not exist",
+                                        schema.as_str(),
+                                        referenced_table_name,
+                                        table_schema,
+                                        table_name
+                                    ),
+                                )
+                            })?;
+                    (meta, meta.schema.clone())
+                } else {
+                    let meta =
+                        self.resolve_table_in_search_path(search_path, &referenced_table_name)?;
+                    (meta, meta.schema.clone())
+                };
                 let parent_pk = ref_meta.primary_key.as_ref().ok_or_else(|| {
                     sql_err(
                         "42830",
                         format!(
                             "referenced table {}.{} must have a primary key",
-                            referenced_schema, referenced_table_name
+                            resolved_schema.as_str(),
+                            referenced_table_name
                         ),
                     )
                 })?;
-                build_meta(parent_pk, &ref_meta.columns, ref_meta.id)?;
+                build_meta(
+                    parent_pk,
+                    &ref_meta.columns,
+                    &resolved_schema,
+                    &referenced_table_name,
+                    ref_meta.id,
+                )?;
             }
         }
         Ok(metas)
@@ -566,14 +609,12 @@ impl Db {
                 }
             }
         }
-        let schema_entry = self
+        if self.catalog.schema_entry(schema).is_none() {
+            return Err(sql_err("3F000", format!("no such schema {schema}")));
+        }
+        let table_meta = self
             .catalog
-            .schemas
-            .get_mut(schema)
-            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
-        let table_meta = schema_entry
-            .tables
-            .get_mut(name)
+            .table_meta_mut(schema, name)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
         table_meta.columns.push(Column {
             name: col_name,
@@ -666,14 +707,12 @@ impl Db {
                 format!("missing storage for table id {table_id}"),
             ));
         }
-        let schema_entry = self
+        if self.catalog.schema_entry(schema).is_none() {
+            return Err(sql_err("3F000", format!("no such schema {schema}")));
+        }
+        let table_meta = self
             .catalog
-            .schemas
-            .get_mut(schema)
-            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
-        let table_meta = schema_entry
-            .tables
-            .get_mut(name)
+            .table_meta_mut(schema, name)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
         table_meta.columns.pop();
         Ok(())
@@ -690,14 +729,12 @@ impl Db {
         if columns.is_empty() {
             return Err(sql_err("0A000", "index must reference at least one column"));
         }
-        let schema_entry = self
+        if self.catalog.schema_entry(schema).is_none() {
+            return Err(sql_err("3F000", format!("no such schema {schema}")));
+        }
+        let table_meta = self
             .catalog
-            .schemas
-            .get_mut(schema)
-            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
-        let table_meta = schema_entry
-            .tables
-            .get_mut(table)
+            .table_meta_mut(schema, table)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
         if table_meta.indexes.iter().any(|idx| idx.name == index_name) {
             if if_not_exists {
@@ -730,23 +767,31 @@ impl Db {
         index_name: &str,
         if_exists: bool,
     ) -> anyhow::Result<()> {
-        let Some(schema_entry) = self.catalog.schemas.get_mut(schema) else {
+        let Some(schema_id) = self.catalog.schema_id(schema) else {
             return if if_exists {
                 Ok(())
             } else {
                 Err(sql_err("3F000", format!("no such schema {schema}")))
             };
         };
+        let table_ids: Vec<TableId> = self
+            .catalog
+            .schemas
+            .get(&schema_id)
+            .map(|entry| entry.objects.values().copied().collect())
+            .unwrap_or_default();
         let mut removed = false;
-        for table_meta in schema_entry.tables.values_mut() {
-            if let Some(pos) = table_meta
-                .indexes
-                .iter()
-                .position(|idx| idx.name == index_name)
-            {
-                table_meta.indexes.remove(pos);
-                removed = true;
-                break;
+        for tid in table_ids {
+            if let Some(table_meta) = self.catalog.get_table_mut_by_id(&tid) {
+                if let Some(pos) = table_meta
+                    .indexes
+                    .iter()
+                    .position(|idx| idx.name == index_name)
+                {
+                    table_meta.indexes.remove(pos);
+                    removed = true;
+                    break;
+                }
             }
         }
         if removed || if_exists {
@@ -763,6 +808,21 @@ impl Db {
         self.catalog
             .get_table(schema, name)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))
+    }
+
+    pub fn resolve_table_in_search_path(
+        &self,
+        search_path: &[SchemaId],
+        name: &str,
+    ) -> anyhow::Result<&TableMeta> {
+        for schema_id in search_path {
+            if let Some(schema_name) = self.catalog.schema_name(*schema_id) {
+                if let Some(table) = self.catalog.get_table(schema_name.as_str(), name) {
+                    return Ok(table);
+                }
+            }
+        }
+        Err(sql_err("42P01", format!("no such table {name}")))
     }
 
     pub fn insert_full_rows(
@@ -1054,7 +1114,13 @@ impl Db {
         result
     }
 
-    pub fn drop_table(&mut self, schema: &str, name: &str, if_exists: bool) -> anyhow::Result<()> {
+    pub fn drop_table(
+        &mut self,
+        schema: &str,
+        name: &str,
+        if_exists: bool,
+        cascade: bool,
+    ) -> anyhow::Result<()> {
         let table_exists = self.catalog.get_table(schema, name).is_some();
         if !table_exists {
             return if if_exists {
@@ -1065,7 +1131,9 @@ impl Db {
         }
 
         let inbound = self.collect_inbound_foreign_keys(schema, name);
-        if let Some(fk) = inbound.first() {
+        if cascade {
+            self.drop_inbound_foreign_keys(&inbound)?;
+        } else if let Some(fk) = inbound.first() {
             return Err(sql_err(
                 "2BP01",
                 format!(
@@ -1075,13 +1143,13 @@ impl Db {
             ));
         }
 
-        let schema_entry = match self.catalog.schemas.get_mut(schema) {
-            Some(entry) => entry,
+        let schema_id = match self.catalog.schema_id(schema) {
+            Some(id) => id,
             None => {
                 return Err(sql_err("3F000", format!("no such schema {schema}")));
             }
         };
-        match schema_entry.tables.remove(name) {
+        match self.catalog.remove_table(schema_id, name) {
             Some(meta) => {
                 if self.tables.remove(&meta.id).is_none() {
                     return Err(sql_err(
@@ -1093,6 +1161,75 @@ impl Db {
             }
             None => Ok(()),
         }
+    }
+
+    pub fn create_schema(&mut self, name: &str, if_not_exists: bool) -> anyhow::Result<()> {
+        if self.catalog.schema_id(name).is_some() {
+            return if if_not_exists {
+                Ok(())
+            } else {
+                Err(sql_err(
+                    "42P06",
+                    format!("schema \"{}\" already exists", name),
+                ))
+            };
+        }
+        self.catalog.ensure_schema(name);
+        Ok(())
+    }
+
+    pub fn drop_schema(
+        &mut self,
+        name: &str,
+        cascade: bool,
+        if_exists: bool,
+    ) -> anyhow::Result<()> {
+        let schema_id = match self.catalog.schema_id(name) {
+            Some(id) => id,
+            None => {
+                return if if_exists {
+                    Ok(())
+                } else {
+                    Err(sql_err(
+                        "3F000",
+                        format!("schema \"{}\" does not exist", name),
+                    ))
+                };
+            }
+        };
+        let table_names: Vec<String> = self
+            .catalog
+            .schemas
+            .get(&schema_id)
+            .map(|entry| entry.objects.keys().cloned().collect())
+            .unwrap_or_default();
+        if !cascade && !table_names.is_empty() {
+            return Err(sql_err(
+                "2BP01",
+                format!("cannot drop schema {} because it is not empty", name),
+            ));
+        }
+        for table_name in table_names {
+            self.drop_table(name, &table_name, false, cascade)?;
+        }
+        self.catalog.drop_schema_entry(schema_id);
+        Ok(())
+    }
+
+    pub fn rename_schema(&mut self, old: &str, new: &str) -> anyhow::Result<()> {
+        let schema_id = self
+            .catalog
+            .schema_id(old)
+            .ok_or_else(|| sql_err("3F000", format!("schema \"{}\" does not exist", old)))?;
+        if self.catalog.schema_id(new).is_some() {
+            return Err(sql_err(
+                "42P06",
+                format!("schema \"{}\" already exists", new),
+            ));
+        }
+        self.catalog
+            .rename_schema_entry(schema_id, SchemaName::new(new));
+        Ok(())
     }
 
     pub fn delete_rows(
@@ -1407,7 +1544,8 @@ impl Db {
                 "42830",
                 format!(
                     "referenced table {}.{} must have a primary key",
-                    fk.referenced_schema, fk.referenced_table_name
+                    fk.referenced_schema.as_str(),
+                    fk.referenced_table_name
                 ),
             ));
         };
@@ -1423,7 +1561,11 @@ impl Db {
             "23503",
             format!(
                 "insert on {}.{} violates foreign key {} referencing {}.{}",
-                table_schema, table_name, fk.name, fk.referenced_schema, fk.referenced_table_name
+                table_schema,
+                table_name,
+                fk.name,
+                fk.referenced_schema.as_str(),
+                fk.referenced_table_name
             ),
         ))
     }
@@ -1510,21 +1652,34 @@ impl Db {
         };
         let parent_id = parent_meta.id;
         let mut out = Vec::new();
-        for (schema_name, schema_entry) in &self.catalog.schemas {
-            for (table_name, meta) in &schema_entry.tables {
-                for fk in &meta.foreign_keys {
-                    if fk.referenced_table == parent_id {
-                        out.push(InboundForeignKey {
-                            schema: schema_name.clone(),
-                            table: table_name.clone(),
-                            table_id: meta.id,
-                            fk: fk.clone(),
-                        });
-                    }
+        for meta in self.catalog.tables_by_id.values() {
+            for fk in &meta.foreign_keys {
+                if fk.referenced_table == parent_id {
+                    out.push(InboundForeignKey {
+                        schema: meta.schema.as_str().to_string(),
+                        table: meta.name.clone(),
+                        table_id: meta.id,
+                        fk: fk.clone(),
+                    });
                 }
             }
         }
         out
+    }
+
+    fn drop_inbound_foreign_keys(&mut self, inbound: &[InboundForeignKey]) -> anyhow::Result<()> {
+        for fk in inbound {
+            if let Some(meta) = self.catalog.get_table_mut_by_id(&fk.table_id) {
+                meta.foreign_keys
+                    .retain(|existing| existing.name != fk.fk.name);
+            }
+            if let Some(table) = self.tables.get_mut(&fk.table_id) {
+                table
+                    .fk_rev
+                    .retain(|(parent_id, _), _| *parent_id != fk.fk.referenced_table);
+            }
+        }
+        Ok(())
     }
 
     fn ensure_no_inbound_refs(

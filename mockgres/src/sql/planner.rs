@@ -25,9 +25,11 @@ impl Planner {
             Some(NodeEnum::TransactionStmt(tx)) => ddl::plan_transaction_stmt(&tx),
             Some(NodeEnum::SelectStmt(sel)) => dml::plan_select(*sel),
             Some(NodeEnum::CreateStmt(cs)) => ddl::plan_create_table(cs),
+            Some(NodeEnum::CreateSchemaStmt(cs)) => ddl::plan_create_schema(cs),
             Some(NodeEnum::AlterTableStmt(at)) => ddl::plan_alter_table(at),
             Some(NodeEnum::IndexStmt(idx)) => ddl::plan_create_index(*idx),
             Some(NodeEnum::DropStmt(drop)) => ddl::plan_drop_stmt(drop),
+            Some(NodeEnum::RenameStmt(rename)) => ddl::plan_rename_schema(*rename),
             Some(NodeEnum::VariableShowStmt(show)) => ddl::plan_show(show),
             Some(NodeEnum::VariableSetStmt(set)) => ddl::plan_set(set),
             Some(NodeEnum::InsertStmt(ins)) => dml::plan_insert(*ins),
@@ -131,7 +133,10 @@ mod tests {
             } => {
                 assert!(if_exists);
                 assert_eq!(indexes.len(), 1);
-                assert_eq!(indexes[0].schema.as_deref(), Some("public"));
+                assert_eq!(
+                    indexes[0].schema.as_ref().map(|s| s.as_str()),
+                    Some("public")
+                );
                 assert_eq!(indexes[0].name, "idx_things");
             }
             other => panic!("unexpected plan: {other:?}"),
@@ -157,7 +162,7 @@ mod tests {
         match plan {
             Plan::SetVariable { name, value } => {
                 assert_eq!(name, "client_min_messages");
-                assert_eq!(value.as_deref(), Some("warning"));
+                assert_eq!(value, Some(vec!["warning".to_string()]));
             }
             other => panic!("unexpected plan: {other:?}"),
         }

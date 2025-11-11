@@ -226,6 +226,8 @@ pub fn parse_function_call(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
         "upper" => ScalarFunc::Upper,
         "lower" => ScalarFunc::Lower,
         "length" | "char_length" => ScalarFunc::Length,
+        "current_schema" => ScalarFunc::CurrentSchema,
+        "current_schemas" => ScalarFunc::CurrentSchemas,
         other => return Err(fe(format!("unsupported function: {other}"))),
     };
     match func {
@@ -237,6 +239,16 @@ pub fn parse_function_call(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
         ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::CurrentSchema => {
+            if !args.is_empty() {
+                return Err(fe("current_schema() takes no arguments"));
+            }
+        }
+        ScalarFunc::CurrentSchemas => {
+            if args.len() != 1 {
+                return Err(fe("current_schemas(boolean) requires one argument"));
             }
         }
     }

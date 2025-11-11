@@ -1,4 +1,5 @@
 use super::expr::parse_scalar_expr;
+use crate::catalog::SchemaName;
 use crate::engine::{DataType, ObjName, ScalarExpr, Value, fe};
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
@@ -160,15 +161,18 @@ pub(super) fn parse_index_columns(params: &[pg_query::Node]) -> PgWireResult<Vec
 }
 
 pub(super) fn parse_obj_name_from_list(node: &NodeEnum) -> PgWireResult<ObjName> {
-    let NodeEnum::List(list) = node else {
-        return Err(fe("bad qualified name"));
-    };
     let mut parts = Vec::new();
-    for item in &list.items {
-        let Some(NodeEnum::String(s)) = item.node.as_ref() else {
-            return Err(fe("bad qualified name component"));
-        };
-        parts.push(s.sval.clone());
+    match node {
+        NodeEnum::List(list) => {
+            for item in &list.items {
+                let Some(NodeEnum::String(s)) = item.node.as_ref() else {
+                    return Err(fe("bad qualified name component"));
+                };
+                parts.push(s.sval.clone());
+            }
+        }
+        NodeEnum::String(s) => parts.push(s.sval.clone()),
+        _ => return Err(fe("bad qualified name")),
     }
     if parts.is_empty() {
         return Err(fe("empty name"));
@@ -177,20 +181,24 @@ pub(super) fn parse_obj_name_from_list(node: &NodeEnum) -> PgWireResult<ObjName>
     let schema = if parts.is_empty() {
         None
     } else {
-        Some(parts.join("."))
+        Some(SchemaName::new(parts.join(".")))
     };
     Ok(ObjName { schema, name })
 }
 
-pub(super) fn parse_set_value(args: &[pg_query::Node]) -> PgWireResult<String> {
+pub(super) fn parse_set_value(args: &[pg_query::Node]) -> PgWireResult<Vec<String>> {
     if args.is_empty() {
         return Err(fe("SET requires value"));
     }
-    let node = args[0].node.as_ref().ok_or_else(|| fe("bad SET value"))?;
-    let Some(v) = try_parse_literal(node)? else {
-        return Err(fe("unsupported SET value"));
-    };
-    literal_value_to_string(v)
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        let node = arg.node.as_ref().ok_or_else(|| fe("bad SET value"))?;
+        let Some(v) = try_parse_literal(node)? else {
+            return Err(fe("unsupported SET value"));
+        };
+        values.push(literal_value_to_string(v)?);
+    }
+    Ok(values)
 }
 
 pub(super) fn literal_value_to_string(value: Value) -> PgWireResult<String> {
@@ -206,51 +214,6 @@ pub(super) fn literal_value_to_string(value: Value) -> PgWireResult<String> {
         }
         _ => return Err(fe("SET literal type not supported")),
     })
-}
-
-pub(super) fn parse_numeric_const(node: &NodeEnum) -> PgWireResult<Value> {
-    match node {
-        NodeEnum::AConst(c) => {
-            let v = const_to_value(c)?;
-            match v {
-                Value::Int64(_) | Value::Float64Bits(_) => Ok(v),
-                Value::Null => Err(fe("null not allowed in numeric const")),
-                Value::Text(_)
-                | Value::Bool(_)
-                | Value::Date(_)
-                | Value::TimestampMicros(_)
-                | Value::Bytes(_) => Err(fe("numeric const expected")),
-            }
-        }
-        NodeEnum::AExpr(ax) => {
-            let is_minus = ax
-                .name
-                .iter()
-                .any(|nn| matches!(nn.node.as_ref(), Some(NodeEnum::String(s)) if s.sval=="-"));
-            if !is_minus {
-                return Err(fe("only numeric const supported"));
-            }
-            let rhs = ax
-                .rexpr
-                .as_ref()
-                .and_then(|n| n.node.as_ref())
-                .ok_or_else(|| fe("bad unary minus"))?;
-            match rhs {
-                NodeEnum::AConst(c) => match const_to_value(c)? {
-                    Value::Int64(i) => Ok(Value::Int64(-i)),
-                    Value::Float64Bits(b) => Ok(Value::from_f64(-f64::from_bits(b))),
-                    Value::Null => Err(fe("minus over null")),
-                    Value::Text(_)
-                    | Value::Bool(_)
-                    | Value::Date(_)
-                    | Value::TimestampMicros(_)
-                    | Value::Bytes(_) => Err(fe("numeric const expected")),
-                },
-                _ => Err(fe("minus over non-const")),
-            }
-        }
-        _ => Err(fe("only numeric const supported")),
-    }
 }
 
 pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> {

@@ -91,14 +91,14 @@ impl SimpleQueryHandler for Mockgres {
     {
         match Planner::plan_sql(query) {
             Ok(lp0) => {
+                let session = self.session_for_client(client)?;
                 // bind (names -> positions) using catalog
                 let bound = {
                     let db_read = self.db.read();
-                    bind(&db_read, lp0)?
+                    bind(&db_read, &session, lp0)?
                 };
 
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
-                let session = self.session_for_client(client)?;
                 let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
                 let snapshot_xid = self.capture_statement_snapshot(&session);
                 let (exec, tag, row_count) = build_executor(
@@ -137,7 +137,7 @@ impl ExtendedQueryHandler for Mockgres {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &pgwire::api::stmt::StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -146,9 +146,10 @@ impl ExtendedQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let session = self.session_for_client(client)?;
         let bound = {
             let db = self.db.read();
-            bind(&db, target.statement.clone())?
+            bind(&db, &session, target.statement.clone())?
         };
         let params = plan_parameter_types(&bound);
         let fields = plan_fields(&bound);
@@ -157,7 +158,7 @@ impl ExtendedQueryHandler for Mockgres {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &pgwire::api::portal::Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -166,7 +167,8 @@ impl ExtendedQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let fields = self.describe_plan(&portal.statement.statement)?;
+        let session = self.session_for_client(client)?;
+        let fields = self.describe_plan(&session, &portal.statement.statement)?;
         Ok(DescribePortalResponse::new(fields))
     }
     async fn do_query<'a, C>(
@@ -186,13 +188,13 @@ impl ExtendedQueryHandler for Mockgres {
             _ => FieldFormat::Text,
         };
 
+        let session = self.session_for_client(client)?;
         let bound = {
             let db = self.db.read();
-            bind(&db, portal.statement.statement.clone())?
+            bind(&db, &session, portal.statement.statement.clone())?
         };
 
         let params = build_params_for_portal(&bound, portal)?;
-        let session = self.session_for_client(client)?;
         let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
         let snapshot_xid = self.capture_statement_snapshot(&session);
         let (exec, tag, row_count) = build_executor(
@@ -267,9 +269,9 @@ impl Drop for StatementEpochGuard {
 }
 
 impl Mockgres {
-    fn describe_plan(&self, plan: &Plan) -> PgWireResult<Vec<FieldInfo>> {
+    fn describe_plan(&self, session: &Session, plan: &Plan) -> PgWireResult<Vec<FieldInfo>> {
         let db = self.db.read();
-        let bound = bind(&db, plan.clone())?;
+        let bound = bind(&db, session, plan.clone())?;
         Ok(plan_fields(&bound))
     }
 
@@ -294,6 +296,12 @@ impl Mockgres {
             }
         }
         let session = self.session_manager.create_session();
+        {
+            let db_read = self.db.read();
+            if let Some(public_id) = db_read.catalog.schema_id("public") {
+                session.set_search_path(vec![public_id]);
+            }
+        }
         client.set_pid_and_secret_key(session.id(), SecretKey::I32(session.id()));
         session
     }

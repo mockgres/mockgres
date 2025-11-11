@@ -1,10 +1,12 @@
+use crate::catalog::SchemaName;
 use crate::engine::{
     DataType, Field, ForeignKeySpec, ObjName, Plan, PrimaryKeySpec, ReferentialAction, Schema, fe,
     fe_code,
 };
 use pg_query::protobuf::{
-    AlterTableStmt, AlterTableType, Constraint, CreateStmt, DropStmt, IndexStmt, ObjectType,
-    RangeVar, TransactionStmt, VariableSetKind, VariableSetStmt, VariableShowStmt,
+    AlterTableStmt, AlterTableType, Constraint, CreateSchemaStmt, CreateStmt, DropBehavior,
+    DropStmt, IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, VariableSetKind,
+    VariableSetStmt, VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -44,12 +46,13 @@ pub(super) fn plan_transaction_stmt(stmt: &TransactionStmt) -> PgWireResult<Plan
 
 pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
     let rv = stmt.relation.ok_or_else(|| fe("missing table name"))?;
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname))
+    };
     let table = ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname)
-        },
+        schema,
         name: rv.relname,
     };
 
@@ -130,12 +133,13 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
     let rv = stmt.relation.ok_or_else(|| fe("missing table name"))?;
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname))
+    };
     let table = ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname)
-        },
+        schema,
         name: rv.relname,
     };
     if stmt.cmds.len() != 1 {
@@ -179,12 +183,13 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
     let table_rv = idx.relation.ok_or_else(|| fe("missing index table"))?;
+    let schema = if table_rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(table_rv.schemaname))
+    };
     let table = ObjName {
-        schema: if table_rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(table_rv.schemaname)
-        },
+        schema,
         name: table_rv.relname,
     };
     if idx.idxname.is_empty() {
@@ -196,6 +201,22 @@ pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
         table,
         columns,
         if_not_exists: idx.if_not_exists,
+    })
+}
+
+pub(super) fn plan_create_schema(stmt: CreateSchemaStmt) -> PgWireResult<Plan> {
+    if stmt.schemaname.is_empty() {
+        return Err(fe("schema name required"));
+    }
+    if stmt.authrole.is_some() {
+        return Err(fe("CREATE SCHEMA AUTHORIZATION is not supported"));
+    }
+    if !stmt.schema_elts.is_empty() {
+        return Err(fe("CREATE SCHEMA elements are not supported"));
+    }
+    Ok(Plan::CreateSchema {
+        name: SchemaName::new(stmt.schemaname),
+        if_not_exists: stmt.if_not_exists,
     })
 }
 
@@ -218,7 +239,24 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
             tables: names,
             if_exists: drop.missing_ok,
         }),
-        _ => Err(fe("only DROP INDEX or DROP TABLE supported")),
+        ObjectType::ObjectSchema => {
+            let behavior =
+                DropBehavior::try_from(drop.behavior).map_err(|_| fe("bad DROP behavior"))?;
+            let cascade = matches!(behavior, DropBehavior::DropCascade);
+            let mut schemas = Vec::with_capacity(names.len());
+            for obj in names {
+                if obj.schema.is_some() {
+                    return Err(fe("schema name must be unqualified"));
+                }
+                schemas.push(SchemaName::new(obj.name));
+            }
+            Ok(Plan::DropSchema {
+                schemas,
+                if_exists: drop.missing_ok,
+                cascade,
+            })
+        }
+        _ => Err(fe("only DROP INDEX, DROP TABLE, or DROP SCHEMA supported")),
     }
 }
 
@@ -237,7 +275,8 @@ pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let name_lower = set.name.to_ascii_lowercase();
-    if name_lower != "client_min_messages" {
+    let supported = matches!(name_lower.as_str(), "client_min_messages" | "search_path");
+    if !supported {
         return Err(fe_code("0A000", format!("SET {} not supported", set.name)));
     }
     let kind = VariableSetKind::try_from(set.kind).map_err(|_| fe("bad SET kind"))?;
@@ -256,6 +295,20 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     Ok(Plan::SetVariable {
         name: name_lower,
         value,
+    })
+}
+
+pub(super) fn plan_rename_schema(stmt: RenameStmt) -> PgWireResult<Plan> {
+    let rename_type = ObjectType::try_from(stmt.rename_type).map_err(|_| fe("bad RENAME type"))?;
+    if rename_type != ObjectType::ObjectSchema {
+        return Err(fe("only ALTER SCHEMA ... RENAME TO is supported"));
+    }
+    if stmt.subname.is_empty() || stmt.newname.is_empty() {
+        return Err(fe("schema name required"));
+    }
+    Ok(Plan::AlterSchemaRename {
+        name: SchemaName::new(stmt.subname),
+        new_name: SchemaName::new(stmt.newname),
     })
 }
 
@@ -330,12 +383,13 @@ fn parse_identifier_list(nodes: &[pg_query::Node]) -> PgWireResult<Vec<String>> 
 }
 
 fn range_var_to_obj_name(rv: &RangeVar) -> ObjName {
+    let schema = if rv.schemaname.is_empty() {
+        None
+    } else {
+        Some(SchemaName::new(rv.schemaname.clone()))
+    };
     ObjName {
-        schema: if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(rv.schemaname.clone())
-        },
+        schema,
         name: rv.relname.clone(),
     }
 }

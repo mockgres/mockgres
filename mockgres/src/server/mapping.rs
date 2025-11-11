@@ -32,7 +32,6 @@ pub fn map_datatype_to_pg_type(dt: &DataType) -> Type {
 pub fn lookup_show_value(name: &str) -> Option<String> {
     match name {
         "server_version" => Some("15.0".to_string()),
-        "search_path" => Some("public".to_string()),
         _ => None,
     }
 }

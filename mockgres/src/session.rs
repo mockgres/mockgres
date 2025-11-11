@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard};
 
-use crate::catalog::TableId;
+use crate::catalog::{SchemaId, TableId};
 use crate::storage::RowKey;
 use crate::txn::TxId;
 
@@ -33,6 +33,7 @@ pub struct SessionState {
     pub next_epoch: u64,
     pub txn_epoch: Option<u64>,
     pub statement_epoch: Option<u64>,
+    pub search_path: Vec<SchemaId>,
 }
 
 impl Default for SessionState {
@@ -44,6 +45,7 @@ impl Default for SessionState {
             next_epoch: 1,
             txn_epoch: None,
             statement_epoch: None,
+            search_path: Vec::new(),
         }
     }
 }
@@ -148,6 +150,15 @@ impl Session {
     pub fn end_transaction_epoch(&self) -> Option<u64> {
         let mut guard = self.state.lock();
         guard.txn_epoch.take()
+    }
+
+    pub fn search_path(&self) -> Vec<SchemaId> {
+        self.state.lock().search_path.clone()
+    }
+
+    pub fn set_search_path(&self, path: Vec<SchemaId>) {
+        let mut guard = self.state.lock();
+        guard.search_path = path;
     }
 }
 
