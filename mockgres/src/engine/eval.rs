@@ -22,7 +22,7 @@ pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> P
             .get(*i)
             .cloned()
             .ok_or_else(|| fe("column index out of range")),
-        ScalarExpr::Column(name) => Err(fe(format!("unbound column reference: {name}"))),
+        ScalarExpr::Column(colref) => Err(fe(format!("unbound column reference: {colref}"))),
         ScalarExpr::Param { idx, .. } => params
             .get(*idx)
             .cloned()

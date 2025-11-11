@@ -80,9 +80,17 @@ pub struct Column {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FieldOrigin {
+    pub schema: Option<String>,
+    pub table: Option<String>,
+    pub alias: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Field {
     pub name: String,
     pub data_type: DataType,
+    pub origin: Option<FieldOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

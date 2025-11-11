@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use crate::catalog::SchemaId;
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, DataType, DbDdlKind, Field, InsertSource, LockSpec, ObjName, Plan, ReturningClause,
-    ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError,
-    UpdateSet, Value, fe, fe_code,
+    BoolExpr, ColumnRefName, DataType, DbDdlKind, Field, FieldOrigin, InsertSource, LockSpec,
+    ObjName, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
+    Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
 use crate::session::Session;
 use anyhow::Error;
@@ -26,6 +26,7 @@ fn bind_with_search_path(
     match p {
         Plan::UnboundSeqScan {
             mut table,
+            alias,
             selection,
             lock,
         } => {
@@ -33,6 +34,15 @@ fn bind_with_search_path(
             if table.schema.is_none() {
                 table.schema = Some(tm.schema.clone());
             }
+
+            let schema_name = tm.schema.as_str().to_string();
+            let table_name = tm.name.clone();
+            let alias_clone = alias.clone();
+            let base_origin = Some(FieldOrigin {
+                schema: Some(schema_name),
+                table: Some(table_name),
+                alias: alias_clone,
+            });
 
             // build (idx, Field) for executor + compose output schema
             let cols: Vec<(usize, Field)> = match selection {
@@ -46,6 +56,7 @@ fn bind_with_search_path(
                             Field {
                                 name: c.name.clone(),
                                 data_type: c.data_type.clone(),
+                                origin: base_origin.clone(),
                             },
                         )
                     })
@@ -66,6 +77,7 @@ fn bind_with_search_path(
                             Field {
                                 name: n,
                                 data_type: tm.columns[i].data_type.clone(),
+                                origin: base_origin.clone(),
                             },
                         ));
                     }
@@ -79,6 +91,7 @@ fn bind_with_search_path(
                 schema.fields.push(Field {
                     name: "__mockgres_row_id".to_string(),
                     data_type: DataType::Int8,
+                    origin: None,
                 });
             }
             let lock = lock.map(|req| LockSpec {
@@ -128,6 +141,7 @@ fn bind_with_search_path(
                 fields.push(Field {
                     name: name.clone(),
                     data_type: dt,
+                    origin: None,
                 });
                 bound_exprs.push((bound, name.clone()));
             }
@@ -223,6 +237,11 @@ fn bind_with_search_path(
             if table.schema.is_none() {
                 table.schema = Some(tm.schema.clone());
             }
+            let schema_origin = Some(FieldOrigin {
+                schema: Some(tm.schema.as_str().to_string()),
+                table: Some(tm.name.clone()),
+                alias: None,
+            });
             let schema = Schema {
                 fields: tm
                     .columns
@@ -230,6 +249,7 @@ fn bind_with_search_path(
                     .map(|c| Field {
                         name: c.name.clone(),
                         data_type: c.data_type.clone(),
+                        origin: schema_origin.clone(),
                     })
                     .collect(),
             };
@@ -307,6 +327,11 @@ fn bind_with_search_path(
             if table.schema.is_none() {
                 table.schema = Some(tm.schema.clone());
             }
+            let schema_origin = Some(FieldOrigin {
+                schema: Some(tm.schema.as_str().to_string()),
+                table: Some(tm.name.clone()),
+                alias: None,
+            });
             let schema = Schema {
                 fields: tm
                     .columns
@@ -314,6 +339,7 @@ fn bind_with_search_path(
                     .map(|c| Field {
                         name: c.name.clone(),
                         data_type: c.data_type.clone(),
+                        origin: schema_origin.clone(),
                     })
                     .collect(),
             };
@@ -416,6 +442,11 @@ fn bind_with_search_path(
             if table.schema.is_none() {
                 table.schema = Some(tm.schema.clone());
             }
+            let schema_origin = Some(FieldOrigin {
+                schema: Some(tm.schema.as_str().to_string()),
+                table: Some(tm.name.clone()),
+                alias: None,
+            });
             let table_schema = Schema {
                 fields: tm
                     .columns
@@ -423,6 +454,7 @@ fn bind_with_search_path(
                     .map(|c| Field {
                         name: c.name.clone(),
                         data_type: c.data_type.clone(),
+                        origin: schema_origin.clone(),
                     })
                     .collect(),
             };
@@ -577,7 +609,11 @@ fn bind_returning_clause(
             ReturningExpr::Star => {
                 for field in &schema.fields {
                     expanded.push(ReturningExpr::Expr {
-                        expr: ScalarExpr::Column(field.name.clone()),
+                        expr: ScalarExpr::Column(ColumnRefName {
+                            schema: None,
+                            relation: None,
+                            column: field.name.clone(),
+                        }),
                         alias: field.name.clone(),
                     });
                 }
@@ -596,6 +632,7 @@ fn bind_returning_clause(
             fields.push(Field {
                 name: alias.clone(),
                 data_type: dt,
+                origin: None,
             });
             *expr = bound;
         }
@@ -663,21 +700,8 @@ fn bind_scalar_expr(
 ) -> pgwire::error::PgWireResult<ScalarExpr> {
     Ok(match expr {
         ScalarExpr::Literal(v) => ScalarExpr::Literal(v.clone()),
-        ScalarExpr::Column(name) => {
-            let mut matches = schema
-                .fields
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.name == *name);
-            let Some((idx, _)) = matches.next() else {
-                return Err(fe_code("42703", format!("unknown column: {name}")));
-            };
-            if matches.next().is_some() {
-                return Err(fe_code(
-                    "42702",
-                    format!("column reference \"{name}\" is ambiguous"),
-                ));
-            }
+        ScalarExpr::Column(colref) => {
+            let idx = resolve_column_reference(schema, colref)?;
             ScalarExpr::ColumnIdx(idx)
         }
         ScalarExpr::ColumnIdx(i) => ScalarExpr::ColumnIdx(*i),
@@ -767,6 +791,55 @@ fn bind_scalar_expr(
             }
         }
     })
+}
+
+fn resolve_column_reference(schema: &Schema, colref: &ColumnRefName) -> PgWireResult<usize> {
+    let mut matches = schema
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| column_ref_matches(field, colref));
+    let Some((idx, _)) = matches.next() else {
+        return Err(fe_code("42703", format!("unknown column: {colref}")));
+    };
+    if matches.next().is_some() {
+        return Err(fe_code(
+            "42702",
+            format!("column reference \"{colref}\" is ambiguous"),
+        ));
+    }
+    Ok(idx)
+}
+
+fn column_ref_matches(field: &Field, colref: &ColumnRefName) -> bool {
+    if field.name != colref.column {
+        return false;
+    }
+    if colref.schema.is_none() && colref.relation.is_none() {
+        return true;
+    }
+    let Some(origin) = &field.origin else {
+        return false;
+    };
+    if let Some(schema_name) = &colref.schema {
+        if origin.schema.as_ref() != Some(schema_name) {
+            return false;
+        }
+        if let Some(table_name) = &colref.relation {
+            return origin.table.as_ref() == Some(table_name);
+        }
+        return false;
+    }
+    if let Some(rel_name) = &colref.relation {
+        if origin.alias.as_ref() == Some(rel_name) {
+            return true;
+        }
+        if origin.table.as_ref() == Some(rel_name) {
+            return true;
+        }
+        return false;
+    }
+    true
 }
 
 fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {

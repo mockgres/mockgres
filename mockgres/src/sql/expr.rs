@@ -1,5 +1,6 @@
 use crate::engine::{
-    BoolExpr, CmpOp, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value, fe,
+    BoolExpr, CmpOp, ColumnRefName, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value,
+    fe,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
@@ -84,7 +85,7 @@ pub fn parse_bool_expr(node: &NodeEnum) -> PgWireResult<BoolExpr> {
 
 pub fn parse_scalar_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
     match node {
-        NodeEnum::ColumnRef(cr) => Ok(ScalarExpr::Column(last_colref_name(cr)?)),
+        NodeEnum::ColumnRef(cr) => Ok(ScalarExpr::Column(parse_column_ref(cr)?)),
         NodeEnum::ParamRef(pr) => parse_param_ref(pr),
         NodeEnum::AExpr(ax) => parse_arithmetic_expr(ax),
         NodeEnum::FuncCall(fc) => parse_function_call(fc),
@@ -263,7 +264,7 @@ pub fn parse_function_call(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
 
 pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
     match expr {
-        ScalarExpr::Column(name) => out.push(name.clone()),
+        ScalarExpr::Column(col) => out.push(col.column.clone()),
         ScalarExpr::ColumnIdx(_) | ScalarExpr::Literal(_) => {}
         ScalarExpr::Param { .. } => {}
         ScalarExpr::BinaryOp { left, right, .. } => {
@@ -299,7 +300,7 @@ pub fn collect_columns_from_bool_expr(expr: &BoolExpr, out: &mut Vec<String>) {
 
 pub fn derive_expr_name(expr: &ScalarExpr) -> String {
     match expr {
-        ScalarExpr::Column(name) => name.clone(),
+        ScalarExpr::Column(col) => col.column.clone(),
         ScalarExpr::ColumnIdx(idx) => format!("?column{}?", idx + 1),
         ScalarExpr::Param { idx, .. } => format!("param{}", idx + 1),
         ScalarExpr::Literal(_) => "?column?".into(),
@@ -310,17 +311,30 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
     }
 }
 
-pub fn last_colref_name(cr: &ColumnRef) -> PgWireResult<String> {
-    let last = cr
-        .fields
-        .last()
-        .and_then(|n| n.node.as_ref())
-        .ok_or_else(|| fe("bad colref"))?;
-    if let NodeEnum::String(s) = last {
-        Ok(s.sval.clone())
-    } else {
-        Err(fe("bad colref"))
+pub fn parse_column_ref(cr: &ColumnRef) -> PgWireResult<ColumnRefName> {
+    let mut parts = Vec::new();
+    for field in &cr.fields {
+        let node = field.node.as_ref().ok_or_else(|| fe("bad colref"))?;
+        match node {
+            NodeEnum::String(s) => parts.push(s.sval.clone()),
+            _ => return Err(fe("unsupported column reference")),
+        }
     }
+    if parts.is_empty() {
+        return Err(fe("bad colref"));
+    }
+    let column = parts.pop().unwrap();
+    let (schema, relation) = match parts.len() {
+        0 => (None, None),
+        1 => (None, Some(parts.remove(0))),
+        2 => (Some(parts.remove(0)), Some(parts.remove(0))),
+        _ => return Err(fe("column reference has too many qualifiers")),
+    };
+    Ok(ColumnRefName {
+        schema,
+        relation,
+        column,
+    })
 }
 
 fn parse_cmp_op(nodes: &[Node]) -> PgWireResult<CmpOp> {

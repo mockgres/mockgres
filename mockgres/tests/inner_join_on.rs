@@ -3,24 +3,7 @@ mod common;
 #[tokio::test(flavor = "multi_thread")]
 async fn inner_join_on_selects_matching_pairs() {
     let ctx = common::start().await;
-    ctx.client
-        .batch_execute("create table authors(author_pk int primary key, name text)")
-        .await
-        .unwrap();
-    ctx.client
-        .batch_execute("create table books(book_pk int primary key, author_fk int, title text)")
-        .await
-        .unwrap();
-    ctx.client
-        .batch_execute("insert into authors values (1,'Ada'), (2,'Bob')")
-        .await
-        .unwrap();
-    ctx.client
-        .batch_execute(
-            "insert into books values (10,1,'A'), (11,2,'B'), (12,2,'C'), (13,null,'Orphan')",
-        )
-        .await
-        .unwrap();
+    seed_authors_and_books(&ctx).await;
 
     let rows = ctx
         .client
@@ -43,6 +26,29 @@ async fn inner_join_on_selects_matching_pairs() {
             ("Bob".into(), "C".into()),
         ]
     );
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn qualified_column_refs_work_across_tables() {
+    let ctx = common::start().await;
+    seed_authors_and_books(&ctx).await;
+
+    let rows = ctx
+        .client
+        .query(
+            "select authors.author_pk, books.title
+           from authors
+           join books on authors.author_pk = books.author_fk
+          order by books.title",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let got: Vec<(i32, String)> = rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(got, vec![(1, "A".into()), (2, "B".into()), (2, "C".into())]);
 
     let _ = ctx.shutdown.send(());
 }
@@ -110,4 +116,46 @@ async fn non_inner_join_is_rejected_for_now() {
         .unwrap_err();
     assert!(err.to_string().contains("only INNER JOIN is supported"));
     let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn table_aliases_are_supported() {
+    let ctx = common::start().await;
+    seed_authors_and_books(&ctx).await;
+
+    let rows = ctx
+        .client
+        .query(
+            "select foo.name
+           from authors as foo
+          where foo.author_pk = 2",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "Bob".to_string());
+
+    let _ = ctx.shutdown.send(());
+}
+
+async fn seed_authors_and_books(ctx: &common::TestCtx) {
+    ctx.client
+        .batch_execute("create table authors(author_pk int primary key, name text)")
+        .await
+        .unwrap();
+    ctx.client
+        .batch_execute("create table books(book_pk int primary key, author_fk int, title text)")
+        .await
+        .unwrap();
+    ctx.client
+        .batch_execute("insert into authors values (1,'Ada'), (2,'Bob')")
+        .await
+        .unwrap();
+    ctx.client
+        .batch_execute(
+            "insert into books values (10,1,'A'), (11,2,'B'), (12,2,'C'), (13,null,'Orphan')",
+        )
+        .await
+        .unwrap();
 }

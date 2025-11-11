@@ -1,5 +1,6 @@
 use super::{DataType, Field, Schema, Value};
 use crate::catalog::{QualifiedName, SchemaName, TableId};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug)]
 pub enum CmpOp {
@@ -18,9 +19,28 @@ pub enum Expr {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ColumnRefName {
+    pub schema: Option<String>,
+    pub relation: Option<String>,
+    pub column: String,
+}
+
+impl fmt::Display for ColumnRefName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(schema) = &self.schema {
+            write!(f, "{schema}.")?;
+        }
+        if let Some(rel) = &self.relation {
+            write!(f, "{rel}.")?;
+        }
+        write!(f, "{}", self.column)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ScalarExpr {
     Literal(Value),
-    Column(String),
+    Column(ColumnRefName),
     ColumnIdx(usize),
     Cast {
         expr: Box<ScalarExpr>,
@@ -168,6 +188,7 @@ pub enum Plan {
     },
     UnboundSeqScan {
         table: ObjName,
+        alias: Option<String>,
         selection: Selection,
         lock: Option<LockRequest>,
     },

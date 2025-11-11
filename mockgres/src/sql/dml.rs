@@ -13,7 +13,7 @@ use pgwire::error::PgWireResult;
 
 use super::expr::{
     collect_columns_from_bool_expr, collect_columns_from_scalar_expr, derive_expr_name,
-    last_colref_name, parse_bool_expr, parse_scalar_expr,
+    parse_bool_expr, parse_column_ref, parse_scalar_expr,
 };
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
@@ -79,10 +79,11 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let mut first_table: Option<ObjName> = None;
     if !multi_from {
         plan = match plan {
-            Plan::UnboundSeqScan { table, .. } => {
+            Plan::UnboundSeqScan { table, alias, .. } => {
                 first_table = Some(table.clone());
                 Plan::UnboundSeqScan {
                     table,
+                    alias,
                     selection,
                     lock: lock_request,
                 }
@@ -175,6 +176,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             fields: vec![Field {
                 name: count_alias,
                 data_type: DataType::Int8,
+                origin: None,
             }],
         };
         plan = Plan::CountRows {
@@ -188,6 +190,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
                 .map(|(expr, name)| Field {
                     name: name.clone(),
                     data_type: infer_expr_type(expr),
+                    origin: None,
                 })
                 .collect(),
         };
@@ -555,9 +558,17 @@ fn parse_from_item(node: pg_query::Node) -> PgWireResult<(Plan, Option<BoolExpr>
                 schema,
                 name: rv.relname,
             };
+            let alias = rv.alias.and_then(|a| {
+                if a.aliasname.is_empty() {
+                    None
+                } else {
+                    Some(a.aliasname)
+                }
+            });
             Ok((
                 Plan::UnboundSeqScan {
                     table,
+                    alias,
                     selection: Selection::Star,
                     lock: None,
                 },
@@ -667,7 +678,7 @@ fn parse_order_clause(clause: &[pg_query::Node]) -> PgWireResult<Vec<SortKey>> {
                 }
             }
             NodeEnum::ColumnRef(cr) => SortKey::ByName {
-                col: last_colref_name(cr)?,
+                col: parse_column_ref(cr)?.column,
                 asc,
                 nulls_first,
             },
@@ -718,7 +729,7 @@ fn parse_insert_value_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
 
 fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
     match expr {
-        ScalarExpr::Column(_) => Err(fe("INSERT expressions cannot reference columns")),
+        ScalarExpr::Column(..) => Err(fe("INSERT expressions cannot reference columns")),
         ScalarExpr::BinaryOp { op, left, right } => Ok(ScalarExpr::BinaryOp {
             op,
             left: Box::new(sanitize_insert_expr(*left)?),
@@ -834,7 +845,7 @@ fn extract_col_name(rt: &ResTarget) -> PgWireResult<String> {
         return Err(fe("bad column target"));
     };
     if let NodeEnum::ColumnRef(cr) = v {
-        last_colref_name(cr)
+        Ok(parse_column_ref(cr)?.column)
     } else {
         Err(fe("only simple column names supported"))
     }

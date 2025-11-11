@@ -294,6 +294,7 @@ pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {
         fields: vec![Field {
             name: show.name.clone(),
             data_type: DataType::Text,
+            origin: None,
         }],
     };
     Ok(Plan::ShowVariable {
