@@ -67,6 +67,7 @@ pub enum ScalarFunc {
     Length,
     CurrentSchema,
     CurrentSchemas,
+    CurrentDatabase,
 }
 
 #[derive(Clone, Debug)]
@@ -115,6 +116,13 @@ pub type ObjName = QualifiedName;
 pub enum ReferentialAction {
     Restrict,
     Cascade,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DbDdlKind {
+    Create,
+    Drop,
+    Alter,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,6 +259,19 @@ pub enum Plan {
         name: SchemaName,
         new_name: SchemaName,
     },
+    CreateDatabase {
+        name: String,
+    },
+    DropDatabase {
+        name: String,
+    },
+    AlterDatabase {
+        name: String,
+    },
+    UnsupportedDbDDL {
+        kind: DbDdlKind,
+        name: String,
+    },
     ShowVariable {
         name: String,
         schema: Schema,
@@ -345,6 +366,10 @@ impl Plan {
             | Plan::CreateSchema { .. }
             | Plan::DropSchema { .. }
             | Plan::AlterSchemaRename { .. }
+            | Plan::CreateDatabase { .. }
+            | Plan::DropDatabase { .. }
+            | Plan::AlterDatabase { .. }
+            | Plan::UnsupportedDbDDL { .. }
             | Plan::SetVariable { .. }
             | Plan::BeginTransaction
             | Plan::CommitTransaction

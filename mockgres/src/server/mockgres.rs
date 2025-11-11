@@ -21,11 +21,12 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
-use crate::engine::{Plan, Value, fe, to_pgwire_stream};
+use crate::engine::{Plan, Value, fe, fe_code, to_pgwire_stream};
 use crate::session::{Session, SessionManager};
 use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
 
+use super::ServerConfig;
 use super::describe::plan_fields;
 use super::exec_builder::{build_executor, command_tag};
 use super::params::{build_params_for_portal, plan_parameter_types};
@@ -35,15 +36,29 @@ pub struct Mockgres {
     pub db: Arc<RwLock<Db>>,
     session_manager: Arc<SessionManager>,
     pub txn_manager: Arc<TransactionManager>,
+    config: ServerConfig,
 }
 
 impl Mockgres {
     pub fn new(db: Arc<RwLock<Db>>) -> Self {
+        Self::new_with_config(db, ServerConfig::default())
+    }
+
+    pub fn new_with_config(db: Arc<RwLock<Db>>, config: ServerConfig) -> Self {
         Self {
             db,
             session_manager: Arc::new(SessionManager::new()),
             txn_manager: Arc::new(TransactionManager::new()),
+            config,
         }
+    }
+
+    pub fn with_config(config: ServerConfig) -> Self {
+        Self::new_with_config(Arc::new(RwLock::new(Db::default())), config)
+    }
+
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
     }
 
     pub async fn serve(self: Arc<Self>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
@@ -63,21 +78,38 @@ impl NoopStartupHandler for Mockgres {
     async fn post_startup<C>(
         &self,
         client: &mut C,
-        _message: PgWireFrontendMessage,
+        message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.init_session(client);
+        if let PgWireFrontendMessage::Startup(startup) = &message {
+            let requested = startup
+                .parameters
+                .get("database")
+                .cloned()
+                .filter(|name| !name.is_empty());
+            let effective = requested
+                .clone()
+                .unwrap_or_else(|| self.config.database_name.clone());
+            if effective != self.config.database_name {
+                return Err(fe_code(
+                    "3D000",
+                    format!("database \"{}\" does not exist", effective),
+                ));
+            }
+        }
+        let session = self.init_session(client);
+        session.set_database_name(self.config.database_name.clone());
         Ok(())
     }
 }
 
 impl Default for Mockgres {
     fn default() -> Self {
-        Self::new(Arc::new(RwLock::new(Db::default())))
+        Self::with_config(ServerConfig::default())
     }
 }
 

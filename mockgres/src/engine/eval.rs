@@ -156,7 +156,7 @@ fn eval_function(func: ScalarFunc, args: Vec<Value>) -> PgWireResult<Value> {
             Some(Value::Null) | None => Ok(Value::Null),
             Some(other) => Err(fe(format!("length() unsupported for {:?}", other))),
         },
-        ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas => {
+        ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas | ScalarFunc::CurrentDatabase => {
             Err(fe("context-dependent function evaluated without binding"))
         }
     }

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 
 use crate::catalog::{SchemaId, SchemaName};
 use crate::db::{Db, LockHandle, LockOwner};
 use crate::engine::{
-    CountExec, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec, ObjName,
-    OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec,
-    UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    CountExec, DbDdlKind, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec,
+    ObjName, OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema,
+    SeqScanExec, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::session::{RowPointer, Session};
 use crate::storage::{Row, RowId};
@@ -140,6 +140,14 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CreateSchema { .. } => "CREATE SCHEMA",
         Plan::DropSchema { .. } => "DROP SCHEMA",
         Plan::AlterSchemaRename { .. } => "ALTER SCHEMA",
+        Plan::CreateDatabase { .. } => "CREATE DATABASE",
+        Plan::DropDatabase { .. } => "DROP DATABASE",
+        Plan::AlterDatabase { .. } => "ALTER DATABASE",
+        Plan::UnsupportedDbDDL { kind, .. } => match kind {
+            DbDdlKind::Create => "CREATE DATABASE",
+            DbDdlKind::Drop => "DROP DATABASE",
+            DbDdlKind::Alter => "ALTER DATABASE",
+        },
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
         Plan::InsertValues { .. } => "INSERT",
@@ -150,6 +158,21 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CommitTransaction => "COMMIT",
         Plan::RollbackTransaction => "ROLLBACK",
     }
+}
+
+fn unsupported_dbddl_error(kind: DbDdlKind) -> PgWireError {
+    let message = match kind {
+        DbDdlKind::Create => {
+            "CREATE DATABASE is not supported in mockgres; start a new instance instead."
+        }
+        DbDdlKind::Drop => {
+            "DROP DATABASE is not supported in mockgres; start a new instance instead."
+        }
+        DbDdlKind::Alter => {
+            "ALTER DATABASE is not supported in mockgres; start a new instance instead."
+        }
+    };
+    fe_code("0A000", message)
 }
 
 pub fn build_executor(
@@ -906,6 +929,10 @@ pub fn build_executor(
             }
             _ => Err(fe_code("0A000", format!("SET {} not supported", name))),
         },
+        Plan::UnsupportedDbDDL { kind, .. } => Err(unsupported_dbddl_error(*kind)),
+        Plan::CreateDatabase { .. } => Err(unsupported_dbddl_error(DbDdlKind::Create)),
+        Plan::DropDatabase { .. } => Err(unsupported_dbddl_error(DbDdlKind::Drop)),
+        Plan::AlterDatabase { .. } => Err(unsupported_dbddl_error(DbDdlKind::Alter)),
         Plan::BeginTransaction => {
             begin_transaction(session, txn_manager)?;
             Ok((

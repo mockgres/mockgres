@@ -34,6 +34,7 @@ pub struct SessionState {
     pub txn_epoch: Option<u64>,
     pub statement_epoch: Option<u64>,
     pub search_path: Vec<SchemaId>,
+    pub current_database: Option<String>,
 }
 
 impl Default for SessionState {
@@ -46,6 +47,7 @@ impl Default for SessionState {
             txn_epoch: None,
             statement_epoch: None,
             search_path: Vec::new(),
+            current_database: None,
         }
     }
 }
@@ -159,6 +161,15 @@ impl Session {
     pub fn set_search_path(&self, path: Vec<SchemaId>) {
         let mut guard = self.state.lock();
         guard.search_path = path;
+    }
+
+    pub fn set_database_name(&self, name: String) {
+        let mut guard = self.state.lock();
+        guard.current_database = Some(name);
+    }
+
+    pub fn database_name(&self) -> Option<String> {
+        self.state.lock().current_database.clone()
     }
 }
 

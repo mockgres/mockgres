@@ -4,9 +4,10 @@ use crate::engine::{
     fe_code,
 };
 use pg_query::protobuf::{
-    AlterTableStmt, AlterTableType, Constraint, CreateSchemaStmt, CreateStmt, DropBehavior,
-    DropStmt, IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, VariableSetKind,
-    VariableSetStmt, VariableShowStmt,
+    AlterDatabaseSetStmt, AlterDatabaseStmt, AlterTableStmt, AlterTableType, Constraint,
+    CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt, DropdbStmt, IndexStmt,
+    ObjectType, RangeVar, RenameStmt, TransactionStmt, VariableSetKind, VariableSetStmt,
+    VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -218,6 +219,34 @@ pub(super) fn plan_create_schema(stmt: CreateSchemaStmt) -> PgWireResult<Plan> {
         name: SchemaName::new(stmt.schemaname),
         if_not_exists: stmt.if_not_exists,
     })
+}
+
+pub(super) fn plan_create_database(stmt: CreatedbStmt) -> PgWireResult<Plan> {
+    let name = require_database_name(&stmt.dbname)?;
+    Ok(Plan::CreateDatabase { name })
+}
+
+pub(super) fn plan_drop_database(stmt: DropdbStmt) -> PgWireResult<Plan> {
+    let name = require_database_name(&stmt.dbname)?;
+    Ok(Plan::DropDatabase { name })
+}
+
+pub(super) fn plan_alter_database(stmt: AlterDatabaseStmt) -> PgWireResult<Plan> {
+    let name = require_database_name(&stmt.dbname)?;
+    Ok(Plan::AlterDatabase { name })
+}
+
+pub(super) fn plan_alter_database_set(stmt: AlterDatabaseSetStmt) -> PgWireResult<Plan> {
+    let name = require_database_name(&stmt.dbname)?;
+    Ok(Plan::AlterDatabase { name })
+}
+
+fn require_database_name(name: &str) -> PgWireResult<String> {
+    if name.trim().is_empty() {
+        Err(fe("database name required"))
+    } else {
+        Ok(name.to_string())
+    }
 }
 
 pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {

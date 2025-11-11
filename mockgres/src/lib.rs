@@ -9,4 +9,4 @@ mod storage;
 mod txn;
 mod types;
 
-pub use server::Mockgres;
+pub use server::{Mockgres, ServerConfig};

@@ -129,6 +129,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }
+        | Plan::CreateDatabase { .. }
+        | Plan::DropDatabase { .. }
+        | Plan::AlterDatabase { .. }
+        | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::BeginTransaction
@@ -267,6 +271,10 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }
+        | Plan::CreateDatabase { .. }
+        | Plan::DropDatabase { .. }
+        | Plan::AlterDatabase { .. }
+        | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::BeginTransaction

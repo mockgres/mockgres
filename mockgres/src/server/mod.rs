@@ -1,3 +1,4 @@
+mod config;
 mod describe;
 mod errors;
 mod exec_builder;
@@ -6,4 +7,5 @@ mod mapping;
 mod mockgres;
 mod params;
 
+pub use config::ServerConfig;
 pub use mockgres::Mockgres;

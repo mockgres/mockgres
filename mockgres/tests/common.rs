@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
@@ -18,10 +19,11 @@ pub struct TestCtx {
 
 pub async fn start() -> TestCtx {
     let handler = Arc::new(mockgres::Mockgres::default());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_task = tokio::spawn(run_server(listener, handler.clone(), shutdown_rx));
+    start_with_handler(handler).await
+}
+
+pub async fn start_with_handler(handler: Arc<mockgres::Mockgres>) -> TestCtx {
+    let (addr, server_task, shutdown) = spawn_server(handler).await;
     let conn_str = format!("host={} port={} user=postgres", addr.ip(), addr.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
@@ -41,6 +43,16 @@ pub async fn start() -> TestCtx {
         shutdown,
         extra_connections: extras,
     }
+}
+
+pub async fn spawn_server(
+    handler: Arc<mockgres::Mockgres>,
+) -> (SocketAddr, JoinHandle<()>, tokio::sync::oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_task = tokio::spawn(run_server(listener, handler, shutdown_rx));
+    (addr, server_task, shutdown)
 }
 
 async fn run_server(
