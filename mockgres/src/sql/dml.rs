@@ -1,7 +1,8 @@
 use crate::catalog::{SchemaName, TableId};
 use crate::engine::{
-    DataType, Field, InsertSource, LockMode, LockRequest, LockSpec, ObjName, Plan, ReturningClause,
-    ReturningExpr, ScalarExpr, Schema, Selection, SortKey, UpdateSet, Value, fe, fe_code,
+    BoolExpr, DataType, Field, InsertSource, LockMode, LockRequest, LockSpec, ObjName, Plan,
+    ReturningClause, ReturningExpr, ScalarExpr, Schema, Selection, SortKey, UpdateSet, Value, fe,
+    fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
@@ -28,7 +29,8 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         }
     }
     let from_count = sel.from_clause.len();
-    let multi_from = from_count > 1;
+    let has_join = sel.from_clause.iter().any(|node| from_item_is_join(node));
+    let multi_from = from_count > 1 || has_join;
     let lock_request = parse_locking_clause(&mut sel.locking_clause, multi_from)?;
 
     let (mut selection, projection_items) = if count_star {
@@ -37,7 +39,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         parse_select_list(&mut sel.target_list)?
     };
 
-    let where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+    let mut where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
     } else {
         None
@@ -72,27 +74,37 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         project_prefix_len = None;
     }
 
-    let mut from_clause = sel.from_clause;
-    let first_table = parse_range_var(from_clause.remove(0))?;
-    let mut plan = Plan::UnboundSeqScan {
-        table: first_table.clone(),
-        selection: if multi_from {
-            Selection::Star
-        } else {
-            selection
-        },
-        lock: if multi_from { None } else { lock_request },
-    };
-    for rv in from_clause {
-        let table = parse_range_var(rv)?;
-        let right = Plan::UnboundSeqScan {
-            table,
-            selection: Selection::Star,
-            lock: None,
+    let mut from_nodes = sel.from_clause;
+    let (mut plan, mut accumulated_on) = parse_from_item(from_nodes.remove(0))?;
+    let mut first_table: Option<ObjName> = None;
+    if !multi_from {
+        plan = match plan {
+            Plan::UnboundSeqScan { table, .. } => {
+                first_table = Some(table.clone());
+                Plan::UnboundSeqScan {
+                    table,
+                    selection,
+                    lock: lock_request,
+                }
+            }
+            other => other,
         };
+    }
+    for item in from_nodes {
+        let (right, on) = parse_from_item(item)?;
         plan = Plan::UnboundJoin {
             left: Box::new(plan),
             right: Box::new(right),
+        };
+        if let Some(p) = on {
+            accumulated_on = combine_bool_exprs(accumulated_on, p);
+        }
+    }
+
+    if let Some(onp) = accumulated_on {
+        where_expr = match where_expr {
+            None => Some(onp),
+            Some(existing) => Some(BoolExpr::And(vec![existing, onp])),
         };
     }
 
@@ -119,6 +131,12 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     if let Some(req) = lock_request {
+        let first_table = first_table.ok_or_else(|| {
+            fe_code(
+                "0A000",
+                "FOR UPDATE is only supported for single-table SELECT statements",
+            )
+        })?;
         plan = Plan::LockRows {
             table: first_table,
             input: Box::new(plan),
@@ -519,20 +537,98 @@ fn parse_returning_clause(
     Ok(Some(ReturningClause { exprs }))
 }
 
-fn parse_range_var(node: pg_query::Node) -> PgWireResult<ObjName> {
-    let from = node.node.ok_or_else(|| fe("missing from"))?;
-    if let NodeEnum::RangeVar(rv) = from {
-        let schema = if rv.schemaname.is_empty() {
-            None
-        } else {
-            Some(SchemaName::new(rv.schemaname))
-        };
-        Ok(ObjName {
-            schema,
-            name: rv.relname,
-        })
+fn from_item_is_join(node: &pg_query::Node) -> bool {
+    matches!(node.node.as_ref(), Some(NodeEnum::JoinExpr(_)))
+}
+
+fn parse_from_item(node: pg_query::Node) -> PgWireResult<(Plan, Option<BoolExpr>)> {
+    use pg_query::NodeEnum;
+    let n = node.node.ok_or_else(|| fe("missing FROM item"))?;
+    match n {
+        NodeEnum::RangeVar(rv) => {
+            let schema = if rv.schemaname.is_empty() {
+                None
+            } else {
+                Some(SchemaName::new(rv.schemaname))
+            };
+            let table = ObjName {
+                schema,
+                name: rv.relname,
+            };
+            Ok((
+                Plan::UnboundSeqScan {
+                    table,
+                    selection: Selection::Star,
+                    lock: None,
+                },
+                None,
+            ))
+        }
+        NodeEnum::JoinExpr(j) => {
+            let jt = pg_query::protobuf::JoinType::try_from(j.jointype)
+                .unwrap_or(pg_query::protobuf::JoinType::JoinInner);
+            if jt != pg_query::protobuf::JoinType::JoinInner {
+                return Err(fe_code("0A000", "only INNER JOIN is supported"));
+            }
+            if !j.using_clause.is_empty() {
+                return Err(fe_code(
+                    "0A000",
+                    "JOIN ... USING (...) is not supported yet",
+                ));
+            }
+            let left_node = *j.larg.ok_or_else(|| fe("join missing left"))?;
+            let right_node = *j.rarg.ok_or_else(|| fe("join missing right"))?;
+            let (left_plan, left_on) = parse_from_item(left_node)?;
+            let (right_plan, right_on) = parse_from_item(right_node)?;
+            let subtree = Plan::UnboundJoin {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+            };
+            let on_expr_node = j.quals.and_then(|n| n.node);
+            let on_bool = if let Some(nn) = on_expr_node {
+                Some(parse_bool_expr(&nn)?)
+            } else {
+                None
+            };
+            let combined_on = combine_optional_bools(vec![left_on, right_on, on_bool]);
+            Ok((subtree, combined_on))
+        }
+        _ => Err(fe("unsupported FROM item")),
+    }
+}
+
+fn combine_bool_exprs(existing: Option<BoolExpr>, next: BoolExpr) -> Option<BoolExpr> {
+    match existing {
+        None => Some(next),
+        Some(prev) => Some(and_chain(vec![prev, next])),
+    }
+}
+
+fn combine_optional_bools(parts: Vec<Option<BoolExpr>>) -> Option<BoolExpr> {
+    let mut exprs = Vec::new();
+    for part in parts.into_iter().flatten() {
+        flatten_and(part, &mut exprs);
+    }
+    match exprs.len() {
+        0 => None,
+        1 => Some(exprs.remove(0)),
+        _ => Some(BoolExpr::And(exprs)),
+    }
+}
+
+fn and_chain(exprs: Vec<BoolExpr>) -> BoolExpr {
+    let mut flat = Vec::new();
+    for expr in exprs {
+        flatten_and(expr, &mut flat);
+    }
+    BoolExpr::And(flat)
+}
+
+fn flatten_and(expr: BoolExpr, acc: &mut Vec<BoolExpr>) {
+    if let BoolExpr::And(inner) = expr {
+        acc.extend(inner);
     } else {
-        Err(fe("unsupported FROM"))
+        acc.push(expr);
     }
 }
 
