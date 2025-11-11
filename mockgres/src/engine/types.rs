@@ -1,5 +1,10 @@
 use super::expr_plan::ScalarExpr;
-use crate::types::{parse_bytea_text, parse_date_str, parse_timestamp_str};
+use crate::session::SessionTimeZone;
+use crate::types::{
+    date_to_timestamptz, format_timestamp, format_timestamptz, parse_bytea_text, parse_date_str,
+    parse_timestamp_str, parse_timestamptz_str, timestamp_micros_to_date_days,
+    timestamp_to_timestamptz, timestamptz_to_date_days, timestamptz_to_timestamp,
+};
 use pgwire::api::Type;
 use pgwire::error::{ErrorInfo, PgWireError};
 use std::fmt;
@@ -53,6 +58,7 @@ pub enum DataType {
     Bool,
     Date,
     Timestamp,
+    Timestamptz,
     Bytea,
 }
 
@@ -66,6 +72,7 @@ impl DataType {
             DataType::Bool => Type::BOOL,
             DataType::Date => Type::DATE,
             DataType::Timestamp => Type::TIMESTAMP,
+            DataType::Timestamptz => Type::TIMESTAMPTZ,
             DataType::Bytea => Type::BYTEA,
         }
     }
@@ -116,6 +123,7 @@ pub enum Value {
     Bool(bool),
     Date(i32),
     TimestampMicros(i64),
+    TimestamptzMicros(i64),
     Bytes(Vec<u8>),
 }
 
@@ -130,6 +138,7 @@ impl PartialEq for Value {
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
             (TimestampMicros(a), TimestampMicros(b)) => a == b,
+            (TimestamptzMicros(a), TimestamptzMicros(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             _ => false,
         }
@@ -150,6 +159,7 @@ impl Hash for Value {
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
             TimestampMicros(t) => t.hash(state),
+            TimestamptzMicros(t) => t.hash(state),
             Bytes(b) => b.hash(state),
         }
     }
@@ -168,7 +178,11 @@ impl Value {
     }
 }
 
-pub fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value, SqlError> {
+pub fn cast_value_to_type(
+    val: Value,
+    target: &DataType,
+    tz: &SessionTimeZone,
+) -> Result<Value, SqlError> {
     match (target, val) {
         (DataType::Int4, Value::Int64(v)) => {
             if v < i32::MIN as i64 || v > i32::MAX as i64 {
@@ -204,6 +218,14 @@ pub fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value, SqlErr
             let f = f64::from_bits(bits);
             Ok(Value::Text(f.to_string()))
         }
+        (DataType::Text, Value::TimestampMicros(m)) => {
+            let text = format_timestamp(m).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::Text(text))
+        }
+        (DataType::Text, Value::TimestamptzMicros(m)) => {
+            let text = format_timestamptz(m, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::Text(text))
+        }
         (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),
         (DataType::Bool, Value::Text(s)) => {
             let lowered = s.to_ascii_lowercase();
@@ -221,15 +243,40 @@ pub fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value, SqlErr
             let days = parse_date_str(&s).map_err(|e| SqlError::new("22007", e))?;
             Ok(Value::Date(days))
         }
+        (DataType::Date, Value::TimestampMicros(m)) => {
+            let days = timestamp_micros_to_date_days(m).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::Date(days))
+        }
+        (DataType::Date, Value::TimestamptzMicros(m)) => {
+            let days = timestamptz_to_date_days(m, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::Date(days))
+        }
         (DataType::Timestamp, Value::TimestampMicros(m)) => Ok(Value::TimestampMicros(m)),
         (DataType::Timestamp, Value::Text(s)) => {
             let micros = parse_timestamp_str(&s).map_err(|e| SqlError::new("22007", e))?;
             Ok(Value::TimestampMicros(micros))
         }
+        (DataType::Timestamp, Value::TimestamptzMicros(m)) => {
+            let local = timestamptz_to_timestamp(m, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::TimestampMicros(local))
+        }
         (DataType::Bytea, Value::Bytes(bytes)) => Ok(Value::Bytes(bytes)),
         (DataType::Bytea, Value::Text(s)) => {
             let bytes = parse_bytea_text(&s).map_err(|e| SqlError::new("22001", e))?;
             Ok(Value::Bytes(bytes))
+        }
+        (DataType::Timestamptz, Value::TimestamptzMicros(m)) => Ok(Value::TimestamptzMicros(m)),
+        (DataType::Timestamptz, Value::TimestampMicros(m)) => {
+            let utc = timestamp_to_timestamptz(m, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::TimestamptzMicros(utc))
+        }
+        (DataType::Timestamptz, Value::Date(days)) => {
+            let utc = date_to_timestamptz(days, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::TimestamptzMicros(utc))
+        }
+        (DataType::Timestamptz, Value::Text(s)) => {
+            let micros = parse_timestamptz_str(&s, tz).map_err(|e| SqlError::new("22007", e))?;
+            Ok(Value::TimestamptzMicros(micros))
         }
         (_, Value::Null) => Ok(Value::Null),
         (dt, got) => Err(SqlError::new(

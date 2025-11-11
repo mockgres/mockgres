@@ -305,7 +305,11 @@ pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let name_lower = set.name.to_ascii_lowercase();
-    let supported = matches!(name_lower.as_str(), "client_min_messages" | "search_path");
+    let normalized = name_lower.replace(' ', "");
+    let supported = matches!(
+        normalized.as_str(),
+        "client_min_messages" | "search_path" | "timezone"
+    );
     if !supported {
         return Err(fe_code("0A000", format!("SET {} not supported", set.name)));
     }
@@ -322,8 +326,13 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
         }
         VariableSetKind::Undefined => return Err(fe("bad SET kind")),
     };
+    let plan_name = if normalized == "timezone" {
+        "timezone".to_string()
+    } else {
+        name_lower
+    };
     Ok(Plan::SetVariable {
-        name: name_lower,
+        name: plan_name,
         value,
     })
 }

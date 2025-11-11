@@ -1,3 +1,4 @@
+use crate::session::SessionTimeZone;
 use time::{Date, Duration, Month, PrimitiveDateTime, Time};
 
 #[allow(dead_code)] // reserved for upcoming binary wire support
@@ -12,6 +13,9 @@ const DATE_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[year]-[month]-[day]");
 const TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const SECONDS_PER_DAY: i64 = 86_400;
+const MICROS_PER_DAY: i64 = MICROS_PER_SECOND * SECONDS_PER_DAY;
 
 pub fn parse_date_str(s: &str) -> Result<i32, String> {
     let date = Date::parse(s, DATE_FORMAT).map_err(|e| e.to_string())?;
@@ -46,6 +50,106 @@ pub fn format_timestamp(micros: i64) -> Result<String, String> {
         .checked_add(duration)
         .ok_or_else(|| "timestamp out of range".to_string())?;
     dt.format(TIMESTAMP_FORMAT).map_err(|e| e.to_string())
+}
+
+fn micro_offset(offset_seconds: i32) -> Result<i64, String> {
+    (offset_seconds as i64)
+        .checked_mul(MICROS_PER_SECOND)
+        .ok_or_else(|| "timestamp out of range".to_string())
+}
+
+fn apply_offset(micros: i64, offset_seconds: i32, subtract: bool) -> Result<i64, String> {
+    let offset = micro_offset(offset_seconds)?;
+    if subtract {
+        micros
+            .checked_sub(offset)
+            .ok_or_else(|| "timestamp out of range".to_string())
+    } else {
+        micros
+            .checked_add(offset)
+            .ok_or_else(|| "timestamp out of range".to_string())
+    }
+}
+
+fn split_timestamptz_offset(input: &str) -> Result<(&str, Option<i32>), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("invalid timestamptz value".to_string());
+    }
+    if trimmed.ends_with('Z') || trimmed.ends_with('z') {
+        let dt = trimmed[..trimmed.len() - 1].trim_end();
+        return Ok((dt, Some(0)));
+    }
+    if let Some(idx) = trimmed.rfind(|c| c == '+' || c == '-') {
+        if idx > 10 {
+            let offset_part = &trimmed[idx..];
+            if offset_part.len() > 1
+                && offset_part[1..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == ':')
+            {
+                let tz = SessionTimeZone::parse(offset_part)
+                    .map_err(|_| "invalid timestamptz offset".to_string())?;
+                let dt = trimmed[..idx].trim_end();
+                return Ok((dt, Some(tz.offset_seconds())));
+            }
+        }
+    }
+    Ok((trimmed, None))
+}
+
+pub fn parse_timestamptz_str(s: &str, session_tz: &SessionTimeZone) -> Result<i64, String> {
+    let (dt_part, explicit_offset) = split_timestamptz_offset(s)?;
+    let local_micros = parse_timestamp_str(dt_part)?;
+    let offset_seconds = explicit_offset.unwrap_or_else(|| session_tz.offset_seconds());
+    apply_offset(local_micros, offset_seconds, true)
+}
+
+pub fn format_timestamptz(micros: i64, session_tz: &SessionTimeZone) -> Result<String, String> {
+    let local = apply_offset(micros, session_tz.offset_seconds(), false)?;
+    let mut text = format_timestamp(local)?;
+    let offset = session_tz.offset_string();
+    text.push_str(&offset);
+    Ok(text)
+}
+
+pub fn timestamp_to_timestamptz(
+    local_micros: i64,
+    session_tz: &SessionTimeZone,
+) -> Result<i64, String> {
+    apply_offset(local_micros, session_tz.offset_seconds(), true)
+}
+
+pub fn timestamptz_to_timestamp(
+    utc_micros: i64,
+    session_tz: &SessionTimeZone,
+) -> Result<i64, String> {
+    apply_offset(utc_micros, session_tz.offset_seconds(), false)
+}
+
+pub fn timestamptz_to_date_days(
+    utc_micros: i64,
+    session_tz: &SessionTimeZone,
+) -> Result<i32, String> {
+    let local = apply_offset(utc_micros, session_tz.offset_seconds(), false)?;
+    timestamp_micros_to_date_days(local)
+}
+
+pub fn date_to_timestamptz(days: i32, session_tz: &SessionTimeZone) -> Result<i64, String> {
+    let local = (days as i64)
+        .checked_mul(MICROS_PER_DAY)
+        .ok_or_else(|| "timestamp out of range".to_string())?;
+    apply_offset(local, session_tz.offset_seconds(), true)
+}
+
+pub fn timestamp_micros_to_date_days(micros: i64) -> Result<i32, String> {
+    let duration = Duration::microseconds(micros);
+    let epoch_dt = PrimitiveDateTime::new(epoch_date(), Time::MIDNIGHT);
+    let dt = epoch_dt
+        .checked_add(duration)
+        .ok_or_else(|| "timestamp out of range".to_string())?;
+    let days = (dt.date() - epoch_date()).whole_days();
+    i32::try_from(days).map_err(|_| "date out of range".to_string())
 }
 
 pub fn parse_bytea_text(s: &str) -> Result<Vec<u8>, String> {

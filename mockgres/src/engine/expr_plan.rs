@@ -88,6 +88,12 @@ pub enum ScalarFunc {
     CurrentSchema,
     CurrentSchemas,
     CurrentDatabase,
+    Now,
+    CurrentTimestamp,
+    StatementTimestamp,
+    TransactionTimestamp,
+    ClockTimestamp,
+    CurrentDate,
 }
 
 #[derive(Clone, Debug)]

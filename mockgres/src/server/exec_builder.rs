@@ -6,11 +6,11 @@ use pgwire::error::{PgWireError, PgWireResult};
 use crate::catalog::{SchemaId, SchemaName};
 use crate::db::{Db, LockHandle, LockOwner};
 use crate::engine::{
-    CountExec, DbDdlKind, ExecNode, Expr, FilterExec, LimitExec, LockSpec, NestedLoopJoinExec,
-    ObjName, OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema,
-    SeqScanExec, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    CountExec, DbDdlKind, EvalContext, ExecNode, Expr, FilterExec, LimitExec, LockSpec,
+    NestedLoopJoinExec, ObjName, OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr,
+    ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
-use crate::session::{RowPointer, Session};
+use crate::session::{RowPointer, Session, SessionTimeZone, now_utc_micros};
 use crate::storage::{Row, RowId};
 use crate::txn::{TransactionManager, TxId, TxnStatus, VisibilityContext};
 
@@ -182,6 +182,7 @@ pub fn build_executor(
     snapshot_xid: TxId,
     p: &Plan,
     params: Arc<Vec<Value>>,
+    ctx: &EvalContext,
 ) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
     match p {
         Plan::Values { rows, schema } => {
@@ -205,6 +206,7 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             Ok((
                 Box::new(ProjectExec::new(
@@ -212,6 +214,7 @@ pub fn build_executor(
                     child,
                     exprs.clone(),
                     params.clone(),
+                    ctx.clone(),
                 )),
                 None,
                 cnt,
@@ -226,6 +229,7 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             Ok((
                 Box::new(CountExec::new(schema.clone(), child)),
@@ -282,6 +286,7 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             let epoch = session
                 .current_epoch()
@@ -314,6 +319,7 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             let child_schema = child.schema().clone();
             let mut node: Box<dyn ExecNode> = Box::new(FilterExec::new(
@@ -321,6 +327,7 @@ pub fn build_executor(
                 child,
                 expr.clone(),
                 params.clone(),
+                ctx.clone(),
             ));
 
             if let Some(n) = *project_prefix_len {
@@ -334,7 +341,13 @@ pub fn build_executor(
                 let exprs: Vec<(ScalarExpr, String)> = (0..n)
                     .map(|i| (ScalarExpr::ColumnIdx(i), proj_fields[i].name.clone()))
                     .collect();
-                node = Box::new(ProjectExec::new(proj_schema, node, exprs, params.clone()));
+                node = Box::new(ProjectExec::new(
+                    proj_schema,
+                    node,
+                    exprs,
+                    params.clone(),
+                    ctx.clone(),
+                ));
             }
 
             Ok((node, None, None))
@@ -348,9 +361,16 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             let schema = child.schema().clone();
-            let exec = Box::new(OrderExec::new(schema, child, keys.clone(), params.clone())?);
+            let exec = Box::new(OrderExec::new(
+                schema,
+                child,
+                keys.clone(),
+                params.clone(),
+                ctx.clone(),
+            )?);
             Ok((exec, None, cnt))
         }
 
@@ -368,6 +388,7 @@ pub fn build_executor(
                 snapshot_xid,
                 input,
                 params.clone(),
+                ctx,
             )?;
             let remaining_after_offset = cnt.map(|c| c.saturating_sub(offset_val));
             let out_cnt = match (remaining_after_offset, limit_val) {
@@ -387,8 +408,15 @@ pub fn build_executor(
             right,
             schema,
         } => {
-            let (left_exec, _ltag, left_cnt) =
-                build_executor(db, txn_manager, session, snapshot_xid, left, params.clone())?;
+            let (left_exec, _ltag, left_cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                left,
+                params.clone(),
+                ctx,
+            )?;
             let (right_exec, _rtag, right_cnt) = build_executor(
                 db,
                 txn_manager,
@@ -396,6 +424,7 @@ pub fn build_executor(
                 snapshot_xid,
                 right,
                 params.clone(),
+                ctx,
             )?;
             let out_cnt = match (left_cnt, right_cnt) {
                 (Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
@@ -687,13 +716,13 @@ pub fn build_executor(
                 match &column_map {
                     Some(cols) => {
                         for (idx, src) in row.iter().enumerate() {
-                            let value = evaluate_insert_source(src, &params)?;
+                            let value = evaluate_insert_source(src, &params, ctx)?;
                             full[cols[idx]] = value;
                         }
                     }
                     None => {
                         for (idx, src) in row.iter().enumerate() {
-                            full[idx] = evaluate_insert_source(src, &params)?;
+                            full[idx] = evaluate_insert_source(src, &params, ctx)?;
                         }
                     }
                 }
@@ -702,7 +731,7 @@ pub fn build_executor(
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let (inserted, inserted_rows, inserted_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
                 let mut db = db.write();
-                match db.insert_full_rows(schema_name, &table.name, realized, txid) {
+                match db.insert_full_rows(schema_name, &table.name, realized, txid, ctx) {
                     Ok(res) => res,
                     Err(e) => {
                         finish_writer_tx(txn_manager, txid, autocommit, false);
@@ -720,7 +749,7 @@ pub fn build_executor(
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for INSERT");
-                let rows = materialize_returning_rows(&clause, &inserted_rows, &params)?;
+                let rows = materialize_returning_rows(&clause, &inserted_rows, &params, ctx)?;
                 Ok((
                     Box::new(ValuesExec::from_values(schema, rows)),
                     Some(tag),
@@ -774,6 +803,7 @@ pub fn build_executor(
                     &visibility,
                     txid,
                     lock_owner,
+                    ctx,
                 ) {
                     Ok(res) => res,
                     Err(e) => {
@@ -793,7 +823,7 @@ pub fn build_executor(
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for UPDATE");
-                let rows = materialize_returning_rows(&clause, &updated_rows, &params)?;
+                let rows = materialize_returning_rows(&clause, &updated_rows, &params, ctx)?;
                 Ok((
                     Box::new(ValuesExec::from_values(schema, rows)),
                     Some(tag),
@@ -831,6 +861,7 @@ pub fn build_executor(
                     &visibility,
                     txid,
                     lock_owner,
+                    ctx,
                 ) {
                     Ok(res) => res,
                     Err(e) => {
@@ -849,7 +880,7 @@ pub fn build_executor(
                 let schema = returning_schema
                     .clone()
                     .expect("returning schema missing for DELETE");
-                let rows = materialize_returning_rows(&clause, &removed_rows, &params)?;
+                let rows = materialize_returning_rows(&clause, &removed_rows, &params, ctx)?;
                 Ok((
                     Box::new(ValuesExec::from_values(schema, rows)),
                     Some(tag),
@@ -874,6 +905,8 @@ pub fn build_executor(
                         .collect::<Vec<_>>()
                 };
                 parts.join(", ")
+            } else if name == "timezone" || name == "time zone" {
+                session.time_zone().display_value().to_string()
             } else {
                 match super::mapping::lookup_show_value(name) {
                     Some(v) => v,
@@ -927,6 +960,23 @@ pub fn build_executor(
                     None,
                 ))
             }
+            "timezone" => {
+                let tz = match value {
+                    Some(values) => {
+                        if values.len() != 1 {
+                            return Err(fe("SET TIME ZONE requires a single value"));
+                        }
+                        SessionTimeZone::parse(&values[0]).map_err(|e| fe_code("22023", e))?
+                    }
+                    None => SessionTimeZone::Utc,
+                };
+                session.set_time_zone(tz);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
             _ => Err(fe_code("0A000", format!("SET {} not supported", name))),
         },
         Plan::UnsupportedDbDDL { kind, .. } => Err(unsupported_dbddl_error(*kind)),
@@ -967,6 +1017,7 @@ fn materialize_returning_rows(
     clause: &ReturningClause,
     rows: &[Row],
     params: &[Value],
+    ctx: &EvalContext,
 ) -> PgWireResult<Vec<Vec<Value>>> {
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -974,7 +1025,7 @@ fn materialize_returning_rows(
         for item in &clause.exprs {
             match item {
                 ReturningExpr::Expr { expr, .. } => {
-                    let value = eval_scalar_expr(row, expr, params)?;
+                    let value = eval_scalar_expr(row, expr, params, ctx)?;
                     projected.push(value);
                 }
                 ReturningExpr::Star => {
@@ -1118,6 +1169,7 @@ fn begin_transaction(
     session.begin_transaction_epoch();
     session.set_current_tx(Some(txid));
     session.reset_changes();
+    session.set_txn_start_micros(now_utc_micros());
     Ok(())
 }
 
@@ -1132,6 +1184,7 @@ fn commit_transaction(
     txn_manager.set_status(txid, TxnStatus::Committed);
     session.set_current_tx(None);
     session.reset_changes();
+    session.clear_txn_start_micros();
     if let Some(epoch) = session.end_transaction_epoch() {
         let db_read = db.read();
         db_read.release_locks(LockOwner::new(session.id(), epoch));
@@ -1149,6 +1202,7 @@ fn rollback_transaction(
     };
     let changes = session.take_changes();
     session.set_current_tx(None);
+    session.clear_txn_start_micros();
     {
         let mut db = db.write();
         db.rollback_transaction_changes(&changes, txid)

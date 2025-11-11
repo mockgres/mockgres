@@ -859,6 +859,7 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::Bool(_)) => DataType::Bool,
         ScalarExpr::Literal(Value::Date(_)) => DataType::Date,
         ScalarExpr::Literal(Value::TimestampMicros(_)) => DataType::Timestamp,
+        ScalarExpr::Literal(Value::TimestamptzMicros(_)) => DataType::Timestamptz,
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
         ScalarExpr::Cast { ty, .. } => ty.clone(),
         _ => DataType::Text,

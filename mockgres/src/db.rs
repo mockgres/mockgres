@@ -2,8 +2,8 @@ use crate::catalog::{
     Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, SchemaId, SchemaName, TableId, TableMeta,
 };
 use crate::engine::{
-    BoolExpr, Column, DataType, ForeignKeySpec, PrimaryKeySpec, ReferentialAction, ScalarExpr,
-    SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, EvalContext, ForeignKeySpec, PrimaryKeySpec, ReferentialAction,
+    ScalarExpr, SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
 };
 use crate::session::{RowPointer, SessionId, TxnChanges};
 use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
@@ -590,7 +590,13 @@ impl Db {
             default: None,
         };
         let append_value = if let Some(expr) = &default_expr {
-            eval_column_default(expr, &temp_column, new_col_index, &meta_snapshot)?
+            eval_column_default(
+                expr,
+                &temp_column,
+                new_col_index,
+                &meta_snapshot,
+                &EvalContext::default(),
+            )?
         } else if nullable {
             Value::Null
         } else {
@@ -831,6 +837,7 @@ impl Db {
         name: &str,
         mut rows: Vec<Vec<CellInput>>,
         txid: TxId,
+        ctx: &EvalContext,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self
             .catalog
@@ -864,13 +871,13 @@ impl Db {
                     CellInput::Value(v) => v,
                     CellInput::Default => {
                         if let Some(expr) = &col.default {
-                            eval_column_default(expr, col, i, &meta)?
+                            eval_column_default(expr, col, i, &meta, ctx)?
                         } else {
                             Value::Null
                         }
                     }
                 };
-                let coerced = coerce_value_for_column(value, col, i, &meta)?;
+                let coerced = coerce_value_for_column(value, col, i, &meta, ctx)?;
                 out.push(coerced);
             }
             let pk_key = self.build_primary_key_row_key(&meta, &out)?;
@@ -971,6 +978,7 @@ impl Db {
         visibility: &VisibilityContext,
         txid: TxId,
         lock_owner: LockOwner,
+        ctx: &EvalContext,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)> {
         let meta = self
             .catalog
@@ -1024,7 +1032,7 @@ impl Db {
                 };
                 let snapshot = versions[idx].data.clone();
                 let passes = if let Some(expr) = filter {
-                    eval_bool_expr(&snapshot, expr, params)
+                    eval_bool_expr(&snapshot, expr, params, ctx)
                         .map_err(|e| sql_err("XX000", e.to_string()))?
                         .unwrap_or(false)
                 } else {
@@ -1035,9 +1043,10 @@ impl Db {
                 }
                 let mut updated = snapshot.clone();
                 for (idx, expr) in sets {
-                    let value = eval_scalar_expr(&snapshot, expr, params)
+                    let value = eval_scalar_expr(&snapshot, expr, params, ctx)
                         .map_err(|e| sql_err("XX000", e.to_string()))?;
-                    let coerced = coerce_value_for_column(value, &meta.columns[*idx], *idx, &meta)?;
+                    let coerced =
+                        coerce_value_for_column(value, &meta.columns[*idx], *idx, &meta, ctx)?;
                     updated[*idx] = coerced;
                 }
                 let old_pk_key = self.build_primary_key_row_key(&meta, &snapshot)?;
@@ -1241,6 +1250,7 @@ impl Db {
         visibility: &VisibilityContext,
         txid: TxId,
         lock_owner: LockOwner,
+        ctx: &EvalContext,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self
             .catalog
@@ -1265,7 +1275,7 @@ impl Db {
                 };
                 let row = versions[idx].data.clone();
                 let passes = match filter {
-                    Some(expr) => eval_bool_expr(&row, expr, params)
+                    Some(expr) => eval_bool_expr(&row, expr, params, ctx)
                         .map_err(|e| sql_err("XX000", e.to_string()))?
                         .unwrap_or(false),
                     None => true,
@@ -1895,9 +1905,11 @@ fn eval_column_default(
     col: &Column,
     idx: usize,
     meta: &TableMeta,
+    ctx: &EvalContext,
 ) -> anyhow::Result<Value> {
-    let value = eval_scalar_expr(&[], expr, &[]).map_err(|e| sql_err("XX000", e.to_string()))?;
-    coerce_value_for_column(value, col, idx, meta)
+    let value =
+        eval_scalar_expr(&[], expr, &[], ctx).map_err(|e| sql_err("XX000", e.to_string()))?;
+    coerce_value_for_column(value, col, idx, meta, ctx)
 }
 
 fn coerce_value_for_column(
@@ -1905,6 +1917,7 @@ fn coerce_value_for_column(
     col: &Column,
     idx: usize,
     meta: &TableMeta,
+    ctx: &EvalContext,
 ) -> anyhow::Result<Value> {
     if let Value::Null = val {
         if !col.nullable {
@@ -1920,7 +1933,7 @@ fn coerce_value_for_column(
         }
         return Ok(Value::Null);
     }
-    let coerced = cast_value_to_type(val, &col.data_type).map_err(|e| {
+    let coerced = cast_value_to_type(val, &col.data_type, &ctx.time_zone).map_err(|e| {
         sql_err(
             e.code,
             format!("column {} (index {}): {}", col.name, idx, e.message),

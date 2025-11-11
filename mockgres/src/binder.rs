@@ -7,20 +7,49 @@ use crate::engine::{
     ObjName, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
     Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
-use crate::session::Session;
+use crate::session::{Session, now_utc_micros};
+use crate::types::timestamp_micros_to_date_days;
 use anyhow::Error;
 use pgwire::error::{PgWireError, PgWireResult};
+
+#[derive(Clone, Copy)]
+struct BindTimeContext {
+    statement_time_micros: Option<i64>,
+    txn_start_micros: Option<i64>,
+}
+
+impl BindTimeContext {
+    fn new(statement_time_micros: Option<i64>, txn_start_micros: Option<i64>) -> Self {
+        Self {
+            statement_time_micros,
+            txn_start_micros,
+        }
+    }
+
+    fn statement_or_now(&self) -> i64 {
+        self.statement_time_micros.unwrap_or_else(now_utc_micros)
+    }
+
+    fn txn_or_statement_or_now(&self) -> i64 {
+        self.txn_start_micros
+            .or(self.statement_time_micros)
+            .unwrap_or_else(now_utc_micros)
+    }
+}
 
 pub fn bind(db: &Db, session: &Session, p: Plan) -> PgWireResult<Plan> {
     let search_path = session.search_path();
     let current_database = session.database_name();
-    bind_with_search_path(db, &search_path, current_database.as_deref(), p)
+    let time_ctx =
+        BindTimeContext::new(session.statement_time_micros(), session.txn_start_micros());
+    bind_with_search_path(db, &search_path, current_database.as_deref(), time_ctx, p)
 }
 
 fn bind_with_search_path(
     db: &Db,
     search_path: &[SchemaId],
     current_database: Option<&str>,
+    time_ctx: BindTimeContext,
     p: Plan,
 ) -> PgWireResult<Plan> {
     match p {
@@ -109,8 +138,10 @@ fn bind_with_search_path(
             })
         }
         Plan::UnboundJoin { left, right } => {
-            let left_bound = bind_with_search_path(db, search_path, current_database, *left)?;
-            let right_bound = bind_with_search_path(db, search_path, current_database, *right)?;
+            let left_bound =
+                bind_with_search_path(db, search_path, current_database, time_ctx, *left)?;
+            let right_bound =
+                bind_with_search_path(db, search_path, current_database, time_ctx, *right)?;
             let mut fields = left_bound.schema().fields.clone();
             fields.extend(right_bound.schema().fields.clone());
             Ok(Plan::Join {
@@ -125,7 +156,7 @@ fn bind_with_search_path(
             exprs,
             schema: _,
         } => {
-            let child = bind_with_search_path(db, search_path, current_database, *input)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             let mut bound_exprs = Vec::with_capacity(exprs.len());
             let mut fields = Vec::with_capacity(exprs.len());
             for (expr, name) in exprs {
@@ -136,6 +167,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?;
                 let dt = scalar_expr_type(&bound, child.schema()).unwrap_or(DataType::Text);
                 fields.push(Field {
@@ -153,7 +185,7 @@ fn bind_with_search_path(
         }
 
         Plan::CountRows { input, schema } => {
-            let child = bind_with_search_path(db, search_path, current_database, *input)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             Ok(Plan::CountRows {
                 input: Box::new(child),
                 schema,
@@ -166,7 +198,8 @@ fn bind_with_search_path(
             row_id_idx: _,
             schema: _,
         } => {
-            let bound_child = bind_with_search_path(db, search_path, current_database, *input)?;
+            let bound_child =
+                bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             let child_schema = bound_child.schema().clone();
             if child_schema.fields.is_empty() {
                 return Err(fe("FOR UPDATE requires row identifier column"));
@@ -201,9 +234,15 @@ fn bind_with_search_path(
             expr,
             project_prefix_len,
         } => {
-            let child = bind_with_search_path(db, search_path, current_database, *input)?;
-            let bound_expr =
-                bind_bool_expr(&expr, child.schema(), db, search_path, current_database)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
+            let bound_expr = bind_bool_expr(
+                &expr,
+                child.schema(),
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+            )?;
             let mut plan = Plan::Filter {
                 input: Box::new(child),
                 expr: bound_expr,
@@ -265,6 +304,7 @@ fn bind_with_search_path(
                             db,
                             search_path,
                             current_database,
+                            time_ctx,
                         )?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
@@ -284,6 +324,7 @@ fn bind_with_search_path(
                             db,
                             search_path,
                             current_database,
+                            time_ctx,
                         )?;
                         bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
                     }
@@ -296,6 +337,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?),
                 None => None,
             };
@@ -306,6 +348,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?),
                 None => None,
             };
@@ -350,6 +393,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?),
                 None => None,
             };
@@ -360,6 +404,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?),
                 None => None,
             };
@@ -371,7 +416,7 @@ fn bind_with_search_path(
             })
         }
         Plan::Order { input, keys } => {
-            let child = bind_with_search_path(db, search_path, current_database, *input)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             let child_schema = child.schema().clone();
             let mut bound_keys = Vec::with_capacity(keys.len());
             for key in keys {
@@ -404,6 +449,7 @@ fn bind_with_search_path(
                             db,
                             search_path,
                             current_database,
+                            time_ctx,
                         )?;
                         bound_keys.push(SortKey::Expr {
                             expr: bound,
@@ -424,7 +470,7 @@ fn bind_with_search_path(
             limit,
             offset,
         } => {
-            let child = bind_with_search_path(db, search_path, current_database, *input)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             Ok(Plan::Limit {
                 input: Box::new(child),
                 limit,
@@ -509,6 +555,7 @@ fn bind_with_search_path(
                                 | DataType::Bool
                                 | DataType::Date
                                 | DataType::Timestamp
+                                | DataType::Timestamptz
                                 | DataType::Bytea => Some(&field.data_type),
                                 _ => None,
                             };
@@ -519,6 +566,7 @@ fn bind_with_search_path(
                                 db,
                                 search_path,
                                 current_database,
+                                time_ctx,
                             )?;
                             bound_row.push(InsertSource::Expr(bound));
                         }
@@ -533,6 +581,7 @@ fn bind_with_search_path(
                     db,
                     search_path,
                     current_database,
+                    time_ctx,
                 )?),
                 None => None,
             };
@@ -602,6 +651,7 @@ fn bind_returning_clause(
     db: &Db,
     search_path: &[SchemaId],
     current_database: Option<&str>,
+    time_ctx: BindTimeContext,
 ) -> pgwire::error::PgWireResult<Schema> {
     let mut expanded = Vec::new();
     for item in clause.exprs.drain(..) {
@@ -627,7 +677,15 @@ fn bind_returning_clause(
     let mut fields = Vec::with_capacity(clause.exprs.len());
     for item in clause.exprs.iter_mut() {
         if let ReturningExpr::Expr { expr, alias } = item {
-            let bound = bind_scalar_expr(expr, schema, None, db, search_path, current_database)?;
+            let bound = bind_scalar_expr(
+                expr,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+            )?;
             let dt = scalar_expr_type(&bound, schema).unwrap_or(DataType::Text);
             fields.push(Field {
                 name: alias.clone(),
@@ -646,14 +704,29 @@ fn bind_bool_expr(
     db: &Db,
     search_path: &[SchemaId],
     current_database: Option<&str>,
+    time_ctx: BindTimeContext,
 ) -> pgwire::error::PgWireResult<BoolExpr> {
     Ok(match expr {
         BoolExpr::Literal(b) => BoolExpr::Literal(*b),
         BoolExpr::Comparison { lhs, op, rhs } => {
-            let mut lhs_bound =
-                bind_scalar_expr(lhs, schema, None, db, search_path, current_database)?;
-            let mut rhs_bound =
-                bind_scalar_expr(rhs, schema, None, db, search_path, current_database)?;
+            let mut lhs_bound = bind_scalar_expr(
+                lhs,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+            )?;
+            let mut rhs_bound = bind_scalar_expr(
+                rhs,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+            )?;
             let lhs_hint = scalar_expr_type(&lhs_bound, schema);
             let rhs_hint = scalar_expr_type(&rhs_bound, schema);
             apply_param_hint(&mut lhs_bound, rhs_hint.as_ref());
@@ -667,13 +740,13 @@ fn bind_bool_expr(
         BoolExpr::And(exprs) => BoolExpr::And(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database))
+                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database, time_ctx))
                 .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
         ),
         BoolExpr::Or(exprs) => BoolExpr::Or(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database))
+                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database, time_ctx))
                 .collect::<pgwire::error::PgWireResult<Vec<_>>>()?,
         ),
         BoolExpr::Not(inner) => BoolExpr::Not(Box::new(bind_bool_expr(
@@ -682,9 +755,18 @@ fn bind_bool_expr(
             db,
             search_path,
             current_database,
+            time_ctx,
         )?)),
         BoolExpr::IsNull { expr, negated } => BoolExpr::IsNull {
-            expr: bind_scalar_expr(expr, schema, None, db, search_path, current_database)?,
+            expr: bind_scalar_expr(
+                expr,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+            )?,
             negated: *negated,
         },
     })
@@ -697,6 +779,7 @@ fn bind_scalar_expr(
     db: &Db,
     search_path: &[SchemaId],
     current_database: Option<&str>,
+    time_ctx: BindTimeContext,
 ) -> pgwire::error::PgWireResult<ScalarExpr> {
     Ok(match expr {
         ScalarExpr::Literal(v) => ScalarExpr::Literal(v.clone()),
@@ -718,6 +801,7 @@ fn bind_scalar_expr(
                 db,
                 search_path,
                 current_database,
+                time_ctx,
             )?),
             right: Box::new(bind_scalar_expr(
                 right,
@@ -726,6 +810,7 @@ fn bind_scalar_expr(
                 db,
                 search_path,
                 current_database,
+                time_ctx,
             )?),
         },
         ScalarExpr::UnaryOp { op, expr } => ScalarExpr::UnaryOp {
@@ -737,6 +822,7 @@ fn bind_scalar_expr(
                 db,
                 search_path,
                 current_database,
+                time_ctx,
             )?),
         },
         ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
@@ -747,13 +833,16 @@ fn bind_scalar_expr(
                 db,
                 search_path,
                 current_database,
+                time_ctx,
             )?),
             ty: ty.clone(),
         },
         ScalarExpr::Func { func, args } => {
             let bound_args = args
                 .iter()
-                .map(|a| bind_scalar_expr(a, schema, hint, db, search_path, current_database))
+                .map(|a| {
+                    bind_scalar_expr(a, schema, hint, db, search_path, current_database, time_ctx)
+                })
                 .collect::<pgwire::error::PgWireResult<Vec<_>>>()?;
             match func {
                 ScalarFunc::CurrentSchema => {
@@ -783,6 +872,42 @@ fn bind_scalar_expr(
                         return Err(fe("current_database() is not available in this context"));
                     };
                     ScalarExpr::Literal(Value::Text(name.to_string()))
+                }
+                ScalarFunc::Now | ScalarFunc::CurrentTimestamp => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("current_timestamp does not take arguments"));
+                    }
+                    ScalarExpr::Literal(Value::TimestamptzMicros(
+                        time_ctx.txn_or_statement_or_now(),
+                    ))
+                }
+                ScalarFunc::StatementTimestamp => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("statement_timestamp() takes no arguments"));
+                    }
+                    ScalarExpr::Literal(Value::TimestamptzMicros(time_ctx.statement_or_now()))
+                }
+                ScalarFunc::TransactionTimestamp => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("transaction_timestamp() takes no arguments"));
+                    }
+                    ScalarExpr::Literal(Value::TimestamptzMicros(
+                        time_ctx.txn_or_statement_or_now(),
+                    ))
+                }
+                ScalarFunc::ClockTimestamp => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("clock_timestamp() takes no arguments"));
+                    }
+                    ScalarExpr::Literal(Value::TimestamptzMicros(now_utc_micros()))
+                }
+                ScalarFunc::CurrentDate => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("current_date takes no arguments"));
+                    }
+                    let micros = time_ctx.statement_or_now();
+                    let days = timestamp_micros_to_date_days(micros).map_err(fe)?;
+                    ScalarExpr::Literal(Value::Date(days))
                 }
                 _ => ScalarExpr::Func {
                     func: *func,
@@ -859,6 +984,7 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
             Value::Bool(_) => Some(DataType::Bool),
             Value::Date(_) => Some(DataType::Date),
             Value::TimestampMicros(_) => Some(DataType::Timestamp),
+            Value::TimestamptzMicros(_) => Some(DataType::Timestamptz),
             Value::Bytes(_) => Some(DataType::Bytea),
             Value::Null => None,
         },
@@ -893,6 +1019,12 @@ fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
             | ScalarFunc::CurrentDatabase => Some(DataType::Text),
             ScalarFunc::CurrentSchemas => Some(DataType::Text),
             ScalarFunc::Length => Some(DataType::Int4),
+            ScalarFunc::Now
+            | ScalarFunc::CurrentTimestamp
+            | ScalarFunc::StatementTimestamp
+            | ScalarFunc::TransactionTimestamp
+            | ScalarFunc::ClockTimestamp => Some(DataType::Timestamptz),
+            ScalarFunc::CurrentDate => Some(DataType::Date),
             ScalarFunc::Coalesce => args
                 .iter()
                 .filter_map(|a| scalar_expr_type(a, schema))

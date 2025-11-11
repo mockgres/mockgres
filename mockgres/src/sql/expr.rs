@@ -230,6 +230,12 @@ pub fn parse_function_call(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
         "current_schema" => ScalarFunc::CurrentSchema,
         "current_schemas" => ScalarFunc::CurrentSchemas,
         "current_database" => ScalarFunc::CurrentDatabase,
+        "now" => ScalarFunc::Now,
+        "current_timestamp" => ScalarFunc::CurrentTimestamp,
+        "statement_timestamp" => ScalarFunc::StatementTimestamp,
+        "transaction_timestamp" => ScalarFunc::TransactionTimestamp,
+        "clock_timestamp" => ScalarFunc::ClockTimestamp,
+        "current_date" => ScalarFunc::CurrentDate,
         other => return Err(fe(format!("unsupported function: {other}"))),
     };
     match func {
@@ -256,6 +262,16 @@ pub fn parse_function_call(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
         ScalarFunc::CurrentDatabase => {
             if !args.is_empty() {
                 return Err(fe("current_database() takes no arguments"));
+            }
+        }
+        ScalarFunc::Now
+        | ScalarFunc::CurrentTimestamp
+        | ScalarFunc::StatementTimestamp
+        | ScalarFunc::TransactionTimestamp
+        | ScalarFunc::ClockTimestamp
+        | ScalarFunc::CurrentDate => {
+            if !args.is_empty() {
+                return Err(fe("function takes no arguments"));
             }
         }
     }

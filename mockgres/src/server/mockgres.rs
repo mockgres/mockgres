@@ -21,8 +21,8 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
-use crate::engine::{Plan, Value, fe, fe_code, to_pgwire_stream};
-use crate::session::{Session, SessionManager};
+use crate::engine::{EvalContext, Plan, Value, fe, fe_code, to_pgwire_stream};
+use crate::session::{Session, SessionManager, now_utc_micros};
 use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
 
@@ -124,15 +124,15 @@ impl SimpleQueryHandler for Mockgres {
         match Planner::plan_sql(query) {
             Ok(lp0) => {
                 let session = self.session_for_client(client)?;
+                let params: Arc<Vec<Value>> = Arc::new(Vec::new());
+                let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
+                let snapshot_xid = self.capture_statement_snapshot(&session);
+                let eval_ctx = EvalContext::from_session(&session);
                 // bind (names -> positions) using catalog
                 let bound = {
                     let db_read = self.db.read();
                     bind(&db_read, &session, lp0)?
                 };
-
-                let params: Arc<Vec<Value>> = Arc::new(Vec::new());
-                let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
-                let snapshot_xid = self.capture_statement_snapshot(&session);
                 let (exec, tag, row_count) = build_executor(
                     &self.db,
                     &self.txn_manager,
@@ -140,8 +140,10 @@ impl SimpleQueryHandler for Mockgres {
                     snapshot_xid,
                     &bound,
                     params,
+                    &eval_ctx,
                 )?;
-                let (fields, rows) = to_pgwire_stream(exec, FieldFormat::Text).await?;
+                let (fields, rows) =
+                    to_pgwire_stream(exec, FieldFormat::Text, eval_ctx.clone()).await?;
                 let mut qr = QueryResponse::new(fields, rows);
                 let tag_text = if let Some(t) = tag {
                     t
@@ -221,14 +223,15 @@ impl ExtendedQueryHandler for Mockgres {
         };
 
         let session = self.session_for_client(client)?;
+        let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
+        let snapshot_xid = self.capture_statement_snapshot(&session);
+        let eval_ctx = EvalContext::from_session(&session);
         let bound = {
             let db = self.db.read();
             bind(&db, &session, portal.statement.statement.clone())?
         };
 
-        let params = build_params_for_portal(&bound, portal)?;
-        let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
-        let snapshot_xid = self.capture_statement_snapshot(&session);
+        let params = build_params_for_portal(&bound, portal, &eval_ctx.time_zone)?;
         let (exec, tag, row_count) = build_executor(
             &self.db,
             &self.txn_manager,
@@ -236,8 +239,9 @@ impl ExtendedQueryHandler for Mockgres {
             snapshot_xid,
             &bound,
             params.clone(),
+            &eval_ctx,
         )?;
-        let (fields, rows) = to_pgwire_stream(exec, fmt).await?;
+        let (fields, rows) = to_pgwire_stream(exec, fmt, eval_ctx.clone()).await?;
         let mut qr = QueryResponse::new(fields, rows);
         let tag_text = if let Some(t) = tag {
             t
@@ -341,6 +345,7 @@ impl Mockgres {
     fn capture_statement_snapshot(&self, session: &Arc<Session>) -> TxId {
         let snapshot = self.txn_manager.snapshot_xid();
         session.set_statement_xid(snapshot);
+        session.set_statement_time_micros(now_utc_micros());
         snapshot
     }
 }

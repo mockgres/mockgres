@@ -10,9 +10,10 @@ use crate::engine::{
     BoolExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr, UpdateSet,
     Value, fe,
 };
+use crate::session::SessionTimeZone;
 use crate::types::{
-    parse_bytea_text, parse_date_str, parse_timestamp_str, postgres_days_to_date,
-    postgres_micros_to_timestamp,
+    parse_bytea_text, parse_date_str, parse_timestamp_str, parse_timestamptz_str,
+    postgres_days_to_date, postgres_micros_to_timestamp,
 };
 
 use super::mapping::{map_datatype_to_pg_type, map_pg_type_to_datatype};
@@ -39,6 +40,7 @@ pub fn plan_parameter_types(plan: &Plan) -> Vec<Type> {
 pub fn build_params_for_portal(
     plan: &Plan,
     portal: &pgwire::api::portal::Portal<Plan>,
+    tz: &SessionTimeZone,
 ) -> PgWireResult<Arc<Vec<Value>>> {
     let mut hints = HashMap::new();
     collect_param_hints_from_plan(plan, &mut hints);
@@ -53,7 +55,7 @@ pub fn build_params_for_portal(
             .get(idx)
             .and_then(map_pg_type_to_datatype);
         let ty = ty_from_plan.or(ty_from_stmt);
-        let val = decode_param_value(raw.as_ref().map(|b| b.as_ref()), fmt, ty)?;
+        let val = decode_param_value(raw.as_ref().map(|b| b.as_ref()), fmt, ty, tz)?;
         values.push(val);
     }
     Ok(Arc::new(values))
@@ -342,6 +344,7 @@ pub fn decode_param_value(
     raw: Option<&[u8]>,
     fmt: FieldFormat,
     ty: Option<DataType>,
+    tz: &SessionTimeZone,
 ) -> PgWireResult<Value> {
     if raw.is_none() {
         return Ok(Value::Null);
@@ -349,12 +352,12 @@ pub fn decode_param_value(
     let bytes = raw.unwrap();
     let ty = ty.unwrap_or(DataType::Text);
     match fmt {
-        FieldFormat::Text => parse_text_value(bytes, &ty),
-        FieldFormat::Binary => parse_binary_value(bytes, &ty),
+        FieldFormat::Text => parse_text_value(bytes, &ty, tz),
+        FieldFormat::Binary => parse_binary_value(bytes, &ty, tz),
     }
 }
 
-fn parse_text_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
+fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWireResult<Value> {
     let s = std::str::from_utf8(bytes).map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
     match ty {
         DataType::Int4 => {
@@ -388,6 +391,10 @@ fn parse_text_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
             let micros = parse_timestamp_str(s).map_err(fe)?;
             Ok(Value::TimestampMicros(micros))
         }
+        DataType::Timestamptz => {
+            let micros = parse_timestamptz_str(s, tz).map_err(fe)?;
+            Ok(Value::TimestamptzMicros(micros))
+        }
         DataType::Bytea => {
             let bytes = parse_bytea_text(s).map_err(fe)?;
             Ok(Value::Bytes(bytes))
@@ -395,7 +402,7 @@ fn parse_text_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
     }
 }
 
-fn parse_binary_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
+fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgWireResult<Value> {
     match ty {
         DataType::Int4 => {
             let arr: [u8; 4] = bytes
@@ -442,6 +449,14 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType) -> PgWireResult<Value> {
             let pg_micros = i64::from_be_bytes(arr);
             let micros = postgres_micros_to_timestamp(pg_micros);
             Ok(Value::TimestampMicros(micros))
+        }
+        DataType::Timestamptz => {
+            let arr: [u8; 8] = bytes
+                .try_into()
+                .map_err(|_| fe("binary timestamptz must be 8 bytes"))?;
+            let pg_micros = i64::from_be_bytes(arr);
+            let micros = postgres_micros_to_timestamp(pg_micros);
+            Ok(Value::TimestamptzMicros(micros))
         }
     }
 }

@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use pgwire::error::PgWireResult;
 use std::sync::Arc;
 
-use super::eval::{eval_bool_expr, eval_scalar_expr};
+use super::eval::{EvalContext, eval_bool_expr, eval_scalar_expr};
 use super::{BoolExpr, Expr, ScalarExpr, Schema, SortKey, Value, fe};
 
 #[async_trait]
@@ -70,6 +70,7 @@ pub struct ProjectExec {
     input: Box<dyn ExecNode>,
     exprs: Vec<ScalarExpr>,
     params: Arc<Vec<Value>>,
+    ctx: EvalContext,
 }
 impl ProjectExec {
     pub fn new(
@@ -77,6 +78,7 @@ impl ProjectExec {
         input: Box<dyn ExecNode>,
         exprs_named: Vec<(ScalarExpr, String)>,
         params: Arc<Vec<Value>>,
+        ctx: EvalContext,
     ) -> Self {
         let exprs = exprs_named.into_iter().map(|(e, _)| e).collect();
         Self {
@@ -84,6 +86,7 @@ impl ProjectExec {
             input,
             exprs,
             params,
+            ctx,
         }
     }
 }
@@ -96,7 +99,7 @@ impl ExecNode for ProjectExec {
         if let Some(in_row) = self.input.next().await? {
             let mut out = Vec::with_capacity(self.exprs.len());
             for e in &self.exprs {
-                out.push(eval_scalar_expr(&in_row, e, &self.params)?);
+                out.push(eval_scalar_expr(&in_row, e, &self.params, &self.ctx)?);
             }
             Ok(Some(out))
         } else {
@@ -277,6 +280,7 @@ pub struct FilterExec {
     child: Box<dyn ExecNode>,
     expr: BoolExpr,
     params: Arc<Vec<Value>>,
+    ctx: EvalContext,
 }
 
 impl FilterExec {
@@ -285,12 +289,14 @@ impl FilterExec {
         child: Box<dyn ExecNode>,
         expr: BoolExpr,
         params: Arc<Vec<Value>>,
+        ctx: EvalContext,
     ) -> Self {
         Self {
             schema,
             child,
             expr,
             params,
+            ctx,
         }
     }
 }
@@ -304,7 +310,8 @@ impl ExecNode for FilterExec {
         loop {
             match self.child.next().await? {
                 Some(row) => {
-                    let pass = eval_bool_expr(&row, &self.expr, &self.params)?.unwrap_or(false);
+                    let pass =
+                        eval_bool_expr(&row, &self.expr, &self.params, &self.ctx)?.unwrap_or(false);
                     if pass {
                         return Ok(Some(row));
                     }
@@ -331,6 +338,7 @@ pub struct OrderExec {
     expr_specs: Vec<ScalarExpr>,
     params: Arc<Vec<Value>>,
     sorted: bool,
+    ctx: EvalContext,
 }
 
 struct OrderKeySpec {
@@ -350,6 +358,7 @@ impl OrderExec {
         child: Box<dyn ExecNode>,
         keys: Vec<SortKey>,
         params: Arc<Vec<Value>>,
+        ctx: EvalContext,
     ) -> PgWireResult<Self> {
         let mut expr_specs = Vec::new();
         let mut resolved_keys = Vec::with_capacity(keys.len());
@@ -410,6 +419,7 @@ impl OrderExec {
             expr_specs,
             params,
             sorted: false,
+            ctx,
         })
     }
 
@@ -424,7 +434,7 @@ impl OrderExec {
         while let Some(r) = child.next().await? {
             let mut expr_vals = Vec::with_capacity(self.expr_specs.len());
             for expr in &self.expr_specs {
-                expr_vals.push(eval_scalar_expr(&r, expr, &self.params)?);
+                expr_vals.push(eval_scalar_expr(&r, expr, &self.params, &self.ctx)?);
             }
             buf.push((r, expr_vals));
         }

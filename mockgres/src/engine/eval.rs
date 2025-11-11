@@ -1,5 +1,6 @@
+use crate::session::{Session, SessionTimeZone};
 use crate::types::{
-    date_days_to_postgres, format_bytea, format_date, format_timestamp,
+    date_days_to_postgres, format_bytea, format_date, format_timestamp, format_timestamptz,
     timestamp_to_postgres_micros,
 };
 use futures::{Stream, StreamExt, stream};
@@ -15,7 +16,37 @@ use super::{
     cast_value_to_type, fe, fe_code,
 };
 
-pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> PgWireResult<Value> {
+#[derive(Clone)]
+pub struct EvalContext {
+    pub time_zone: SessionTimeZone,
+}
+
+impl EvalContext {
+    pub fn new(time_zone: SessionTimeZone) -> Self {
+        Self { time_zone }
+    }
+
+    pub fn from_session(session: &Session) -> Self {
+        Self {
+            time_zone: session.time_zone(),
+        }
+    }
+}
+
+impl Default for EvalContext {
+    fn default() -> Self {
+        Self {
+            time_zone: SessionTimeZone::Utc,
+        }
+    }
+}
+
+pub fn eval_scalar_expr(
+    row: &[Value],
+    expr: &ScalarExpr,
+    params: &[Value],
+    ctx: &EvalContext,
+) -> PgWireResult<Value> {
     match expr {
         ScalarExpr::Literal(v) => Ok(v.clone()),
         ScalarExpr::ColumnIdx(i) => row
@@ -28,27 +59,28 @@ pub fn eval_scalar_expr(row: &[Value], expr: &ScalarExpr, params: &[Value]) -> P
             .cloned()
             .ok_or_else(|| fe("parameter index out of range")),
         ScalarExpr::BinaryOp { op, left, right } => {
-            let lv = eval_scalar_expr(row, left, params)?;
-            let rv = eval_scalar_expr(row, right, params)?;
+            let lv = eval_scalar_expr(row, left, params, ctx)?;
+            let rv = eval_scalar_expr(row, right, params, ctx)?;
             eval_binary_op(*op, lv, rv)
         }
         ScalarExpr::UnaryOp { op, expr } => {
-            let v = eval_scalar_expr(row, expr, params)?;
+            let v = eval_scalar_expr(row, expr, params, ctx)?;
             eval_unary_op(*op, v)
         }
         ScalarExpr::Func { func, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(eval_scalar_expr(row, arg, params)?);
+                evaluated.push(eval_scalar_expr(row, arg, params, ctx)?);
             }
             eval_function(*func, evaluated)
         }
         ScalarExpr::Cast { expr, ty } => {
-            let value = eval_scalar_expr(row, expr, params)?;
+            let value = eval_scalar_expr(row, expr, params, ctx)?;
             if matches!(value, Value::Null) {
                 Ok(Value::Null)
             } else {
-                cast_value_to_type(value, ty).map_err(|e| fe_code(e.code, e.message.clone()))
+                cast_value_to_type(value, ty, &ctx.time_zone)
+                    .map_err(|e| fe_code(e.code, e.message.clone()))
             }
         }
     }
@@ -159,6 +191,12 @@ fn eval_function(func: ScalarFunc, args: Vec<Value>) -> PgWireResult<Value> {
         ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas | ScalarFunc::CurrentDatabase => {
             Err(fe("context-dependent function evaluated without binding"))
         }
+        ScalarFunc::Now
+        | ScalarFunc::CurrentTimestamp
+        | ScalarFunc::StatementTimestamp
+        | ScalarFunc::TransactionTimestamp
+        | ScalarFunc::ClockTimestamp
+        | ScalarFunc::CurrentDate => Err(fe("timestamp function evaluated without binding")),
     }
 }
 
@@ -211,7 +249,7 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
         Value::Bool(b) => Some(if b { "t" } else { "f" }.into()),
         Value::Bytes(bytes) => Some(String::from_utf8_lossy(&bytes).into()),
-        Value::Date(_) | Value::TimestampMicros(_) => {
+        Value::Date(_) | Value::TimestampMicros(_) | Value::TimestamptzMicros(_) => {
             return Err(fe("text conversion not supported for date/timestamp"));
         }
     })
@@ -221,13 +259,14 @@ pub fn eval_bool_expr(
     row: &[Value],
     expr: &BoolExpr,
     params: &[Value],
+    ctx: &EvalContext,
 ) -> PgWireResult<Option<bool>> {
     use std::cmp::Ordering;
     Ok(match expr {
         BoolExpr::Literal(b) => Some(*b),
         BoolExpr::Comparison { lhs, op, rhs } => {
-            let lv = eval_scalar_expr(row, lhs, params)?;
-            let rv = eval_scalar_expr(row, rhs, params)?;
+            let lv = eval_scalar_expr(row, lhs, params, ctx)?;
+            let rv = eval_scalar_expr(row, rhs, params, ctx)?;
             let ord = compare_values(&lv, &rv);
             ord.map(|o| match op {
                 CmpOp::Eq => o == Ordering::Equal,
@@ -241,7 +280,7 @@ pub fn eval_bool_expr(
         BoolExpr::And(exprs) => {
             let mut saw_null = false;
             for e in exprs {
-                match eval_bool_expr(row, e, params)? {
+                match eval_bool_expr(row, e, params, ctx)? {
                     Some(true) => {}
                     Some(false) => return Ok(Some(false)),
                     None => saw_null = true,
@@ -252,7 +291,7 @@ pub fn eval_bool_expr(
         BoolExpr::Or(exprs) => {
             let mut saw_null = false;
             for e in exprs {
-                match eval_bool_expr(row, e, params)? {
+                match eval_bool_expr(row, e, params, ctx)? {
                     Some(true) => return Ok(Some(true)),
                     Some(false) => {}
                     None => saw_null = true,
@@ -260,12 +299,12 @@ pub fn eval_bool_expr(
             }
             if saw_null { None } else { Some(false) }
         }
-        BoolExpr::Not(inner) => match eval_bool_expr(row, inner, params)? {
+        BoolExpr::Not(inner) => match eval_bool_expr(row, inner, params, ctx)? {
             Some(v) => Some(!v),
             None => None,
         },
         BoolExpr::IsNull { expr, negated } => {
-            let v = eval_scalar_expr(row, expr, params)?;
+            let v = eval_scalar_expr(row, expr, params, ctx)?;
             match v {
                 Value::Null => Some(!*negated),
                 _ => Some(*negated),
@@ -325,6 +364,7 @@ fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::TimestampMicros(a), Value::TimestampMicros(b)) => a.cmp(b),
+        (Value::TimestamptzMicros(a), Value::TimestamptzMicros(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
         _ => return None,
     })
@@ -333,10 +373,12 @@ fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
 pub async fn to_pgwire_stream(
     mut node: Box<dyn ExecNode>,
     fmt: FieldFormat,
+    ctx: EvalContext,
 ) -> PgWireResult<(
     Arc<Vec<FieldInfo>>,
     impl Stream<Item = PgWireResult<DataRow>> + Send + 'static,
 )> {
+    let ctx = Arc::new(ctx);
     node.open().await?;
     let schema = node.schema().clone();
     let fields = Arc::new(
@@ -346,105 +388,130 @@ pub async fn to_pgwire_stream(
             .map(|f| FieldInfo::new(f.name.clone(), None, None, f.data_type.to_pg(), fmt))
             .collect::<Vec<_>>(),
     );
-
+    let ctx_stream = ctx.clone();
     let s = stream::unfold(
         (node, fields.clone(), schema),
-        move |(mut node, fields, schema)| async move {
-            match node.next().await {
-                Ok(Some(vals)) => {
-                    let mut enc = DataRowEncoder::new(fields.clone());
-                    for (i, v) in vals.into_iter().enumerate() {
-                        let dt = &schema.field(i).data_type;
-                        let res = match (v, dt) {
-                            (Value::Null, DataType::Int4) => enc.encode_field(&Option::<i32>::None),
-                            (Value::Null, DataType::Int8) => enc.encode_field(&Option::<i64>::None),
-                            (Value::Null, DataType::Float8) => {
-                                enc.encode_field(&Option::<f64>::None)
-                            }
-                            (Value::Null, DataType::Text) => {
-                                enc.encode_field(&Option::<String>::None)
-                            }
-                            (Value::Null, DataType::Bool) => {
-                                enc.encode_field(&Option::<bool>::None)
-                            }
-                            (Value::Null, DataType::Date) => {
-                                enc.encode_field(&Option::<String>::None)
-                            }
-                            (Value::Null, DataType::Timestamp) => {
-                                enc.encode_field(&Option::<String>::None)
-                            }
-                            (Value::Null, DataType::Bytea) => {
-                                enc.encode_field(&Option::<Vec<u8>>::None)
-                            }
-
-                            (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
-                            (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
-                            (Value::Int64(i), DataType::Float8) => {
-                                let f = i as f64;
-                                enc.encode_field(&f)
-                            }
-                            (Value::Float64Bits(b), DataType::Float8) => {
-                                let f = f64::from_bits(b);
-                                enc.encode_field(&f)
-                            }
-                            (Value::Text(s), DataType::Text) => enc.encode_field(&s),
-                            (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
-                            (Value::Date(days), DataType::Date) => {
-                                if fmt == FieldFormat::Binary {
-                                    let pg_days = date_days_to_postgres(days);
-                                    enc.encode_field(&pg_days)
-                                } else {
-                                    let text = match format_date(days) {
-                                        Ok(t) => t,
-                                        Err(e) => {
-                                            return Some((Err(fe(e)), (node, fields, schema)));
-                                        }
-                                    };
-                                    enc.encode_field(&text)
+        move |(mut node, fields, schema)| {
+            let ctx = ctx_stream.clone();
+            async move {
+                match node.next().await {
+                    Ok(Some(vals)) => {
+                        let mut enc = DataRowEncoder::new(fields.clone());
+                        for (i, v) in vals.into_iter().enumerate() {
+                            let dt = &schema.field(i).data_type;
+                            let res = match (v, dt) {
+                                (Value::Null, DataType::Int4) => {
+                                    enc.encode_field(&Option::<i32>::None)
                                 }
-                            }
-                            (Value::TimestampMicros(micros), DataType::Timestamp) => {
-                                if fmt == FieldFormat::Binary {
-                                    let pg_micros = timestamp_to_postgres_micros(micros);
-                                    enc.encode_field(&pg_micros)
-                                } else {
-                                    let text = match format_timestamp(micros) {
-                                        Ok(t) => t,
-                                        Err(e) => {
-                                            return Some((Err(fe(e)), (node, fields, schema)));
-                                        }
-                                    };
-                                    enc.encode_field(&text)
+                                (Value::Null, DataType::Int8) => {
+                                    enc.encode_field(&Option::<i64>::None)
                                 }
-                            }
-                            (Value::Bytes(bytes), DataType::Bytea) => {
-                                if fmt == FieldFormat::Binary {
-                                    enc.encode_field_with_type_and_format(
-                                        &bytes,
-                                        &Type::BYTEA,
-                                        FieldFormat::Binary,
-                                    )
-                                } else {
-                                    let text = format_bytea(bytes.as_slice());
-                                    enc.encode_field(&text)
+                                (Value::Null, DataType::Float8) => {
+                                    enc.encode_field(&Option::<f64>::None)
                                 }
+                                (Value::Null, DataType::Text) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Bool) => {
+                                    enc.encode_field(&Option::<bool>::None)
+                                }
+                                (Value::Null, DataType::Date) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Timestamp) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Timestamptz) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Bytea) => {
+                                    enc.encode_field(&Option::<Vec<u8>>::None)
+                                }
+                                (Value::Int64(i), DataType::Int4) => {
+                                    enc.encode_field(&(i as i32))
+                                }
+                                (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
+                                (Value::Int64(i), DataType::Float8) => {
+                                    let f = i as f64;
+                                    enc.encode_field(&f)
+                                }
+                                (Value::Float64Bits(b), DataType::Float8) => {
+                                    let f = f64::from_bits(b);
+                                    enc.encode_field(&f)
+                                }
+                                (Value::Text(s), DataType::Text) => enc.encode_field(&s),
+                                (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
+                                (Value::Date(days), DataType::Date) => {
+                                    if fmt == FieldFormat::Binary {
+                                        let pg_days = date_days_to_postgres(days);
+                                        enc.encode_field(&pg_days)
+                                    } else {
+                                        let text = match format_date(days) {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                return Some((Err(fe(e)), (node, fields, schema)));
+                                            }
+                                        };
+                                        enc.encode_field(&text)
+                                    }
+                                }
+                                (Value::TimestampMicros(micros), DataType::Timestamp) => {
+                                    if fmt == FieldFormat::Binary {
+                                        let pg_micros = timestamp_to_postgres_micros(micros);
+                                        enc.encode_field(&pg_micros)
+                                    } else {
+                                        let text = match format_timestamp(micros) {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                return Some((Err(fe(e)), (node, fields, schema)));
+                                            }
+                                        };
+                                        enc.encode_field(&text)
+                                    }
+                                }
+                                (Value::TimestamptzMicros(micros), DataType::Timestamptz) => {
+                                    if fmt == FieldFormat::Binary {
+                                        let pg_micros = timestamp_to_postgres_micros(micros);
+                                        enc.encode_field(&pg_micros)
+                                    } else {
+                                        let text = match format_timestamptz(micros, &ctx.time_zone) {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                return Some((Err(fe(e)), (node, fields, schema)));
+                                            }
+                                        };
+                                        enc.encode_field(&text)
+                                    }
+                                }
+                                (Value::Bytes(bytes), DataType::Bytea) => {
+                                    if fmt == FieldFormat::Binary {
+                                        enc.encode_field_with_type_and_format(
+                                            &bytes,
+                                            &Type::BYTEA,
+                                            FieldFormat::Binary,
+                                        )
+                                    } else {
+                                        let text = format_bytea(bytes.as_slice());
+                                        enc.encode_field(&text)
+                                    }
+                                }
+                                _ => Err(PgWireError::ApiError("type mismatch".into())),
+                            };
+                            if let Err(e) = res {
+                                return Some((Err(e), (node, fields, schema)));
                             }
-                            _ => Err(PgWireError::ApiError("type mismatch".into())),
-                        };
-                        if let Err(e) = res {
-                            return Some((Err(e), (node, fields, schema)));
+                        }
+                        match enc.finish() {
+                            Ok(dr) => Some((Ok(dr), (node, fields, schema))),
+                            Err(e) => Some((Err(e), (node, fields, schema))),
                         }
                     }
-                    match enc.finish() {
-                        Ok(dr) => Some((Ok(dr), (node, fields, schema))),
+                    Ok(None) => match node.close().await {
+                        Ok(()) => None,
                         Err(e) => Some((Err(e), (node, fields, schema))),
-                    }
-                }
-                Ok(None) => match node.close().await {
-                    Ok(()) => None,
+                    },
                     Err(e) => Some((Err(e), (node, fields, schema))),
-                },
-                Err(e) => Some((Err(e), (node, fields, schema))),
+                }
             }
         },
     )
@@ -470,6 +537,14 @@ mod tests {
         ScalarExpr::Literal(Value::from_f64(v))
     }
 
+    fn eval(expr: &ScalarExpr) -> Value {
+        eval_scalar_expr(&[], expr, &[], &EvalContext::default()).unwrap()
+    }
+
+    fn eval_bool(expr: &BoolExpr) -> Option<bool> {
+        eval_bool_expr(&[], expr, &[], &EvalContext::default()).unwrap()
+    }
+
     #[test]
     fn evaluates_all_arithmetic_ops() {
         let add = ScalarExpr::BinaryOp {
@@ -477,34 +552,28 @@ mod tests {
             left: Box::new(lit_int(2)),
             right: Box::new(lit_int(3)),
         };
-        assert_eq!(eval_scalar_expr(&[], &add, &[]).unwrap(), Value::Int64(5));
+        assert_eq!(eval(&add), Value::Int64(5));
 
         let sub = ScalarExpr::BinaryOp {
             op: ScalarBinaryOp::Sub,
             left: Box::new(lit_float(7.5)),
             right: Box::new(lit_int(2)),
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &sub, &[]).unwrap().as_f64().unwrap(),
-            5.5
-        );
+        assert_eq!(eval(&sub).as_f64().unwrap(), 5.5);
 
         let mul = ScalarExpr::BinaryOp {
             op: ScalarBinaryOp::Mul,
             left: Box::new(lit_int(4)),
             right: Box::new(lit_int(3)),
         };
-        assert_eq!(eval_scalar_expr(&[], &mul, &[]).unwrap(), Value::Int64(12));
+        assert_eq!(eval(&mul), Value::Int64(12));
 
         let div = ScalarExpr::BinaryOp {
             op: ScalarBinaryOp::Div,
             left: Box::new(lit_int(9)),
             right: Box::new(lit_int(2)),
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &div, &[]).unwrap().as_f64().unwrap(),
-            4.5
-        );
+        assert_eq!(eval(&div).as_f64().unwrap(), 4.5);
     }
 
     #[test]
@@ -514,22 +583,13 @@ mod tests {
             left: Box::new(lit_text("hello")),
             right: Box::new(lit_int(5)),
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &concat, &[]).unwrap(),
-            Value::Text("hello5".into())
-        );
+        assert_eq!(eval(&concat), Value::Text("hello5".into()));
 
         let negate = ScalarExpr::UnaryOp {
             op: ScalarUnaryOp::Negate,
             expr: Box::new(lit_float(1.5)),
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &negate, &[])
-                .unwrap()
-                .as_f64()
-                .unwrap(),
-            -1.5
-        );
+        assert_eq!(eval(&negate).as_f64().unwrap(), -1.5);
     }
 
     #[test]
@@ -538,28 +598,19 @@ mod tests {
             func: ScalarFunc::Upper,
             args: vec![lit_text("hi")],
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &upper, &[]).unwrap(),
-            Value::Text("HI".into())
-        );
+        assert_eq!(eval(&upper), Value::Text("HI".into()));
 
         let lower = ScalarExpr::Func {
             func: ScalarFunc::Lower,
             args: vec![lit_text("LOUD")],
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &lower, &[]).unwrap(),
-            Value::Text("loud".into())
-        );
+        assert_eq!(eval(&lower), Value::Text("loud".into()));
 
         let len_bytes = ScalarExpr::Func {
             func: ScalarFunc::Length,
             args: vec![ScalarExpr::Literal(Value::Bytes(b"abc".to_vec()))],
         };
-        assert_eq!(
-            eval_scalar_expr(&[], &len_bytes, &[]).unwrap(),
-            Value::Int64(3)
-        );
+        assert_eq!(eval(&len_bytes), Value::Int64(3));
     }
 
     #[test]
@@ -569,20 +620,20 @@ mod tests {
             op: CmpOp::Gt,
             rhs: lit_int(3),
         };
-        assert_eq!(eval_bool_expr(&[], &comparison, &[]).unwrap(), Some(true));
+        assert_eq!(eval_bool(&comparison), Some(true));
 
         let null_cmp = BoolExpr::Comparison {
             lhs: ScalarExpr::Literal(Value::Null),
             op: CmpOp::Eq,
             rhs: lit_int(1),
         };
-        assert_eq!(eval_bool_expr(&[], &null_cmp, &[]).unwrap(), None);
+        assert_eq!(eval_bool(&null_cmp), None);
 
         let is_null = BoolExpr::IsNull {
             expr: ScalarExpr::Literal(Value::Null),
             negated: false,
         };
-        assert_eq!(eval_bool_expr(&[], &is_null, &[]).unwrap(), Some(true));
+        assert_eq!(eval_bool(&is_null), Some(true));
     }
 
     #[test]
@@ -592,10 +643,7 @@ mod tests {
             ty: DataType::Date,
         };
         let expected_date = Value::Date(parse_date_str("2024-02-01").unwrap());
-        assert_eq!(
-            eval_scalar_expr(&[], &date_expr, &[]).unwrap(),
-            expected_date
-        );
+        assert_eq!(eval(&date_expr), expected_date);
 
         let ts_expr = ScalarExpr::Cast {
             expr: Box::new(lit_text("2024-02-01 12:34:56")),
@@ -603,6 +651,6 @@ mod tests {
         };
         let expected_ts =
             Value::TimestampMicros(parse_timestamp_str("2024-02-01 12:34:56").unwrap());
-        assert_eq!(eval_scalar_expr(&[], &ts_expr, &[]).unwrap(), expected_ts);
+        assert_eq!(eval(&ts_expr), expected_ts);
     }
 }

@@ -11,6 +11,7 @@ pub fn map_pg_type_to_datatype(t: &Type) -> Option<DataType> {
         Type::BOOL => Some(DataType::Bool),
         Type::DATE => Some(DataType::Date),
         Type::TIMESTAMP => Some(DataType::Timestamp),
+        Type::TIMESTAMPTZ => Some(DataType::Timestamptz),
         Type::BYTEA => Some(DataType::Bytea),
         _ => None,
     }
@@ -25,6 +26,7 @@ pub fn map_datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Bool => Type::BOOL,
         DataType::Date => Type::DATE,
         DataType::Timestamp => Type::TIMESTAMP,
+        DataType::Timestamptz => Type::TIMESTAMPTZ,
         DataType::Bytea => Type::BYTEA,
     }
 }

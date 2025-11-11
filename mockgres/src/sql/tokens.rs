@@ -60,6 +60,13 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
         && tokens[tokens.len() - 1] == "zone"
     {
         DataType::Timestamp
+    } else if tokens.len() >= 4
+        && tokens[tokens.len() - 4] == "timestamp"
+        && tokens[tokens.len() - 3] == "with"
+        && tokens[tokens.len() - 2] == "time"
+        && tokens[tokens.len() - 1] == "zone"
+    {
+        DataType::Timestamptz
     } else {
         match last {
             "int" | "int4" | "integer" => DataType::Int4,
@@ -69,6 +76,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "bool" | "boolean" => DataType::Bool,
             "date" => DataType::Date,
             "timestamp" => DataType::Timestamp,
+            "timestamptz" => DataType::Timestamptz,
             "bytea" => DataType::Bytea,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
@@ -241,6 +249,7 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         | Value::Bool(_)
                         | Value::Date(_)
                         | Value::TimestampMicros(_)
+                        | Value::TimestamptzMicros(_)
                         | Value::Bytes(_) => Err(fe("minus over non-numeric literal")),
                     },
                     _ => Err(fe("minus over non-const")),

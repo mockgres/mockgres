@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard};
+use time::OffsetDateTime;
 
 use crate::catalog::{SchemaId, TableId};
 use crate::storage::RowKey;
@@ -24,6 +25,92 @@ pub struct TxnChanges {
     pub updated_old: Vec<RowPointer>,
 }
 
+#[derive(Clone, Debug)]
+pub enum SessionTimeZone {
+    Utc,
+    FixedOffset { seconds: i32, display: String },
+}
+
+impl Default for SessionTimeZone {
+    fn default() -> Self {
+        SessionTimeZone::Utc
+    }
+}
+
+impl SessionTimeZone {
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let trimmed = input.trim();
+        if trimmed.eq_ignore_ascii_case("utc") || trimmed.eq_ignore_ascii_case("z") {
+            return Ok(SessionTimeZone::Utc);
+        }
+        let mut chars = trimmed.chars();
+        let Some(sign_char) = chars.next() else {
+            return Err("invalid time zone value".to_string());
+        };
+        if sign_char != '+' && sign_char != '-' {
+            return Err("invalid time zone offset".to_string());
+        }
+        let sign = if sign_char == '+' { 1 } else { -1 };
+        let rest = chars.as_str();
+        let (hour_part, minute_part) = if let Some(colon_idx) = rest.find(':') {
+            (&rest[..colon_idx], Some(&rest[colon_idx + 1..]))
+        } else {
+            (rest, None)
+        };
+        if hour_part.is_empty() {
+            return Err("invalid time zone hour".to_string());
+        }
+        let hours: i32 = hour_part
+            .parse()
+            .map_err(|_| "invalid time zone hour".to_string())?;
+        if hours.abs() > 15 {
+            return Err("time zone hour out of range".to_string());
+        }
+        let minutes: i32 = match minute_part {
+            Some(part) if !part.is_empty() => part
+                .parse()
+                .map_err(|_| "invalid time zone minute".to_string())?,
+            Some(_) => return Err("invalid time zone minute".to_string()),
+            None => 0,
+        };
+        if minutes < 0 || minutes >= 60 {
+            return Err("time zone minute out of range".to_string());
+        }
+        if hours == 15 && minutes > 0 {
+            return Err("time zone offset out of range".to_string());
+        }
+        let seconds = sign * (hours * 3600 + minutes * 60);
+        let display = format!(
+            "{}{:02}:{:02}",
+            if sign >= 0 { '+' } else { '-' },
+            hours.abs(),
+            minutes.abs()
+        );
+        Ok(SessionTimeZone::FixedOffset { seconds, display })
+    }
+
+    pub fn offset_seconds(&self) -> i32 {
+        match self {
+            SessionTimeZone::Utc => 0,
+            SessionTimeZone::FixedOffset { seconds, .. } => *seconds,
+        }
+    }
+
+    pub fn display_value(&self) -> &str {
+        match self {
+            SessionTimeZone::Utc => "UTC",
+            SessionTimeZone::FixedOffset { display, .. } => display.as_str(),
+        }
+    }
+
+    pub fn offset_string(&self) -> String {
+        match self {
+            SessionTimeZone::Utc => "+00:00".to_string(),
+            SessionTimeZone::FixedOffset { display, .. } => display.clone(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionState {
     pub current_tx: Option<TxId>,
@@ -35,6 +122,9 @@ pub struct SessionState {
     pub statement_epoch: Option<u64>,
     pub search_path: Vec<SchemaId>,
     pub current_database: Option<String>,
+    pub statement_time_micros: Option<i64>,
+    pub txn_start_micros: Option<i64>,
+    pub time_zone: SessionTimeZone,
 }
 
 impl Default for SessionState {
@@ -48,6 +138,9 @@ impl Default for SessionState {
             statement_epoch: None,
             search_path: Vec::new(),
             current_database: None,
+            statement_time_micros: None,
+            txn_start_micros: None,
+            time_zone: SessionTimeZone::default(),
         }
     }
 }
@@ -133,6 +226,7 @@ impl Session {
 
     pub fn exit_statement(&self) -> Option<u64> {
         let mut guard = self.state.lock();
+        guard.statement_time_micros = None;
         guard.statement_epoch.take()
     }
 
@@ -171,6 +265,38 @@ impl Session {
     pub fn database_name(&self) -> Option<String> {
         self.state.lock().current_database.clone()
     }
+
+    pub fn set_time_zone(&self, tz: SessionTimeZone) {
+        let mut guard = self.state.lock();
+        guard.time_zone = tz;
+    }
+
+    pub fn time_zone(&self) -> SessionTimeZone {
+        self.state.lock().time_zone.clone()
+    }
+
+    pub fn set_statement_time_micros(&self, micros: i64) {
+        let mut guard = self.state.lock();
+        guard.statement_time_micros = Some(micros);
+    }
+
+    pub fn statement_time_micros(&self) -> Option<i64> {
+        self.state.lock().statement_time_micros
+    }
+
+    pub fn set_txn_start_micros(&self, micros: i64) {
+        let mut guard = self.state.lock();
+        guard.txn_start_micros = Some(micros);
+    }
+
+    pub fn txn_start_micros(&self) -> Option<i64> {
+        self.state.lock().txn_start_micros
+    }
+
+    pub fn clear_txn_start_micros(&self) {
+        let mut guard = self.state.lock();
+        guard.txn_start_micros = None;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -202,4 +328,9 @@ impl SessionManager {
     pub fn remove(&self, id: SessionId) {
         self.sessions.remove(&id);
     }
+}
+
+pub fn now_utc_micros() -> i64 {
+    let now = OffsetDateTime::now_utc();
+    (now.unix_timestamp_nanos() / 1_000) as i64
 }
