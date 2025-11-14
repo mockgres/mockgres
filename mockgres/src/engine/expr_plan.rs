@@ -1,4 +1,4 @@
-use super::{DataType, Field, Schema, Value};
+use super::{DataType, Field, IdentitySpec, Schema, Value};
 use crate::catalog::{QualifiedName, SchemaName, TableId};
 use std::fmt;
 
@@ -79,6 +79,7 @@ pub enum ScalarUnaryOp {
     Negate,
 }
 
+/// Supported scalar functions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarFunc {
     Coalesce,
@@ -94,6 +95,23 @@ pub enum ScalarFunc {
     TransactionTimestamp,
     ClockTimestamp,
     CurrentDate,
+}
+
+/// Logical aggregate function identifiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// Planner representation of an aggregate invocation.
+#[derive(Clone, Debug)]
+pub struct AggCall {
+    pub func: AggFunc,
+    pub expr: Option<ScalarExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +196,12 @@ pub struct PrimaryKeySpec {
 }
 
 #[derive(Clone, Debug)]
+pub struct UniqueSpec {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ForeignKeySpec {
     pub name: Option<String>,
     pub columns: Vec<String>,
@@ -239,19 +263,39 @@ pub enum Plan {
         exprs: Vec<(ScalarExpr, String)>,
         schema: Schema,
     },
+    /// Hash-based aggregate node (group keys first, followed by aggregate outputs).
+    Aggregate {
+        input: Box<Plan>,
+        group_exprs: Vec<(ScalarExpr, String)>,
+        agg_exprs: Vec<(AggCall, String)>,
+        schema: Schema,
+    },
     CountRows {
         input: Box<Plan>,
         schema: Schema,
     },
     CreateTable {
         table: ObjName,
-        cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
+        cols: Vec<(
+            String,
+            DataType,
+            bool,
+            Option<ScalarExpr>,
+            Option<IdentitySpec>,
+        )>,
         pk: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
+        uniques: Vec<UniqueSpec>,
     },
     AlterTableAddColumn {
         table: ObjName,
-        column: (String, DataType, bool, Option<ScalarExpr>),
+        column: (
+            String,
+            DataType,
+            bool,
+            Option<ScalarExpr>,
+            Option<IdentitySpec>,
+        ),
         if_not_exists: bool,
     },
     AlterTableDropColumn {
@@ -259,11 +303,22 @@ pub enum Plan {
         column: String,
         if_exists: bool,
     },
+    AlterTableAddConstraintUnique {
+        table: ObjName,
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    AlterTableDropConstraint {
+        table: ObjName,
+        name: String,
+        if_exists: bool,
+    },
     CreateIndex {
         name: String,
         table: ObjName,
         columns: Vec<String>,
         if_not_exists: bool,
+        is_unique: bool,
     },
     DropIndex {
         indexes: Vec<ObjName>,
@@ -311,6 +366,7 @@ pub enum Plan {
         table: ObjName,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertSource>>,
+        override_system_value: bool,
         returning: Option<ReturningClause>,
         returning_schema: Option<Schema>,
     },
@@ -361,6 +417,7 @@ impl Plan {
     pub fn schema(&self) -> &Schema {
         match self {
             Plan::Values { schema, .. }
+            | Plan::Aggregate { schema, .. }
             | Plan::SeqScan { schema, .. }
             | Plan::LockRows { schema, .. }
             | Plan::Projection { schema, .. }
@@ -387,6 +444,8 @@ impl Plan {
             | Plan::CreateTable { .. }
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
+            | Plan::AlterTableAddConstraintUnique { .. }
+            | Plan::AlterTableDropConstraint { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
             | Plan::DropTable { .. }

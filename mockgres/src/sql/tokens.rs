@@ -1,9 +1,9 @@
 use super::expr::parse_scalar_expr;
 use crate::catalog::SchemaName;
-use crate::engine::{DataType, ObjName, ScalarExpr, Value, fe};
-use pg_query::NodeEnum;
+use crate::engine::{DataType, IdentitySpec, ObjName, ScalarExpr, Value, fe};
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, ColumnDef, TypeName};
+use pg_query::{Node, NodeEnum};
 use pgwire::error::PgWireResult;
 
 pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
@@ -86,7 +86,13 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
 
 pub(super) fn parse_column_def(
     cd: &ColumnDef,
-) -> PgWireResult<(String, DataType, bool, Option<ScalarExpr>)> {
+) -> PgWireResult<(
+    String,
+    DataType,
+    bool,
+    Option<ScalarExpr>,
+    Option<IdentitySpec>,
+)> {
     let dt = map_type(cd)?;
     let default_node = cd
         .raw_default
@@ -105,7 +111,7 @@ pub(super) fn parse_column_def(
                 }
             })
         });
-    let nullable = !cd
+    let mut nullable = !cd
         .constraints
         .iter()
         .any(|c| matches!(c.node.as_ref(), Some(NodeEnum::Constraint(cons)) if cons.contype == pg_query::protobuf::ConstrType::ConstrNotnull as i32));
@@ -117,11 +123,28 @@ pub(super) fn parse_column_def(
         }
         None => None,
     };
+    let identity = parse_identity_spec(cd)?;
+    if let Some(spec) = &identity {
+        if !matches!(dt, DataType::Int4 | DataType::Int8) {
+            return Err(fe("IDENTITY columns must be INT or BIGINT"));
+        }
+        if spec.increment_by == 0 {
+            return Err(fe("IDENTITY INCREMENT BY cannot be zero"));
+        }
+    }
     let name = cd.colname.clone();
     if name.is_empty() {
         return Err(fe("column must have a name"));
     }
-    Ok((name, dt, nullable, default))
+    if identity.is_some() && default.is_some() {
+        return Err(fe(format!(
+            "identity column {name} cannot have an explicit DEFAULT"
+        )));
+    }
+    if identity.is_some() {
+        nullable = false;
+    }
+    Ok((name, dt, nullable, default, identity))
 }
 
 fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
@@ -144,6 +167,69 @@ fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn parse_identity_spec(cd: &ColumnDef) -> PgWireResult<Option<IdentitySpec>> {
+    let mut spec: Option<IdentitySpec> = None;
+    for constraint in &cd.constraints {
+        let Some(NodeEnum::Constraint(cons)) = constraint.node.as_ref() else {
+            continue;
+        };
+        if cons.contype != pg_query::protobuf::ConstrType::ConstrIdentity as i32 {
+            continue;
+        }
+        if spec.is_some() {
+            return Err(fe(format!(
+                "column {} specifies IDENTITY more than once",
+                cd.colname
+            )));
+        }
+        let always = match cons.generated_when.as_str() {
+            "a" | "A" => true,
+            "" | "d" | "D" => false,
+            other => {
+                return Err(fe(format!(
+                    "unsupported IDENTITY generation mode {other:?}"
+                )));
+            }
+        };
+        let mut start_with = None;
+        let mut increment_by = None;
+        for opt in &cons.options {
+            let Some(NodeEnum::DefElem(def)) = opt.node.as_ref() else {
+                continue;
+            };
+            match def.defname.as_str() {
+                "start" => start_with = Some(parse_identity_option_value(&def.arg)?),
+                "increment" => increment_by = Some(parse_identity_option_value(&def.arg)?),
+                _ => {}
+            }
+        }
+        spec = Some(IdentitySpec {
+            always,
+            start_with: start_with.unwrap_or(1),
+            increment_by: increment_by.unwrap_or(1),
+        });
+    }
+    Ok(spec)
+}
+
+fn parse_identity_option_value(arg: &Option<Box<Node>>) -> PgWireResult<i128> {
+    let node = arg
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("IDENTITY option requires a value"))?;
+    match node {
+        NodeEnum::Integer(i) => Ok(i.ival as i128),
+        NodeEnum::AConst(c) => match const_to_value(c)? {
+            Value::Int64(v) => Ok(v as i128),
+            Value::Text(s) => s
+                .parse::<i128>()
+                .map_err(|_| fe("IDENTITY option requires integer")),
+            _ => Err(fe("IDENTITY option requires integer literal")),
+        },
+        _ => Err(fe("IDENTITY option requires integer literal")),
     }
 }
 

@@ -21,11 +21,20 @@ pub struct VersionedRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct IdentityRuntime {
+    pub next_value: i128,
+    pub increment_by: i128,
+}
+
+#[derive(Clone, Debug)]
 pub struct Table {
     pub rows_by_key: HashMap<RowKey, Vec<VersionedRow>>,
     pub next_rowid: RowId,
     pub pk_map: Option<HashMap<RowKey, RowId>>,
     pub fk_rev: HashMap<(TableId, Vec<Value>), HashSet<RowId>>,
+    pub identities: Vec<Option<IdentityRuntime>>,
+    // key = index name, value = map from column values to owning rowid
+    pub unique_maps: HashMap<String, HashMap<Vec<Value>, RowId>>,
 }
 
 impl Default for Table {
@@ -35,16 +44,20 @@ impl Default for Table {
             next_rowid: 1,
             pk_map: None,
             fk_rev: HashMap::new(),
+            identities: Vec::new(),
+            unique_maps: HashMap::new(),
         }
     }
 }
 
 impl Table {
-    pub fn with_pk(has_pk: bool) -> Self {
+    pub fn with_pk(has_pk: bool, identities: Vec<Option<IdentityRuntime>>) -> Self {
         let mut tbl = Self::default();
         if has_pk {
             tbl.pk_map = Some(HashMap::new());
         }
+        tbl.identities = identities;
+        tbl.unique_maps = HashMap::new();
         tbl
     }
 

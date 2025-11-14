@@ -47,6 +47,7 @@ impl fmt::Display for TableId {
 pub struct IndexMeta {
     pub name: String,
     pub columns: Vec<usize>,
+    pub unique: bool,
 }
 
 #[derive(Clone, Debug)]

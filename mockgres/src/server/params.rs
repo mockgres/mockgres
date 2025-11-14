@@ -76,6 +76,22 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_scalar(expr, out);
             }
         }
+        Plan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            ..
+        } => {
+            collect_param_hints_from_plan(input, out);
+            for (expr, _) in group_exprs {
+                collect_param_hints_from_scalar(expr, out);
+            }
+            for (agg, _) in agg_exprs {
+                if let Some(expr) = &agg.expr {
+                    collect_param_hints_from_scalar(expr, out);
+                }
+            }
+        }
         Plan::CountRows { input, .. } => collect_param_hints_from_plan(input, out),
         Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
             collect_param_hints_from_plan(left, out);
@@ -125,6 +141,8 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableDropConstraint { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
@@ -218,6 +236,22 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_scalar(expr, out);
             }
         }
+        Plan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            ..
+        } => {
+            collect_param_indexes(input, out);
+            for (expr, _) in group_exprs {
+                collect_param_indexes_from_scalar(expr, out);
+            }
+            for (agg, _) in agg_exprs {
+                if let Some(expr) = &agg.expr {
+                    collect_param_indexes_from_scalar(expr, out);
+                }
+            }
+        }
         Plan::CountRows { input, .. } => collect_param_indexes(input, out),
         Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
             collect_param_indexes(left, out);
@@ -267,6 +301,8 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableDropConstraint { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }

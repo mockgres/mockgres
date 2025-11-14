@@ -2,11 +2,12 @@ use crate::catalog::{
     Catalog, ColId, ForeignKeyMeta, PrimaryKeyMeta, SchemaId, SchemaName, TableId, TableMeta,
 };
 use crate::engine::{
-    BoolExpr, Column, DataType, EvalContext, ForeignKeySpec, PrimaryKeySpec, ReferentialAction,
-    ScalarExpr, SqlError, Value, cast_value_to_type, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, EvalContext, EvalMode, ForeignKeySpec, IdentitySpec,
+    PrimaryKeySpec, ReferentialAction, ScalarExpr, SqlError, Value, cast_value_to_type,
+    eval_bool_expr, eval_scalar_expr, eval_scalar_expr_with_mode,
 };
 use crate::session::{RowPointer, SessionId, TxnChanges};
-use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
+use crate::storage::{IdentityRuntime, Row, RowId, RowKey, Table, VersionedRow};
 use crate::txn::{TxId, VisibilityContext};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -189,7 +190,7 @@ impl Db {
         self.create_table(
             "pg_catalog",
             "pg_namespace",
-            vec![("nspname".to_string(), DataType::Text, false, None)],
+            vec![("nspname".to_string(), DataType::Text, false, None, None)],
             None,
             Vec::new(),
             &[],
@@ -215,7 +216,13 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        cols: Vec<(String, DataType, bool, Option<ScalarExpr>)>,
+        cols: Vec<(
+            String,
+            DataType,
+            bool,
+            Option<ScalarExpr>,
+            Option<IdentitySpec>,
+        )>,
         pk_spec: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
         search_path: &[SchemaId],
@@ -231,23 +238,37 @@ impl Db {
         let id = self.alloc_table_id(schema_id);
 
         let mut columns: Vec<Column> = Vec::with_capacity(cols.len());
-        for (n, t, nullable, default_expr) in cols.into_iter() {
+        let mut identities: Vec<Option<IdentityRuntime>> = Vec::with_capacity(cols.len());
+        for (n, t, nullable, default_expr, identity) in cols.into_iter() {
+            let effective_nullable = if identity.is_some() { false } else { nullable };
             if matches!(
                 default_expr.as_ref(),
                 Some(ScalarExpr::Literal(Value::Null))
-            ) && !nullable
+            ) && !effective_nullable
             {
                 return Err(sql_err(
                     "23502",
                     format!("default NULL not allowed for NOT NULL column {n}"),
                 ));
             }
+            if identity.is_some() && default_expr.is_some() {
+                return Err(sql_err(
+                    "0A000",
+                    format!("identity column {n} cannot specify a DEFAULT"),
+                ));
+            }
+            let runtime = identity.as_ref().map(|spec| IdentityRuntime {
+                next_value: spec.start_with,
+                increment_by: spec.increment_by,
+            });
             columns.push(Column {
                 name: n,
                 data_type: t,
-                nullable,
+                nullable: effective_nullable,
                 default: default_expr,
+                identity,
             });
+            identities.push(runtime);
         }
 
         let pk_meta = self.build_primary_key_meta(name, &mut columns, pk_spec)?;
@@ -276,7 +297,7 @@ impl Db {
 
         self.catalog.insert_table(schema_id, name, tm);
 
-        self.tables.insert(id, Table::with_pk(has_pk));
+        self.tables.insert(id, Table::with_pk(has_pk, identities));
         Ok(id)
     }
 
@@ -561,10 +582,23 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        column: (String, DataType, bool, Option<ScalarExpr>),
+        column: (
+            String,
+            DataType,
+            bool,
+            Option<ScalarExpr>,
+            Option<IdentitySpec>,
+        ),
         if_not_exists: bool,
+        ctx: &EvalContext,
     ) -> anyhow::Result<()> {
-        let (col_name, data_type, nullable, default_expr) = column;
+        let (col_name, data_type, nullable, default_expr, identity) = column;
+        if identity.is_some() {
+            return Err(sql_err(
+                "0A000",
+                "ALTER TABLE ADD COLUMN does not yet support IDENTITY columns",
+            ));
+        }
         let (table_id, column_exists, meta_snapshot) = {
             let meta = self
                 .catalog
@@ -588,15 +622,10 @@ impl Db {
             data_type: data_type.clone(),
             nullable,
             default: None,
+            identity: None,
         };
         let append_value = if let Some(expr) = &default_expr {
-            eval_column_default(
-                expr,
-                &temp_column,
-                new_col_index,
-                &meta_snapshot,
-                &EvalContext::default(),
-            )?
+            eval_column_default(expr, &temp_column, new_col_index, &meta_snapshot, ctx)?
         } else if nullable {
             Value::Null
         } else {
@@ -614,6 +643,7 @@ impl Db {
                     version.data.push(append_value.clone());
                 }
             }
+            table.identities.push(None);
         }
         if self.catalog.schema_entry(schema).is_none() {
             return Err(sql_err("3F000", format!("no such schema {schema}")));
@@ -627,6 +657,7 @@ impl Db {
             data_type,
             nullable,
             default: default_expr,
+            identity: None,
         });
         Ok(())
     }
@@ -707,6 +738,7 @@ impl Db {
                     version.data.pop();
                 }
             }
+            table.identities.pop();
         } else {
             return Err(sql_err(
                 "XX000",
@@ -731,6 +763,7 @@ impl Db {
         index_name: &str,
         columns: Vec<String>,
         if_not_exists: bool,
+        is_unique: bool,
     ) -> anyhow::Result<()> {
         if columns.is_empty() {
             return Err(sql_err("0A000", "index must reference at least one column"));
@@ -763,6 +796,7 @@ impl Db {
         table_meta.indexes.push(crate::catalog::IndexMeta {
             name: index_name.to_string(),
             columns: col_positions,
+            unique: is_unique,
         });
         Ok(())
     }
@@ -787,6 +821,7 @@ impl Db {
             .map(|entry| entry.objects.values().copied().collect())
             .unwrap_or_default();
         let mut removed = false;
+        let mut removed_table_id = None;
         for tid in table_ids {
             if let Some(table_meta) = self.catalog.get_table_mut_by_id(&tid) {
                 if let Some(pos) = table_meta
@@ -796,8 +831,14 @@ impl Db {
                 {
                     table_meta.indexes.remove(pos);
                     removed = true;
+                    removed_table_id = Some(tid);
                     break;
                 }
+            }
+        }
+        if let Some(tid) = removed_table_id {
+            if let Some(table) = self.tables.get_mut(&tid) {
+                table.unique_maps.remove(index_name);
             }
         }
         if removed || if_exists {
@@ -835,7 +876,8 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        mut rows: Vec<Vec<CellInput>>,
+        rows: Vec<Vec<CellInput>>,
+        override_system_value: bool,
         txid: TxId,
         ctx: &EvalContext,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
@@ -846,43 +888,48 @@ impl Db {
             .clone();
         let table_id = meta.id;
         let ncols = meta.columns.len();
-        let mut staged: Vec<(Row, Option<RowKey>, Vec<Option<Vec<Value>>>)> =
-            Vec::with_capacity(rows.len());
+        #[derive(Clone)]
+        struct PendingInsert {
+            row: Row,
+            pk_key: Option<RowKey>,
+            fk_keys: Vec<Option<Vec<Value>>>,
+            unique_keys: Vec<(String, Option<Vec<Value>>)>,
+        }
+        let mut staged: Vec<PendingInsert> = Vec::with_capacity(rows.len());
 
-        for (ridx, r) in rows.drain(..).enumerate() {
-            // arity: number of values must match table columns
-            if r.len() != ncols {
+        for (ridx, row) in rows.into_iter().enumerate() {
+            if row.len() != ncols {
                 return Err(sql_err(
                     "21P01",
                     format!(
                         "insert has wrong number of values at row {}: expected {}, got {}",
                         ridx + 1,
                         ncols,
-                        r.len()
+                        row.len()
                     ),
                 ));
             }
-
-            // coerce and validate each cell to the target column type
-            let mut out: Row = Vec::with_capacity(ncols);
-            for (i, cell) in r.into_iter().enumerate() {
-                let col = &meta.columns[i];
-                let value = match cell {
-                    CellInput::Value(v) => v,
-                    CellInput::Default => {
-                        if let Some(expr) = &col.default {
-                            eval_column_default(expr, col, i, &meta, ctx)?
-                        } else {
-                            Value::Null
-                        }
-                    }
-                };
-                let coerced = coerce_value_for_column(value, col, i, &meta, ctx)?;
-                out.push(coerced);
+            let out = {
+                let table_entry = self.tables.get_mut(&table_id).ok_or_else(|| {
+                    sql_err("XX000", format!("missing storage for table id {table_id}"))
+                })?;
+                Self::materialize_insert_row(table_entry, &meta, row, override_system_value, ctx)?
+            };
+            let unique_keys = self.build_unique_index_values(&meta, &out);
+            if !unique_keys.is_empty() {
+                let table_ref = self.tables.get(&table_id).ok_or_else(|| {
+                    sql_err("XX000", format!("missing storage for table id {table_id}"))
+                })?;
+                self.ensure_unique_constraints(&table_ref.unique_maps, &unique_keys, None)?;
             }
             let pk_key = self.build_primary_key_row_key(&meta, &out)?;
             let fk_keys = self.ensure_outbound_foreign_keys(schema, name, &meta, &out)?;
-            staged.push((out, pk_key, fk_keys));
+            staged.push(PendingInsert {
+                row: out,
+                pk_key,
+                fk_keys,
+                unique_keys,
+            });
         }
 
         let mut table = self
@@ -894,7 +941,18 @@ impl Db {
             let mut inserted_rows = Vec::with_capacity(staged.len());
             let mut inserted_ptrs = Vec::with_capacity(staged.len());
 
-            for (row, pk_key, fk_keys) in staged.into_iter() {
+            for pending_insert in staged.into_iter() {
+                self.ensure_unique_constraints(
+                    &table.unique_maps,
+                    &pending_insert.unique_keys,
+                    None,
+                )?;
+                let PendingInsert {
+                    row,
+                    pk_key,
+                    fk_keys,
+                    unique_keys,
+                } = pending_insert;
                 let row_id = table.alloc_rowid();
                 if let Some(pk) = pk_key.clone() {
                     let constraint = meta
@@ -926,6 +984,7 @@ impl Db {
                 let storage_key = RowKey::RowId(row_id);
                 table.rows_by_key.insert(storage_key.clone(), vec![version]);
                 self.add_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                self.insert_unique_entries_owned(&mut table, unique_keys, row_id);
                 inserted_ptrs.push(RowPointer {
                     table_id,
                     key: storage_key,
@@ -937,6 +996,73 @@ impl Db {
         })();
         self.tables.insert(table_id, table);
         result
+    }
+
+    fn materialize_insert_row(
+        table: &mut Table,
+        meta: &TableMeta,
+        row: Vec<CellInput>,
+        override_system_value: bool,
+        ctx: &EvalContext,
+    ) -> anyhow::Result<Row> {
+        let mut out: Row = Vec::with_capacity(meta.columns.len());
+        for (i, cell) in row.into_iter().enumerate() {
+            let col = &meta.columns[i];
+            let value = match (col.identity.as_ref(), cell) {
+                (Some(spec), CellInput::Value(v)) => {
+                    if spec.always && !override_system_value {
+                        return Err(sql_err(
+                            "428C9",
+                            format!("cannot insert into identity column \"{}\"", col.name),
+                        ));
+                    }
+                    v
+                }
+                (Some(_), CellInput::Default) => {
+                    let runtime = table
+                        .identities
+                        .get_mut(i)
+                        .and_then(|slot| slot.as_mut())
+                        .ok_or_else(|| {
+                            sql_err(
+                                "XX000",
+                                format!("missing identity state for column {}", col.name),
+                            )
+                        })?;
+                    let current = runtime.next_value;
+                    runtime.next_value = runtime
+                        .next_value
+                        .checked_add(runtime.increment_by)
+                        .ok_or_else(|| {
+                            sql_err(
+                                "22003",
+                                format!("identity column {} increment overflowed", col.name),
+                            )
+                        })?;
+                    if current < i64::MIN as i128 || current > i64::MAX as i128 {
+                        return Err(sql_err(
+                            "22003",
+                            format!(
+                                "identity column {} produced value {} out of range",
+                                col.name, current
+                            ),
+                        ));
+                    }
+                    Value::Int64(current as i64)
+                }
+                (None, CellInput::Value(v)) => v,
+                (None, CellInput::Default) => {
+                    if let Some(expr) = &col.default {
+                        eval_column_default(expr, col, i, meta, ctx)?
+                    } else {
+                        Value::Null
+                    }
+                }
+            };
+            let coerced = coerce_value_for_column(value, col, i, meta, ctx)?;
+            out.push(coerced);
+        }
+        Ok(out)
     }
 
     pub fn scan_bound_positions(
@@ -1024,6 +1150,8 @@ impl Db {
                 new_pk: Option<RowKey>,
                 old_fk: Vec<Option<Vec<Value>>>,
                 new_fk: Vec<Option<Vec<Value>>>,
+                old_unique: Vec<(String, Option<Vec<Value>>)>,
+                new_unique: Vec<(String, Option<Vec<Value>>)>,
             }
             let mut pending: Vec<PendingUpdate> = Vec::new();
             for (key, versions) in table.rows_by_key.iter() {
@@ -1058,6 +1186,8 @@ impl Db {
                     .collect();
                 let new_fk_keys =
                     self.ensure_outbound_foreign_keys(schema, name, &meta, &updated)?;
+                let old_unique = self.build_unique_index_values(&meta, &snapshot);
+                let new_unique = self.build_unique_index_values(&meta, &updated);
                 pending.push(PendingUpdate {
                     key: key.clone(),
                     updated,
@@ -1065,6 +1195,8 @@ impl Db {
                     new_pk: new_pk_key,
                     old_fk: old_fk_keys,
                     new_fk: new_fk_keys,
+                    old_unique,
+                    new_unique,
                 });
             }
             let mut count = 0usize;
@@ -1072,12 +1204,46 @@ impl Db {
             let mut inserted_ptrs = Vec::with_capacity(pending.len());
             let mut touched_ptrs = Vec::with_capacity(pending.len());
             for pending_update in pending {
-                if let Some(versions) = table.rows_by_key.get_mut(&pending_update.key) {
+                let PendingUpdate {
+                    key,
+                    updated,
+                    old_pk,
+                    new_pk,
+                    old_fk,
+                    new_fk,
+                    old_unique,
+                    new_unique,
+                } = pending_update;
+                let Some(_) = table
+                    .rows_by_key
+                    .get(&key)
+                    .and_then(|versions| select_visible_version_idx(versions, visibility))
+                else {
+                    continue;
+                };
+                let row_id = row_key_to_row_id(&key)?;
+                lock_handle.lock_row_nowait(meta.id, row_id, lock_owner)?;
+                let Some(idx_check) = table
+                    .rows_by_key
+                    .get(&key)
+                    .and_then(|versions| select_visible_version_idx(versions, visibility))
+                else {
+                    continue;
+                };
+                let still_visible = table
+                    .rows_by_key
+                    .get(&key)
+                    .and_then(|versions| versions.get(idx_check))
+                    .map(|version| version.xmax.is_none())
+                    .unwrap_or(false);
+                if !still_visible {
+                    continue;
+                }
+                self.check_unique_updates(&table.unique_maps, &old_unique, &new_unique, row_id)?;
+                if let Some(versions) = table.rows_by_key.get_mut(&key) {
                     let Some(idx) = select_visible_version_idx(versions, visibility) else {
                         continue;
                     };
-                    let row_id = row_key_to_row_id(&pending_update.key)?;
-                    lock_handle.lock_row_nowait(meta.id, row_id, lock_owner)?;
                     if versions[idx].xmax.is_some() {
                         continue;
                     }
@@ -1085,37 +1251,36 @@ impl Db {
                     versions.push(VersionedRow {
                         xmin: txid,
                         xmax: None,
-                        data: pending_update.updated.clone(),
+                        data: updated.clone(),
                     });
-                    updated_rows.push(pending_update.updated.clone());
-                    if let Some(pk_meta) = pk_meta {
-                        self.update_pk_map_for_row(
-                            &mut table,
-                            pk_meta,
-                            pending_update.old_pk.as_ref(),
-                            pending_update.new_pk.as_ref(),
-                            row_id,
-                        )?;
-                    }
-                    if fk_changed {
-                        self.remove_fk_rev_entries(
-                            &mut table,
-                            &meta,
-                            row_id,
-                            &pending_update.old_fk,
-                        );
-                        self.add_fk_rev_entries(&mut table, &meta, row_id, &pending_update.new_fk);
-                    }
-                    touched_ptrs.push(RowPointer {
-                        table_id: meta.id,
-                        key: pending_update.key.clone(),
-                    });
-                    inserted_ptrs.push(RowPointer {
-                        table_id: meta.id,
-                        key: pending_update.key,
-                    });
-                    count += 1;
+                } else {
+                    continue;
                 }
+                updated_rows.push(updated.clone());
+                if let Some(pk_meta) = pk_meta {
+                    self.update_pk_map_for_row(
+                        &mut table,
+                        pk_meta,
+                        old_pk.as_ref(),
+                        new_pk.as_ref(),
+                        row_id,
+                    )?;
+                }
+                if fk_changed {
+                    self.remove_fk_rev_entries(&mut table, &meta, row_id, &old_fk);
+                    self.add_fk_rev_entries(&mut table, &meta, row_id, &new_fk);
+                }
+                self.apply_unique_updates(&mut table, old_unique, new_unique, row_id);
+                let touched_key = key.clone();
+                touched_ptrs.push(RowPointer {
+                    table_id: meta.id,
+                    key: touched_key,
+                });
+                inserted_ptrs.push(RowPointer {
+                    table_id: meta.id,
+                    key,
+                });
+                count += 1;
             }
             Ok((count, updated_rows, inserted_ptrs, touched_ptrs))
         })();
@@ -1289,6 +1454,7 @@ impl Db {
                     .iter()
                     .map(|fk| self.build_fk_parent_key(&row, fk))
                     .collect();
+                let unique_keys = self.build_unique_index_values(&meta, &row);
                 let row_key = key.clone();
                 let row_id = row_key_to_row_id(&row_key)?;
                 seeds.push(DeleteTarget {
@@ -1299,6 +1465,7 @@ impl Db {
                     row_id,
                     pk_key,
                     fk_keys,
+                    unique_keys,
                 });
                 removed_rows.push(row);
             }
@@ -1400,6 +1567,7 @@ impl Db {
                         .iter()
                         .map(|fk_meta| self.build_fk_parent_key(&row, fk_meta))
                         .collect();
+                    let unique_keys = self.build_unique_index_values(&child_meta, &row);
                     targets.push(DeleteTarget {
                         schema: fk.schema.clone(),
                         table: fk.table.clone(),
@@ -1408,6 +1576,7 @@ impl Db {
                         row_id: *row_id,
                         pk_key,
                         fk_keys,
+                        unique_keys,
                     });
                 }
             }
@@ -1467,6 +1636,7 @@ impl Db {
                             target.row_id,
                             &target.fk_keys,
                         );
+                        self.remove_unique_entries(table_entry, &target.unique_keys, target.row_id);
                     }
                 }
             }
@@ -1531,6 +1701,173 @@ impl Db {
             values.push(value);
         }
         Some(values)
+    }
+
+    fn build_unique_index_values(
+        &self,
+        meta: &TableMeta,
+        row: &[Value],
+    ) -> Vec<(String, Option<Vec<Value>>)> {
+        let mut entries = Vec::new();
+        for idx in meta.indexes.iter().filter(|idx| idx.unique) {
+            let mut values = Vec::with_capacity(idx.columns.len());
+            let mut enforce = true;
+            for col_idx in &idx.columns {
+                let value = row.get(*col_idx).cloned().unwrap_or(Value::Null);
+                if matches!(value, Value::Null) {
+                    enforce = false;
+                    break;
+                }
+                values.push(value);
+            }
+            if enforce {
+                entries.push((idx.name.clone(), Some(values)));
+            } else {
+                entries.push((idx.name.clone(), None));
+            }
+        }
+        entries
+    }
+
+    fn ensure_unique_constraints(
+        &self,
+        unique_maps: &HashMap<String, HashMap<Vec<Value>, RowId>>,
+        entries: &[(String, Option<Vec<Value>>)],
+        row_id: Option<RowId>,
+    ) -> anyhow::Result<()> {
+        for (index_name, maybe_values) in entries {
+            let Some(values) = maybe_values else {
+                continue;
+            };
+            if let Some(map) = unique_maps.get(index_name) {
+                if let Some(existing) = map.get(values) {
+                    if row_id.map_or(true, |rid| *existing != rid) {
+                        return Err(sql_err(
+                            "23505",
+                            format!(
+                                "duplicate key value violates unique constraint {}",
+                                index_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_unique_updates(
+        &self,
+        unique_maps: &HashMap<String, HashMap<Vec<Value>, RowId>>,
+        old_entries: &[(String, Option<Vec<Value>>)],
+        new_entries: &[(String, Option<Vec<Value>>)],
+        row_id: RowId,
+    ) -> anyhow::Result<()> {
+        for ((index_name, old_vals), (_, new_vals)) in old_entries.iter().zip(new_entries.iter()) {
+            let Some(new_values) = new_vals else {
+                continue;
+            };
+            let changed = match old_vals {
+                Some(old_values) => old_values != new_values,
+                None => true,
+            };
+            if !changed {
+                continue;
+            }
+            if let Some(map) = unique_maps.get(index_name) {
+                if let Some(existing) = map.get(new_values) {
+                    if *existing != row_id {
+                        return Err(sql_err(
+                            "23505",
+                            format!(
+                                "duplicate key value violates unique constraint {}",
+                                index_name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_unique_entries_owned(
+        &self,
+        table: &mut Table,
+        entries: Vec<(String, Option<Vec<Value>>)>,
+        row_id: RowId,
+    ) {
+        for (index_name, maybe_values) in entries {
+            if let Some(values) = maybe_values {
+                table
+                    .unique_maps
+                    .entry(index_name)
+                    .or_insert_with(HashMap::new)
+                    .insert(values, row_id);
+            }
+        }
+    }
+
+    fn apply_unique_updates(
+        &self,
+        table: &mut Table,
+        old_entries: Vec<(String, Option<Vec<Value>>)>,
+        new_entries: Vec<(String, Option<Vec<Value>>)>,
+        row_id: RowId,
+    ) {
+        for ((index_name, old_vals), (_, new_vals)) in
+            old_entries.into_iter().zip(new_entries.into_iter())
+        {
+            if old_vals == new_vals {
+                continue;
+            }
+            if let Some(values) = old_vals.as_ref() {
+                self.remove_unique_entry(table, &index_name, values, row_id);
+            }
+            if let Some(values) = new_vals {
+                table
+                    .unique_maps
+                    .entry(index_name)
+                    .or_insert_with(HashMap::new)
+                    .insert(values, row_id);
+            }
+        }
+    }
+
+    fn remove_unique_entries(
+        &self,
+        table: &mut Table,
+        entries: &[(String, Option<Vec<Value>>)],
+        row_id: RowId,
+    ) {
+        for (index_name, maybe_values) in entries {
+            if let Some(values) = maybe_values {
+                self.remove_unique_entry(table, index_name, values, row_id);
+            }
+        }
+    }
+
+    fn remove_unique_entry(
+        &self,
+        table: &mut Table,
+        index_name: &str,
+        values: &[Value],
+        row_id: RowId,
+    ) {
+        let mut remove_entry = false;
+        if let Some(map) = table.unique_maps.get_mut(index_name) {
+            if let Some(existing) = map.get(values) {
+                if *existing == row_id {
+                    map.remove(values);
+                }
+            }
+            if map.is_empty() {
+                remove_entry = true;
+            }
+        }
+        if remove_entry {
+            table.unique_maps.remove(index_name);
+        }
     }
 
     fn ensure_parent_exists(
@@ -1782,6 +2119,8 @@ impl Db {
                             .map(|fk| self.build_fk_parent_key(&row, fk))
                             .collect::<Vec<_>>();
                         self.remove_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                        let unique_keys = self.build_unique_index_values(&meta, &row);
+                        self.remove_unique_entries(&mut table, &unique_keys, row_id);
                     }
                 }
                 self.tables.insert(ptr.table_id, table);
@@ -1824,6 +2163,8 @@ impl Db {
                             .map(|fk| self.build_fk_parent_key(&row, fk))
                             .collect::<Vec<_>>();
                         self.add_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
+                        let unique_keys = self.build_unique_index_values(&meta, &row);
+                        self.insert_unique_entries_owned(&mut table, unique_keys, row_id);
                     }
                 }
                 self.tables.insert(ptr.table_id, table);
@@ -1855,6 +2196,7 @@ struct DeleteTarget {
     row_id: RowId,
     pk_key: Option<RowKey>,
     fk_keys: Vec<Option<Vec<Value>>>,
+    unique_keys: Vec<(String, Option<Vec<Value>>)>,
 }
 
 struct CascadeFrame {
@@ -1907,8 +2249,8 @@ fn eval_column_default(
     meta: &TableMeta,
     ctx: &EvalContext,
 ) -> anyhow::Result<Value> {
-    let value =
-        eval_scalar_expr(&[], expr, &[], ctx).map_err(|e| sql_err("XX000", e.to_string()))?;
+    let value = eval_scalar_expr_with_mode(&[], expr, &[], ctx, EvalMode::ColumnDefault)
+        .map_err(|e| sql_err("XX000", e.to_string()))?;
     coerce_value_for_column(value, col, idx, meta, ctx)
 }
 

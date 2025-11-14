@@ -79,11 +79,19 @@ impl DataType {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct IdentitySpec {
+    pub always: bool,
+    pub start_with: i128,
+    pub increment_by: i128,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Column {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub default: Option<ScalarExpr>,
+    pub identity: Option<IdentitySpec>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

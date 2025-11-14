@@ -6,9 +6,10 @@ use pgwire::error::{PgWireError, PgWireResult};
 use crate::catalog::{SchemaId, SchemaName};
 use crate::db::{Db, LockHandle, LockOwner};
 use crate::engine::{
-    CountExec, DbDdlKind, EvalContext, ExecNode, Expr, FilterExec, LimitExec, LockSpec,
-    NestedLoopJoinExec, ObjName, OrderExec, Plan, ProjectExec, ReturningClause, ReturningExpr,
-    ScalarExpr, Schema, SeqScanExec, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    AggCall, AggFunc, CountExec, DbDdlKind, EvalContext, ExecNode, Expr, FilterExec,
+    HashAggregateExec, LimitExec, LockSpec, NestedLoopJoinExec, ObjName, OrderExec, Plan,
+    ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value,
+    ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::session::{RowPointer, Session, SessionTimeZone, now_utc_micros};
 use crate::storage::{Row, RowId};
@@ -119,11 +120,33 @@ fn schema_contains_index(db: &Db, schema_id: SchemaId, index_name: &str) -> bool
     false
 }
 
+fn derive_unique_index_name(table: &str, columns: &[String]) -> String {
+    let suffix = if columns.is_empty() {
+        "key".to_string()
+    } else {
+        columns.join("_")
+    };
+    if suffix.is_empty() {
+        format!("{}_key", table)
+    } else {
+        format!("{}_{}_key", table, suffix)
+    }
+}
+
+fn assert_supported_aggs(aggs: &[(AggCall, String)]) {
+    for (agg, _) in aggs {
+        match agg.func {
+            AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {}
+        }
+    }
+}
+
 pub fn command_tag(plan: &Plan) -> &'static str {
     match plan {
         Plan::Values { .. }
         | Plan::SeqScan { .. }
         | Plan::Projection { .. }
+        | Plan::Aggregate { .. }
         | Plan::CountRows { .. }
         | Plan::Filter { .. }
         | Plan::Order { .. }
@@ -133,7 +156,10 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Join { .. } => "SELECT",
 
         Plan::CreateTable { .. } => "CREATE TABLE",
-        Plan::AlterTableAddColumn { .. } | Plan::AlterTableDropColumn { .. } => "ALTER TABLE",
+        Plan::AlterTableAddColumn { .. }
+        | Plan::AlterTableDropColumn { .. }
+        | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableDropConstraint { .. } => "ALTER TABLE",
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
         Plan::DropTable { .. } => "DROP TABLE",
@@ -218,6 +244,35 @@ pub fn build_executor(
                 )),
                 None,
                 cnt,
+            ))
+        }
+        Plan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema,
+        } => {
+            assert_supported_aggs(agg_exprs);
+            let (child, _tag, _cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+                ctx,
+            )?;
+            Ok((
+                Box::new(HashAggregateExec::new(
+                    schema.clone(),
+                    child,
+                    group_exprs.clone(),
+                    agg_exprs.clone(),
+                    params.clone(),
+                    ctx.clone(),
+                )),
+                None,
+                None,
             ))
         }
 
@@ -446,6 +501,7 @@ pub fn build_executor(
             cols,
             pk,
             foreign_keys,
+            uniques,
         } => {
             let schema_name = {
                 let db_read = db.read();
@@ -463,6 +519,24 @@ pub fn build_executor(
                     &search_path,
                 )
                 .map_err(map_db_err)?;
+            if !uniques.is_empty() {
+                for u in &*uniques {
+                    let idx_name = u
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| derive_unique_index_name(&table.name, &u.columns));
+                    db_write
+                        .create_index(
+                            &schema_name,
+                            &table.name,
+                            &idx_name,
+                            u.columns.clone(),
+                            true,
+                            true,
+                        )
+                        .map_err(map_db_err)?;
+                }
+            }
             drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -485,7 +559,13 @@ pub fn build_executor(
             };
             let mut db_write = db.write();
             db_write
-                .alter_table_add_column(&schema_name, &table.name, column.clone(), *if_not_exists)
+                .alter_table_add_column(
+                    &schema_name,
+                    &table.name,
+                    column.clone(),
+                    *if_not_exists,
+                    ctx,
+                )
                 .map_err(map_db_err)?;
             drop(db_write);
             Ok((
@@ -528,11 +608,113 @@ pub fn build_executor(
             ))
         }
 
+        Plan::AlterTableAddConstraintUnique {
+            table,
+            name,
+            columns,
+        } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let index_name = name
+                .clone()
+                .unwrap_or_else(|| derive_unique_index_name(&table.name, columns));
+            let mut db_write = db.write();
+            db_write
+                .create_index(
+                    &schema_name,
+                    &table.name,
+                    &index_name,
+                    columns.clone(),
+                    false,
+                    true,
+                )
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
+
+        Plan::AlterTableDropConstraint {
+            table,
+            name,
+            if_exists,
+        } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => {
+                        if *if_exists {
+                            return Ok((
+                                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                                Some("ALTER TABLE".into()),
+                                None,
+                            ));
+                        }
+                        return Err(fe_code("42P01", format!("no such table {}", table.name)));
+                    }
+                }
+            };
+            let constraint_name = name.clone();
+            {
+                let db_read = db.read();
+                let Some(meta) = db_read.catalog.get_table(&schema_name, &table.name) else {
+                    if *if_exists {
+                        return Ok((
+                            Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                            Some("ALTER TABLE".into()),
+                            None,
+                        ));
+                    }
+                    return Err(fe_code("42P01", format!("no such table {}", table.name)));
+                };
+                let has_unique = meta
+                    .indexes
+                    .iter()
+                    .any(|idx| idx.unique && idx.name == constraint_name);
+                if !has_unique {
+                    if *if_exists {
+                        return Ok((
+                            Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                            Some("ALTER TABLE".into()),
+                            None,
+                        ));
+                    }
+                    return Err(fe_code(
+                        "42704",
+                        format!(
+                            "constraint {} on table {}.{} does not exist",
+                            constraint_name, schema_name, table.name
+                        ),
+                    ));
+                }
+            }
+            let mut db_write = db.write();
+            db_write
+                .drop_index(&schema_name, &constraint_name, *if_exists)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
+
         Plan::CreateIndex {
             table,
             name,
             columns,
             if_not_exists,
+            is_unique,
         } => {
             let schema_name = {
                 let db_read = db.read();
@@ -549,6 +731,7 @@ pub fn build_executor(
                     name,
                     columns.clone(),
                     *if_not_exists,
+                    *is_unique,
                 )
                 .map_err(map_db_err)?;
             drop(db_write);
@@ -660,9 +843,11 @@ pub fn build_executor(
             table,
             columns,
             rows,
+            override_system_value,
             returning,
             returning_schema,
         } => {
+            let override_system_value = *override_system_value;
             let schema_name = schema_or_public(&table.schema);
             let table_meta = {
                 let db = db.read();
@@ -731,7 +916,14 @@ pub fn build_executor(
             let (txid, autocommit) = writer_txid(session, txn_manager);
             let (inserted, inserted_rows, inserted_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
                 let mut db = db.write();
-                match db.insert_full_rows(schema_name, &table.name, realized, txid, ctx) {
+                match db.insert_full_rows(
+                    schema_name,
+                    &table.name,
+                    realized,
+                    override_system_value,
+                    txid,
+                    ctx,
+                ) {
                     Ok(res) => res,
                     Err(e) => {
                         finish_writer_tx(txn_manager, txid, autocommit, false);

@@ -1,19 +1,21 @@
 use crate::catalog::{SchemaName, TableId};
 use crate::engine::{
-    BoolExpr, DataType, Field, InsertSource, LockMode, LockRequest, LockSpec, ObjName, Plan,
-    ReturningClause, ReturningExpr, ScalarExpr, Schema, Selection, SortKey, UpdateSet, Value, fe,
-    fe_code,
+    AggCall, AggFunc, BoolExpr, DataType, Field, InsertSource, LockMode, LockRequest, LockSpec,
+    ObjName, Plan, ReturningClause, ReturningExpr, ScalarExpr, Schema, Selection, SortKey,
+    UpdateSet, Value, fe, fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{
-    DeleteStmt, InsertStmt, LockClauseStrength, LockWaitPolicy, ResTarget, SelectStmt, UpdateStmt,
+    DeleteStmt, InsertStmt, LockClauseStrength, LockWaitPolicy, OverridingKind, ResTarget,
+    SelectStmt, UpdateStmt,
 };
 use pgwire::error::PgWireResult;
 
 use super::expr::{
-    collect_columns_from_bool_expr, collect_columns_from_scalar_expr, derive_expr_name,
-    parse_bool_expr, parse_column_ref, parse_scalar_expr,
+    agg_func_from_name, collect_columns_from_bool_expr, collect_columns_from_scalar_expr,
+    derive_expr_name, is_aggregate_func_name, parse_bool_expr, parse_bool_expr_with_aggregates,
+    parse_column_ref, parse_scalar_expr, AggregateExprCollector,
 };
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
@@ -28,21 +30,35 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             count_alias = alias;
         }
     }
+    let has_other_aggs = target_list_contains_aggregates(&sel.target_list);
     let from_count = sel.from_clause.len();
     let has_join = sel.from_clause.iter().any(|node| from_item_is_join(node));
     let multi_from = from_count > 1 || has_join;
     let lock_request = parse_locking_clause(&mut sel.locking_clause, multi_from)?;
 
-    let (mut selection, projection_items) = if count_star {
-        (Selection::Star, None)
-    } else {
-        parse_select_list(&mut sel.target_list)?
-    };
-
     let mut where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
     } else {
         None
+    };
+    let mut having_aggs = Vec::new();
+    let mut having_expr =
+        if let Some(h) = sel.having_clause.as_ref().and_then(|n| n.node.as_ref()) {
+            let mut collector = AggregateExprCollector::new("__having_agg");
+            let expr = parse_bool_expr_with_aggregates(h, &mut collector)?;
+            having_aggs = collector.into_aggs();
+            Some(expr)
+        } else {
+            None
+        };
+    let has_having = having_expr.is_some();
+
+    let selection_needs_projection =
+        !count_star && !has_other_aggs && sel.group_clause.is_empty() && !has_having;
+    let (mut selection, projection_items) = if selection_needs_projection {
+        parse_select_list(&mut sel.target_list)?
+    } else {
+        (Selection::Star, None)
     };
 
     let mut project_prefix_len: Option<usize> = None;
@@ -171,7 +187,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
 
-    if count_star {
+    if count_star && !has_other_aggs && sel.group_clause.is_empty() && !has_having {
         let schema = Schema {
             fields: vec![Field {
                 name: count_alias,
@@ -182,6 +198,115 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         plan = Plan::CountRows {
             input: Box::new(plan),
             schema,
+        };
+    } else if has_other_aggs || !sel.group_clause.is_empty() || has_having {
+        let group_clause_exprs = parse_group_clause(&sel.group_clause)?;
+        let group_len = group_clause_exprs.len();
+        let items = parse_aggregate_select_list(&mut sel.target_list)?;
+        let mut select_proj = Vec::new();
+        let mut select_agg_exprs = Vec::new();
+        for item in items {
+            if let Some((agg_call, alias)) = item.agg_call {
+                let agg_idx = select_agg_exprs.len();
+                select_proj.push(SelectProjection::Agg {
+                    agg_idx,
+                    alias: alias.clone(),
+                });
+                select_agg_exprs.push((agg_call, alias));
+            } else if let Some((expr, alias)) = item.group_expr {
+                if group_clause_exprs.is_empty() {
+                    return Err(fe_code(
+                        "42803",
+                        "column must appear in the GROUP BY clause or be used in an aggregate function",
+                    ));
+                }
+                let Some(idx) = find_group_expr_index(&expr, &group_clause_exprs) else {
+                    return Err(fe_code(
+                        "42803",
+                        "column must appear in the GROUP BY clause or be used in an aggregate function",
+                    ));
+                };
+                select_proj.push(SelectProjection::Group { group_idx: idx, alias });
+            }
+        }
+        if select_proj.is_empty() {
+            return Err(fe("SELECT list is empty"));
+        }
+        if group_clause_exprs.is_empty()
+            && select_proj
+                .iter()
+                .any(|proj| matches!(proj, SelectProjection::Group { .. }))
+        {
+            return Err(fe_code(
+                "42803",
+                "column must appear in the GROUP BY clause or be used in an aggregate function",
+            ));
+        }
+
+        let mut agg_exprs_full = select_agg_exprs.clone();
+        agg_exprs_full.extend(having_aggs.clone());
+
+        let mut fields = Vec::new();
+        for (expr, alias) in &group_clause_exprs {
+            fields.push(Field {
+                name: alias.clone(),
+                data_type: infer_expr_type(expr),
+                origin: None,
+            });
+        }
+        for (agg, alias) in &agg_exprs_full {
+            fields.push(Field {
+                name: alias.clone(),
+                data_type: infer_agg_type(agg),
+                origin: None,
+            });
+        }
+
+        let mut aggregate_plan = Plan::Aggregate {
+            input: Box::new(plan),
+            group_exprs: group_clause_exprs.clone(),
+            agg_exprs: agg_exprs_full,
+            schema: Schema { fields },
+        };
+        if let Some(expr) = having_expr.take() {
+            aggregate_plan = Plan::Filter {
+                input: Box::new(aggregate_plan),
+                expr,
+                project_prefix_len: None,
+            };
+        }
+
+        let mut projection_exprs = Vec::new();
+        let mut projection_fields = Vec::new();
+        for proj in select_proj {
+            match proj {
+                SelectProjection::Group { group_idx, alias } => {
+                    projection_exprs.push((ScalarExpr::ColumnIdx(group_idx), alias.clone()));
+                    let dt = infer_expr_type(&group_clause_exprs[group_idx].0);
+                    projection_fields.push(Field {
+                        name: alias,
+                        data_type: dt,
+                        origin: None,
+                    });
+                }
+                SelectProjection::Agg { agg_idx, alias } => {
+                    let column_idx = group_len + agg_idx;
+                    projection_exprs.push((ScalarExpr::ColumnIdx(column_idx), alias.clone()));
+                    let dt = infer_agg_type(&select_agg_exprs[agg_idx].0);
+                    projection_fields.push(Field {
+                        name: alias,
+                        data_type: dt,
+                        origin: None,
+                    });
+                }
+            }
+        }
+        plan = Plan::Projection {
+            input: Box::new(aggregate_plan),
+            exprs: projection_exprs,
+            schema: Schema {
+                fields: projection_fields,
+            },
         };
     } else if let Some(exprs) = projection_items {
         let schema = Schema {
@@ -286,6 +411,161 @@ fn detect_count_star(node: &pg_query::Node) -> Option<String> {
     }
 }
 
+fn target_list_contains_aggregates(target_list: &[pg_query::Node]) -> bool {
+    use pg_query::NodeEnum;
+
+    for t in target_list {
+        let Some(NodeEnum::ResTarget(rt)) = t.node.as_ref() else { continue };
+        let Some(expr_node) = rt.val.as_ref().and_then(|n| n.node.as_ref()) else {
+            continue;
+        };
+        if let NodeEnum::FuncCall(fc) = expr_node {
+            let name = fc
+                .funcname
+                .iter()
+                .find_map(|n| {
+                    n.node.as_ref().and_then(|nn| {
+                        if let NodeEnum::String(s) = nn {
+                            Some(s.sval.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default();
+            if is_aggregate_func_name(&name) {
+                if target_list.len() == 1 && fc.agg_star && name.eq_ignore_ascii_case("count") {
+                    continue;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+struct AggregateSelectItem {
+    group_expr: Option<(ScalarExpr, String)>,
+    agg_call: Option<(AggCall, String)>,
+}
+
+enum SelectProjection {
+    Group { group_idx: usize, alias: String },
+    Agg { agg_idx: usize, alias: String },
+}
+
+fn parse_aggregate_select_list(
+    target_list: &mut Vec<pg_query::Node>,
+) -> PgWireResult<Vec<AggregateSelectItem>> {
+    use pg_query::NodeEnum;
+
+    let mut items = Vec::new();
+    for node in target_list.drain(..) {
+        let rt = node
+            .node
+            .as_ref()
+            .and_then(|n| {
+                if let NodeEnum::ResTarget(rt) = n {
+                    Some(rt)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| fe("bad target"))?;
+        let expr_node = rt
+            .val
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad target expr"))?;
+        if let NodeEnum::FuncCall(fc) = expr_node {
+            let func_name = fc
+                .funcname
+                .iter()
+                .find_map(|n| {
+                    n.node.as_ref().and_then(|nn| {
+                        if let NodeEnum::String(s) = nn {
+                            Some(s.sval.to_ascii_lowercase())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or_default();
+            if let Some(func) = agg_func_from_name(&func_name) {
+                if fc.agg_distinct {
+                    return Err(fe("DISTINCT aggregates are not supported"));
+                }
+                let alias = if rt.name.is_empty() {
+                    func_name.clone()
+                } else {
+                    rt.name.clone()
+                };
+                let agg_call = if func == AggFunc::Count && fc.agg_star {
+                    AggCall { func, expr: None }
+                } else {
+                    if fc.args.len() != 1 {
+                        return Err(fe("aggregate functions require exactly one argument"));
+                    }
+                    let arg_node = fc.args[0]
+                        .node
+                        .as_ref()
+                        .ok_or_else(|| fe("bad aggregate argument"))?;
+                    let expr = parse_scalar_expr(arg_node)?;
+                    AggCall {
+                        func,
+                        expr: Some(expr),
+                    }
+                };
+                items.push(AggregateSelectItem {
+                    group_expr: None,
+                    agg_call: Some((agg_call, alias)),
+                });
+                continue;
+            }
+        }
+        let expr = parse_scalar_expr(expr_node)?;
+        let alias = if rt.name.is_empty() {
+            derive_expr_name(&expr)
+        } else {
+            rt.name.clone()
+        };
+        items.push(AggregateSelectItem {
+            group_expr: Some((expr, alias)),
+            agg_call: None,
+        });
+    }
+    Ok(items)
+}
+
+fn parse_group_clause(
+    group_clause: &[pg_query::Node],
+) -> PgWireResult<Vec<(ScalarExpr, String)>> {
+    use pg_query::NodeEnum;
+
+    let mut out = Vec::with_capacity(group_clause.len());
+    for node in group_clause {
+        let Some(expr_node) = node.node.as_ref() else {
+            return Err(fe("bad GROUP BY expression"));
+        };
+        let expr_ref = match expr_node {
+            NodeEnum::SortBy(sort) => sort
+                .node
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad GROUP BY expression"))?,
+            other => other,
+        };
+        let expr = parse_scalar_expr(expr_ref)?;
+        let alias = derive_expr_name(&expr);
+        out.push((expr, alias));
+    }
+    Ok(out)
+}
+
+fn find_group_expr_index(expr: &ScalarExpr, groups: &[(ScalarExpr, String)]) -> Option<usize> {
+    groups.iter().position(|(gexpr, _)| gexpr == expr)
+}
+
 fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
     let tl = sel.target_list;
     if tl.is_empty() {
@@ -333,6 +613,15 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
         name: rv.relname,
     };
     let insert_columns = parse_insert_columns(&ins.cols)?;
+    let override_system_value = match OverridingKind::try_from(ins.r#override)
+        .unwrap_or(OverridingKind::OverridingNotSet)
+    {
+        OverridingKind::Undefined | OverridingKind::OverridingNotSet => false,
+        OverridingKind::OverridingSystemValue => true,
+        OverridingKind::OverridingUserValue => {
+            return Err(fe_code("0A000", "OVERRIDING USER VALUE is not supported"));
+        }
+    };
     let sel = ins
         .select_stmt
         .and_then(|n| n.node)
@@ -362,6 +651,7 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
         table,
         columns: insert_columns,
         rows: all_rows,
+        override_system_value,
         returning,
         returning_schema: None,
     })
@@ -863,5 +1153,21 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
         ScalarExpr::Cast { ty, .. } => ty.clone(),
         _ => DataType::Text,
+    }
+}
+
+fn infer_agg_type(agg: &AggCall) -> DataType {
+    match agg.func {
+        AggFunc::Count => DataType::Int8,
+        AggFunc::Sum => match agg.expr.as_ref().map(|e| infer_expr_type(e)) {
+            Some(DataType::Float8) => DataType::Float8,
+            _ => DataType::Int8,
+        },
+        AggFunc::Avg => DataType::Float8,
+        AggFunc::Min | AggFunc::Max => agg
+            .expr
+            .as_ref()
+            .map(|e| infer_expr_type(e))
+            .unwrap_or(DataType::Text),
     }
 }

@@ -1,7 +1,7 @@
 use crate::catalog::SchemaName;
 use crate::engine::{
-    DataType, Field, ForeignKeySpec, ObjName, Plan, PrimaryKeySpec, ReferentialAction, Schema, fe,
-    fe_code,
+    DataType, Field, ForeignKeySpec, ObjName, Plan, PrimaryKeySpec, ReferentialAction, Schema,
+    UniqueSpec, fe, fe_code,
 };
 use pg_query::protobuf::{
     AlterDatabaseSetStmt, AlterDatabaseStmt, AlterTableStmt, AlterTableType, Constraint,
@@ -60,64 +60,110 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
     let mut cols = Vec::new();
     let mut pk: Option<PrimaryKeySpec> = None;
     let mut foreign_keys = Vec::new();
+    let mut uniques: Vec<UniqueSpec> = Vec::new();
 
     for elt in stmt.table_elts {
         match elt.node.unwrap() {
             pg_query::NodeEnum::ColumnDef(cd) => {
-                let (cname, dt, nullable, default) = parse_column_def(&cd)?;
+                let (cname, dt, nullable, default, identity) = parse_column_def(&cd)?;
                 let column_fks = collect_column_foreign_keys(&cd, &cname)?;
                 foreign_keys.extend(column_fks);
                 let col_name_clone = cname.clone();
-                cols.push((cname, dt, nullable, default));
+                cols.push((cname, dt, nullable, default, identity));
                 for c in &cd.constraints {
                     let Some(pg_query::NodeEnum::Constraint(cons)) = c.node.as_ref() else {
                         continue;
                     };
-                    if cons.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32 {
-                        if pk.is_some() {
-                            return Err(fe("multiple primary key definitions are not supported"));
+                    match pg_query::protobuf::ConstrType::try_from(cons.contype)
+                        .map_err(|_| fe("unknown constraint type"))?
+                    {
+                        pg_query::protobuf::ConstrType::ConstrPrimary => {
+                            if pk.is_some() {
+                                return Err(fe(
+                                    "multiple primary key definitions are not supported",
+                                ));
+                            }
+                            let name = if cons.conname.is_empty() {
+                                None
+                            } else {
+                                Some(cons.conname.clone())
+                            };
+                            pk = Some(PrimaryKeySpec {
+                                name,
+                                columns: vec![col_name_clone.clone()],
+                            });
+                            break;
                         }
-                        let name = if cons.conname.is_empty() {
-                            None
-                        } else {
-                            Some(cons.conname.clone())
-                        };
-                        pk = Some(PrimaryKeySpec {
-                            name,
-                            columns: vec![col_name_clone.clone()],
-                        });
-                        break;
+                        pg_query::protobuf::ConstrType::ConstrUnique => {
+                            let name = if cons.conname.is_empty() {
+                                None
+                            } else {
+                                Some(cons.conname.clone())
+                            };
+                            uniques.push(UniqueSpec {
+                                name,
+                                columns: vec![col_name_clone.clone()],
+                            });
+                        }
+                        _ => {}
                     }
                 }
             }
             pg_query::NodeEnum::Constraint(cons) => {
-                if cons.contype == pg_query::protobuf::ConstrType::ConstrPrimary as i32 {
-                    if pk.is_some() {
-                        return Err(fe("multiple primary key definitions are not supported"));
-                    }
-                    let mut names = Vec::new();
-                    for n in cons.keys {
-                        let pg_query::NodeEnum::String(s) = n.node.unwrap() else {
-                            continue;
+                match pg_query::protobuf::ConstrType::try_from(cons.contype)
+                    .map_err(|_| fe("unknown constraint type"))?
+                {
+                    pg_query::protobuf::ConstrType::ConstrPrimary => {
+                        if pk.is_some() {
+                            return Err(fe("multiple primary key definitions are not supported"));
+                        }
+                        let mut names = Vec::new();
+                        for n in cons.keys {
+                            let pg_query::NodeEnum::String(s) = n.node.unwrap() else {
+                                continue;
+                            };
+                            names.push(s.sval);
+                        }
+                        if names.is_empty() {
+                            return Err(fe("PRIMARY KEY requires column list"));
+                        }
+                        let name = if cons.conname.is_empty() {
+                            None
+                        } else {
+                            Some(cons.conname)
                         };
-                        names.push(s.sval);
+                        pk = Some(PrimaryKeySpec {
+                            name,
+                            columns: names,
+                        });
                     }
-                    if names.is_empty() {
-                        return Err(fe("PRIMARY KEY requires column list"));
+                    pg_query::protobuf::ConstrType::ConstrForeign => {
+                        if let Some(fk) = parse_foreign_key_constraint(&cons, None)? {
+                            foreign_keys.push(fk);
+                        }
                     }
-                    let name = if cons.conname.is_empty() {
-                        None
-                    } else {
-                        Some(cons.conname)
-                    };
-                    pk = Some(PrimaryKeySpec {
-                        name,
-                        columns: names,
-                    });
-                } else if cons.contype == pg_query::protobuf::ConstrType::ConstrForeign as i32 {
-                    if let Some(fk) = parse_foreign_key_constraint(&cons, None)? {
-                        foreign_keys.push(fk);
+                    pg_query::protobuf::ConstrType::ConstrUnique => {
+                        let mut names = Vec::new();
+                        for n in cons.keys {
+                            let pg_query::NodeEnum::String(s) = n.node.unwrap() else {
+                                continue;
+                            };
+                            names.push(s.sval);
+                        }
+                        if names.is_empty() {
+                            return Err(fe("UNIQUE requires column list"));
+                        }
+                        let name = if cons.conname.is_empty() {
+                            None
+                        } else {
+                            Some(cons.conname)
+                        };
+                        uniques.push(UniqueSpec {
+                            name,
+                            columns: names,
+                        });
                     }
+                    _ => {}
                 }
             }
             _ => {}
@@ -129,6 +175,7 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
         cols,
         pk,
         foreign_keys,
+        uniques,
     })
 }
 
@@ -178,6 +225,53 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                 if_exists: cmd.missing_ok,
             })
         }
+        AlterTableType::AtAddConstraint => {
+            let cons_node = cmd
+                .def
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("ADD CONSTRAINT requires definition"))?;
+            let pg_query::NodeEnum::Constraint(cons) = cons_node else {
+                return Err(fe("ADD CONSTRAINT expects constraint definition"));
+            };
+            match pg_query::protobuf::ConstrType::try_from(cons.contype)
+                .map_err(|_| fe("unknown constraint type"))?
+            {
+                pg_query::protobuf::ConstrType::ConstrUnique => {
+                    let mut columns = Vec::new();
+                    for key in &cons.keys {
+                        let Some(pg_query::NodeEnum::String(s)) = key.node.as_ref() else {
+                            continue;
+                        };
+                        columns.push(s.sval.clone());
+                    }
+                    if columns.is_empty() {
+                        return Err(fe("UNIQUE constraint requires column list"));
+                    }
+                    let name = if cons.conname.is_empty() {
+                        None
+                    } else {
+                        Some(cons.conname.clone())
+                    };
+                    Ok(Plan::AlterTableAddConstraintUnique {
+                        table,
+                        name,
+                        columns,
+                    })
+                }
+                _ => Err(fe("unsupported ALTER TABLE constraint")),
+            }
+        }
+        AlterTableType::AtDropConstraint => {
+            if cmd.name.is_empty() {
+                return Err(fe("DROP CONSTRAINT requires name"));
+            }
+            Ok(Plan::AlterTableDropConstraint {
+                table,
+                name: cmd.name,
+                if_exists: cmd.missing_ok,
+            })
+        }
         _ => Err(fe("unsupported ALTER TABLE command")),
     }
 }
@@ -202,6 +296,7 @@ pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
         table,
         columns,
         if_not_exists: idx.if_not_exists,
+        is_unique: idx.unique,
     })
 }
 

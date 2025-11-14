@@ -3,9 +3,9 @@ use std::collections::HashSet;
 use crate::catalog::SchemaId;
 use crate::db::Db;
 use crate::engine::{
-    BoolExpr, ColumnRefName, DataType, DbDdlKind, Field, FieldOrigin, InsertSource, LockSpec,
-    ObjName, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
-    Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
+    AggCall, AggFunc, BoolExpr, ColumnRefName, DataType, DbDdlKind, Field, FieldOrigin,
+    InsertSource, LockSpec, ObjName, Plan, ReturningClause, ReturningExpr, ScalarBinaryOp,
+    ScalarExpr, ScalarFunc, Schema, Selection, SortKey, SqlError, UpdateSet, Value, fe, fe_code,
 };
 use crate::session::{Session, now_utc_micros};
 use crate::types::timestamp_micros_to_date_days;
@@ -180,6 +180,97 @@ fn bind_with_search_path(
             Ok(Plan::Projection {
                 input: Box::new(child),
                 exprs: bound_exprs,
+                schema: Schema { fields },
+            })
+        }
+
+        Plan::Aggregate {
+            input,
+            group_exprs,
+            agg_exprs,
+            schema: _,
+        } => {
+            let child =
+                bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
+            let child_schema = child.schema().clone();
+            let mut bound_group_exprs = Vec::with_capacity(group_exprs.len());
+            let mut fields = Vec::new();
+            for (expr, name) in group_exprs {
+                let bound = bind_scalar_expr(
+                    &expr,
+                    &child_schema,
+                    None,
+                    db,
+                    search_path,
+                    current_database,
+                    time_ctx,
+                )?;
+                let dt = scalar_expr_type(&bound, &child_schema).unwrap_or(DataType::Text);
+                let origin = if let ScalarExpr::ColumnIdx(idx) = &bound {
+                    child_schema
+                        .fields
+                        .get(*idx)
+                        .and_then(|f| f.origin.clone())
+                } else {
+                    None
+                };
+                fields.push(Field {
+                    name: name.clone(),
+                    data_type: dt.clone(),
+                    origin,
+                });
+                bound_group_exprs.push((bound, name));
+            }
+
+            let mut bound_agg_exprs = Vec::with_capacity(agg_exprs.len());
+            for (agg_call, name) in agg_exprs {
+                let bound_expr = if let Some(expr) = agg_call.expr {
+                    Some(bind_scalar_expr(
+                        &expr,
+                        &child_schema,
+                        None,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?)
+                } else {
+                    None
+                };
+                let dt = match agg_call.func {
+                    AggFunc::Count => DataType::Int8,
+                    AggFunc::Sum => match bound_expr
+                        .as_ref()
+                        .and_then(|e| scalar_expr_type(e, &child_schema))
+                    {
+                        Some(DataType::Float8) => DataType::Float8,
+                        Some(DataType::Int4) | Some(DataType::Int8) => DataType::Int8,
+                        _ => DataType::Float8,
+                    },
+                    AggFunc::Avg => DataType::Float8,
+                    AggFunc::Min | AggFunc::Max => bound_expr
+                        .as_ref()
+                        .and_then(|e| scalar_expr_type(e, &child_schema))
+                        .unwrap_or(DataType::Text),
+                };
+                fields.push(Field {
+                    name: name.clone(),
+                    data_type: dt.clone(),
+                    origin: None,
+                });
+                bound_agg_exprs.push((
+                    AggCall {
+                        func: agg_call.func,
+                        expr: bound_expr,
+                    },
+                    name,
+                ));
+            }
+
+            Ok(Plan::Aggregate {
+                input: Box::new(child),
+                group_exprs: bound_group_exprs,
+                agg_exprs: bound_agg_exprs,
                 schema: Schema { fields },
             })
         }
@@ -481,6 +572,7 @@ fn bind_with_search_path(
             mut table,
             columns,
             rows,
+            override_system_value,
             mut returning,
             mut returning_schema,
         } => {
@@ -589,6 +681,7 @@ fn bind_with_search_path(
                 table,
                 columns,
                 rows: bound_rows,
+                override_system_value,
                 returning,
                 returning_schema,
             })

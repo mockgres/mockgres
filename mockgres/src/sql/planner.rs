@@ -55,8 +55,9 @@ mod tests {
             .expect("plan sql");
         match plan {
             Plan::AlterTableAddColumn { column, .. } => {
-                let (name, _ty, _nullable, default) = column;
+                let (name, _ty, _nullable, default, identity) = column;
                 assert_eq!(name, "note");
+                assert!(identity.is_none());
                 match default {
                     Some(ScalarExpr::Literal(Value::Text(s))) => assert_eq!(s, "pending"),
                     other => panic!("expected text default, got {other:?}"),
@@ -120,11 +121,13 @@ mod tests {
                 table,
                 columns,
                 if_not_exists,
+                is_unique,
             } => {
                 assert_eq!(name, "idx_things");
                 assert_eq!(table.name, "items");
                 assert_eq!(columns, vec!["id".to_string(), "qty".to_string()]);
                 assert!(!if_not_exists);
+                assert!(!is_unique);
             }
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -142,6 +145,55 @@ mod tests {
                     Some("public")
                 );
                 assert_eq!(indexes[0].name, "idx_things");
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alter_table_unique_constraint_parse() {
+        let unnamed =
+            Planner::plan_sql("alter table items add unique (qty)").expect("plan add unique");
+        match unnamed {
+            Plan::AlterTableAddConstraintUnique {
+                table,
+                name,
+                columns,
+            } => {
+                assert_eq!(table.name, "items");
+                assert!(name.is_none());
+                assert_eq!(columns, vec!["qty".to_string()]);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+
+        let named =
+            Planner::plan_sql("alter table items add constraint items_qty_unique unique (qty)")
+                .expect("plan add named unique");
+        match named {
+            Plan::AlterTableAddConstraintUnique {
+                table,
+                name,
+                columns,
+            } => {
+                assert_eq!(table.name, "items");
+                assert_eq!(name.as_deref(), Some("items_qty_unique"));
+                assert_eq!(columns, vec!["qty".to_string()]);
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+
+        let drop = Planner::plan_sql("alter table items drop constraint items_qty_unique")
+            .expect("plan drop unique");
+        match drop {
+            Plan::AlterTableDropConstraint {
+                table,
+                name,
+                if_exists,
+            } => {
+                assert_eq!(table.name, "items");
+                assert_eq!(name, "items_qty_unique");
+                assert!(!if_exists);
             }
             other => panic!("unexpected plan: {other:?}"),
         }

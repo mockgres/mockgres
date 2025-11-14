@@ -80,22 +80,55 @@ fn split_timestamptz_offset(input: &str) -> Result<(&str, Option<i32>), String> 
         let dt = trimmed[..trimmed.len() - 1].trim_end();
         return Ok((dt, Some(0)));
     }
-    if let Some(idx) = trimmed.rfind(|c| c == '+' || c == '-') {
-        if idx > 10 {
-            let offset_part = &trimmed[idx..];
-            if offset_part.len() > 1
-                && offset_part[1..]
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == ':')
-            {
-                let tz = SessionTimeZone::parse(offset_part)
-                    .map_err(|_| "invalid timestamptz offset".to_string())?;
-                let dt = trimmed[..idx].trim_end();
-                return Ok((dt, Some(tz.offset_seconds())));
+    if let Some((idx, offset_part)) = find_offset_suffix(trimmed) {
+        let tz = SessionTimeZone::parse(offset_part)
+            .map_err(|_| "invalid timestamptz offset".to_string())?;
+        let dt = trimmed[..idx].trim_end();
+        return Ok((dt, Some(tz.offset_seconds())));
+    }
+    Ok((trimmed, None))
+}
+
+fn find_offset_suffix(input: &str) -> Option<(usize, &str)> {
+    for (idx, ch) in input.char_indices().rev() {
+        if ch == '+' || ch == '-' {
+            let candidate = &input[idx..];
+            if looks_like_offset_suffix(candidate) {
+                return Some((idx, candidate));
             }
         }
     }
-    Ok((trimmed, None))
+    None
+}
+
+fn looks_like_offset_suffix(candidate: &str) -> bool {
+    if candidate.len() < 2 {
+        return false;
+    }
+    let bytes = candidate.as_bytes();
+    if bytes[0] != b'+' && bytes[0] != b'-' {
+        return false;
+    }
+    let body = &candidate[1..];
+    if body.is_empty() {
+        return false;
+    }
+    if let Some(colon_idx) = body.find(':') {
+        if colon_idx == 0 || colon_idx > 2 {
+            return false;
+        }
+        if body[colon_idx + 1..].contains(':') {
+            return false;
+        }
+        let hour = &body[..colon_idx];
+        let minute = &body[colon_idx + 1..];
+        if minute.len() != 2 {
+            return false;
+        }
+        hour.chars().all(|c| c.is_ascii_digit()) && minute.chars().all(|c| c.is_ascii_digit())
+    } else {
+        (1..=2).contains(&body.len()) && body.chars().all(|c| c.is_ascii_digit())
+    }
 }
 
 pub fn parse_timestamptz_str(s: &str, session_tz: &SessionTimeZone) -> Result<i64, String> {

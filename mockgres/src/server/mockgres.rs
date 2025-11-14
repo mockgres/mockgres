@@ -127,7 +127,7 @@ impl SimpleQueryHandler for Mockgres {
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
                 let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
                 let snapshot_xid = self.capture_statement_snapshot(&session);
-                let eval_ctx = EvalContext::from_session(&session);
+                let eval_ctx = EvalContext::for_statement(&session);
                 // bind (names -> positions) using catalog
                 let bound = {
                     let db_read = self.db.read();
@@ -225,7 +225,7 @@ impl ExtendedQueryHandler for Mockgres {
         let session = self.session_for_client(client)?;
         let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
         let snapshot_xid = self.capture_statement_snapshot(&session);
-        let eval_ctx = EvalContext::from_session(&session);
+        let eval_ctx = EvalContext::for_statement(&session);
         let bound = {
             let db = self.db.read();
             bind(&db, &session, portal.statement.statement.clone())?

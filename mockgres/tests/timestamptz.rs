@@ -25,11 +25,17 @@ async fn timestamptz_respects_session_timezone() {
         .await
         .expect("set initial time zone");
     ctx.client
-        .execute("insert into tz_data (ts) values ('2025-01-01 12:00:00')", &[])
+        .execute(
+            "insert into tz_data (ts) values ('2025-01-01 12:00:00')",
+            &[],
+        )
         .await
         .expect("insert local timestamptz");
     ctx.client
-        .execute("insert into tz_data (ts) values ('2025-01-01 12:00:00+00')", &[])
+        .execute(
+            "insert into tz_data (ts) values ('2025-01-01 12:00:00+00')",
+            &[],
+        )
         .await
         .expect("insert utc timestamptz");
 

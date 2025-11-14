@@ -1,7 +1,7 @@
-use crate::session::{Session, SessionTimeZone};
+use crate::session::{Session, SessionTimeZone, now_utc_micros};
 use crate::types::{
     date_days_to_postgres, format_bytea, format_date, format_timestamp, format_timestamptz,
-    timestamp_to_postgres_micros,
+    timestamp_micros_to_date_days, timestamp_to_postgres_micros,
 };
 use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
@@ -17,28 +17,87 @@ use super::{
 };
 
 #[derive(Clone)]
+pub struct StatementTimeContext {
+    pub stmt_ts_utc_micros: i64,
+    pub session_tz: SessionTimeZone,
+}
+
+impl StatementTimeContext {
+    pub fn new(stmt_ts_utc_micros: i64, session_tz: SessionTimeZone) -> Self {
+        Self {
+            stmt_ts_utc_micros,
+            session_tz,
+        }
+    }
+
+    pub fn capture(session: &Session) -> Self {
+        let tz = session.time_zone();
+        let stmt_ts = session
+            .statement_time_micros()
+            .unwrap_or_else(now_utc_micros);
+        Self::new(stmt_ts, tz)
+    }
+}
+
+#[derive(Clone)]
 pub struct EvalContext {
     pub time_zone: SessionTimeZone,
+    pub statement_time: Option<StatementTimeContext>,
 }
 
 impl EvalContext {
     pub fn new(time_zone: SessionTimeZone) -> Self {
-        Self { time_zone }
+        Self {
+            time_zone,
+            statement_time: None,
+        }
+    }
+
+    pub fn for_statement(session: &Session) -> Self {
+        let tz = session.time_zone();
+        let statement_time = StatementTimeContext::capture(session);
+        Self {
+            time_zone: tz,
+            statement_time: Some(statement_time),
+        }
+    }
+
+    pub fn with_statement_time(
+        time_zone: SessionTimeZone,
+        statement_time: StatementTimeContext,
+    ) -> Self {
+        Self {
+            time_zone,
+            statement_time: Some(statement_time),
+        }
     }
 
     pub fn from_session(session: &Session) -> Self {
+        let time_zone = session.time_zone();
+        let statement_time = session
+            .statement_time_micros()
+            .map(|micros| StatementTimeContext::new(micros, time_zone.clone()));
         Self {
-            time_zone: session.time_zone(),
+            time_zone,
+            statement_time,
         }
     }
 }
 
 impl Default for EvalContext {
     fn default() -> Self {
+        let tz = SessionTimeZone::Utc;
         Self {
-            time_zone: SessionTimeZone::Utc,
+            time_zone: tz.clone(),
+            statement_time: Some(StatementTimeContext::new(now_utc_micros(), tz)),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EvalMode {
+    Normal,
+    ColumnDefault,
 }
 
 pub fn eval_scalar_expr(
@@ -46,6 +105,16 @@ pub fn eval_scalar_expr(
     expr: &ScalarExpr,
     params: &[Value],
     ctx: &EvalContext,
+) -> PgWireResult<Value> {
+    eval_scalar_expr_with_mode(row, expr, params, ctx, EvalMode::Normal)
+}
+
+pub fn eval_scalar_expr_with_mode(
+    row: &[Value],
+    expr: &ScalarExpr,
+    params: &[Value],
+    ctx: &EvalContext,
+    mode: EvalMode,
 ) -> PgWireResult<Value> {
     match expr {
         ScalarExpr::Literal(v) => Ok(v.clone()),
@@ -59,23 +128,23 @@ pub fn eval_scalar_expr(
             .cloned()
             .ok_or_else(|| fe("parameter index out of range")),
         ScalarExpr::BinaryOp { op, left, right } => {
-            let lv = eval_scalar_expr(row, left, params, ctx)?;
-            let rv = eval_scalar_expr(row, right, params, ctx)?;
+            let lv = eval_scalar_expr_with_mode(row, left, params, ctx, mode)?;
+            let rv = eval_scalar_expr_with_mode(row, right, params, ctx, mode)?;
             eval_binary_op(*op, lv, rv)
         }
         ScalarExpr::UnaryOp { op, expr } => {
-            let v = eval_scalar_expr(row, expr, params, ctx)?;
+            let v = eval_scalar_expr_with_mode(row, expr, params, ctx, mode)?;
             eval_unary_op(*op, v)
         }
         ScalarExpr::Func { func, args } => {
             let mut evaluated = Vec::with_capacity(args.len());
             for arg in args {
-                evaluated.push(eval_scalar_expr(row, arg, params, ctx)?);
+                evaluated.push(eval_scalar_expr_with_mode(row, arg, params, ctx, mode)?);
             }
-            eval_function(*func, evaluated)
+            eval_function(*func, evaluated, ctx, mode)
         }
         ScalarExpr::Cast { expr, ty } => {
-            let value = eval_scalar_expr(row, expr, params, ctx)?;
+            let value = eval_scalar_expr_with_mode(row, expr, params, ctx, mode)?;
             if matches!(value, Value::Null) {
                 Ok(Value::Null)
             } else {
@@ -162,7 +231,12 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
     }
 }
 
-fn eval_function(func: ScalarFunc, args: Vec<Value>) -> PgWireResult<Value> {
+fn eval_function(
+    func: ScalarFunc,
+    args: Vec<Value>,
+    ctx: &EvalContext,
+    mode: EvalMode,
+) -> PgWireResult<Value> {
     match func {
         ScalarFunc::Coalesce => {
             for arg in args {
@@ -191,13 +265,42 @@ fn eval_function(func: ScalarFunc, args: Vec<Value>) -> PgWireResult<Value> {
         ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas | ScalarFunc::CurrentDatabase => {
             Err(fe("context-dependent function evaluated without binding"))
         }
-        ScalarFunc::Now
-        | ScalarFunc::CurrentTimestamp
-        | ScalarFunc::StatementTimestamp
-        | ScalarFunc::TransactionTimestamp
-        | ScalarFunc::ClockTimestamp
-        | ScalarFunc::CurrentDate => Err(fe("timestamp function evaluated without binding")),
+        ScalarFunc::Now | ScalarFunc::CurrentTimestamp | ScalarFunc::StatementTimestamp => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::TimestamptzMicros(statement_timestamp(ctx)?))
+        }
+        ScalarFunc::TransactionTimestamp => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::TimestamptzMicros(statement_timestamp(ctx)?))
+        }
+        ScalarFunc::ClockTimestamp => {
+            ensure_no_args(&func, &args)?;
+            if matches!(mode, EvalMode::ColumnDefault) {
+                return Err(fe("clock_timestamp() is not allowed in column defaults"));
+            }
+            Ok(Value::TimestamptzMicros(now_utc_micros()))
+        }
+        ScalarFunc::CurrentDate => {
+            ensure_no_args(&func, &args)?;
+            let micros = statement_timestamp(ctx)?;
+            let days = timestamp_micros_to_date_days(micros).map_err(fe)?;
+            Ok(Value::Date(days))
+        }
     }
+}
+
+fn ensure_no_args(func: &ScalarFunc, args: &[Value]) -> PgWireResult<()> {
+    if !args.is_empty() {
+        return Err(fe(format!("{func:?}() takes no arguments")));
+    }
+    Ok(())
+}
+
+fn statement_timestamp(ctx: &EvalContext) -> PgWireResult<i64> {
+    ctx.statement_time
+        .as_ref()
+        .map(|t| t.stmt_ts_utc_micros)
+        .ok_or_else(|| fe("statement timestamp is not available in this context"))
 }
 
 #[derive(Clone)]
@@ -313,7 +416,7 @@ pub fn eval_bool_expr(
     })
 }
 
-fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
+pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
         return None;
@@ -427,9 +530,7 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Bytea) => {
                                     enc.encode_field(&Option::<Vec<u8>>::None)
                                 }
-                                (Value::Int64(i), DataType::Int4) => {
-                                    enc.encode_field(&(i as i32))
-                                }
+                                (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
                                 (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
                                 (Value::Int64(i), DataType::Float8) => {
                                     let f = i as f64;
@@ -474,7 +575,8 @@ pub async fn to_pgwire_stream(
                                         let pg_micros = timestamp_to_postgres_micros(micros);
                                         enc.encode_field(&pg_micros)
                                     } else {
-                                        let text = match format_timestamptz(micros, &ctx.time_zone) {
+                                        let text = match format_timestamptz(micros, &ctx.time_zone)
+                                        {
                                             Ok(t) => t,
                                             Err(e) => {
                                                 return Some((Err(fe(e)), (node, fields, schema)));
@@ -652,5 +754,37 @@ mod tests {
         let expected_ts =
             Value::TimestampMicros(parse_timestamp_str("2024-02-01 12:34:56").unwrap());
         assert_eq!(eval(&ts_expr), expected_ts);
+    }
+
+    #[test]
+    fn column_default_allows_current_timestamp() {
+        let expr = ScalarExpr::Func {
+            func: ScalarFunc::CurrentTimestamp,
+            args: vec![],
+        };
+        let tz = SessionTimeZone::Utc;
+        let ctx =
+            EvalContext::with_statement_time(tz.clone(), StatementTimeContext::new(42, tz.clone()));
+        let value = eval_scalar_expr_with_mode(&[], &expr, &[], &ctx, EvalMode::ColumnDefault)
+            .expect("evaluates timestamp");
+        assert_eq!(value, Value::TimestamptzMicros(42));
+    }
+
+    #[test]
+    fn column_default_rejects_clock_timestamp() {
+        let expr = ScalarExpr::Func {
+            func: ScalarFunc::ClockTimestamp,
+            args: vec![],
+        };
+        let tz = SessionTimeZone::Utc;
+        let ctx =
+            EvalContext::with_statement_time(tz.clone(), StatementTimeContext::new(42, tz.clone()));
+        let err = eval_scalar_expr_with_mode(&[], &expr, &[], &ctx, EvalMode::ColumnDefault)
+            .expect_err("clock_timestamp blocked");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("clock_timestamp"),
+            "unexpected error message: {msg}"
+        );
     }
 }
