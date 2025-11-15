@@ -39,10 +39,7 @@ fn parse_bool_expr_internal(
             let mut args = Vec::new();
             for a in &be.args {
                 let n = a.node.as_ref().ok_or_else(|| fe("bad bool arg"))?;
-                args.push(parse_bool_expr_internal(
-                    n,
-                    agg_ctx.as_deref_mut(),
-                )?);
+                args.push(parse_bool_expr_internal(n, agg_ctx.as_deref_mut())?);
             }
             match op {
                 BoolExprType::AndExpr => Ok(BoolExpr::And(args)),
@@ -164,10 +161,7 @@ fn parse_coalesce_expr(
             .node
             .as_ref()
             .ok_or_else(|| fe("bad coalesce argument"))?;
-        args.push(parse_scalar_expr_internal(
-            node,
-            agg_ctx.as_deref_mut(),
-        )?);
+        args.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
     }
     if args.is_empty() {
         return Err(fe("coalesce requires at least one argument"));
@@ -402,10 +396,7 @@ fn parse_function_call(
             .node
             .as_ref()
             .ok_or_else(|| fe("bad function argument"))?;
-        args.push(parse_scalar_expr_internal(
-            node,
-            agg_ctx.as_deref_mut(),
-        )?);
+        args.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
     }
     let func = match name.as_str() {
         "coalesce" => ScalarFunc::Coalesce,

@@ -1,24 +1,25 @@
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use pgwire::error::{PgWireError, PgWireResult};
 
 use crate::catalog::{SchemaId, SchemaName};
-use crate::db::{Db, LockHandle, LockOwner};
+use crate::db::{Db, LockOwner};
 use crate::engine::{
-    AggCall, AggFunc, CountExec, DbDdlKind, EvalContext, ExecNode, Expr, FilterExec,
-    HashAggregateExec, LimitExec, LockSpec, NestedLoopJoinExec, ObjName, OrderExec, Plan,
-    ProjectExec, ReturningClause, ReturningExpr, ScalarExpr, Schema, SeqScanExec, UpdateSet, Value,
-    ValuesExec, eval_scalar_expr, fe, fe_code,
+    AggCall, AggFunc, DbDdlKind, EvalContext, ExecNode, Expr, ObjName, Plan, ReturningClause,
+    ReturningExpr, Schema, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
-use crate::session::{RowPointer, Session, SessionTimeZone, now_utc_micros};
-use crate::storage::{Row, RowId};
-use crate::txn::{TransactionManager, TxId, TxnStatus, VisibilityContext};
+use crate::session::{RowPointer, Session, SessionTimeZone};
+use crate::storage::Row;
+use crate::txn::{TransactionManager, TxId, VisibilityContext};
 
 use super::errors::map_db_err;
+use super::exec::read::build_read_executor;
+use super::exec::tx::{
+    begin_transaction, commit_transaction, finish_writer_tx, rollback_transaction, writer_txid,
+};
 use super::insert::evaluate_insert_source;
 
-fn schema_or_public(schema: &Option<SchemaName>) -> &str {
+pub(crate) fn schema_or_public(schema: &Option<SchemaName>) -> &str {
     schema.as_ref().map(|s| s.as_str()).unwrap_or("public")
 }
 
@@ -133,7 +134,7 @@ fn derive_unique_index_name(table: &str, columns: &[String]) -> String {
     }
 }
 
-fn assert_supported_aggs(aggs: &[(AggCall, String)]) {
+pub(crate) fn assert_supported_aggs(aggs: &[(AggCall, String)]) {
     for (agg, _) in aggs {
         match agg.func {
             AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {}
@@ -211,291 +212,18 @@ pub fn build_executor(
     ctx: &EvalContext,
 ) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
     match p {
-        Plan::Values { rows, schema } => {
-            let cnt = rows.len();
-            Ok((
-                Box::new(ValuesExec::new(schema.clone(), rows.clone())?),
-                None,
-                Some(cnt),
-            ))
+        Plan::Values { .. }
+        | Plan::Projection { .. }
+        | Plan::Aggregate { .. }
+        | Plan::CountRows { .. }
+        | Plan::SeqScan { .. }
+        | Plan::LockRows { .. }
+        | Plan::Filter { .. }
+        | Plan::Order { .. }
+        | Plan::Limit { .. }
+        | Plan::Join { .. } => {
+            return build_read_executor(db, txn_manager, session, snapshot_xid, p, params, ctx);
         }
-
-        Plan::Projection {
-            input,
-            exprs,
-            schema,
-        } => {
-            let (child, _tag, cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            Ok((
-                Box::new(ProjectExec::new(
-                    schema.clone(),
-                    child,
-                    exprs.clone(),
-                    params.clone(),
-                    ctx.clone(),
-                )),
-                None,
-                cnt,
-            ))
-        }
-        Plan::Aggregate {
-            input,
-            group_exprs,
-            agg_exprs,
-            schema,
-        } => {
-            assert_supported_aggs(agg_exprs);
-            let (child, _tag, _cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            Ok((
-                Box::new(HashAggregateExec::new(
-                    schema.clone(),
-                    child,
-                    group_exprs.clone(),
-                    agg_exprs.clone(),
-                    params.clone(),
-                    ctx.clone(),
-                )),
-                None,
-                None,
-            ))
-        }
-
-        Plan::CountRows { input, schema } => {
-            let (child, _tag, _cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            Ok((
-                Box::new(CountExec::new(schema.clone(), child)),
-                None,
-                Some(1),
-            ))
-        }
-
-        Plan::SeqScan {
-            table,
-            cols,
-            schema,
-            lock,
-        } => {
-            let db_read = db.read();
-            let schema_name = schema_or_public(&table.schema);
-            let _tm = db_read
-                .resolve_table(schema_name, &table.name)
-                .map_err(map_db_err)?;
-            let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
-            let current_tx = session.current_tx();
-            let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
-            let (mut rows, _cols, row_ids) = if positions.is_empty() && schema.fields.is_empty() {
-                (vec![], vec![], Vec::new())
-            } else {
-                db_read
-                    .scan_bound_positions(schema_name, &table.name, &positions, &visibility)
-                    .map_err(map_db_err)?
-            };
-            drop(db_read);
-            if lock.is_some() {
-                for (row, row_id) in rows.iter_mut().zip(row_ids.iter()) {
-                    row.push(Value::Int64(*row_id as i64));
-                }
-            }
-            let cnt = rows.len();
-            Ok((
-                Box::new(SeqScanExec::new(schema.clone(), rows)),
-                None,
-                Some(cnt),
-            ))
-        }
-        Plan::LockRows {
-            table: _,
-            input,
-            lock,
-            row_id_idx,
-            schema,
-        } => {
-            let (child, _tag, _cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            let epoch = session
-                .current_epoch()
-                .ok_or_else(|| fe("FOR UPDATE requires an active transaction"))?;
-            let owner = LockOwner::new(session.id(), epoch);
-            let lock_handle = {
-                let db_read = db.read();
-                db_read.lock_handle()
-            };
-            let exec = LockApplyExec::new(
-                schema.clone(),
-                child,
-                *lock,
-                *row_id_idx,
-                owner,
-                lock_handle,
-            );
-            Ok((Box::new(exec), None, None))
-        }
-
-        Plan::Filter {
-            input,
-            expr,
-            project_prefix_len,
-        } => {
-            let (child, _tag, _cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            let child_schema = child.schema().clone();
-            let mut node: Box<dyn ExecNode> = Box::new(FilterExec::new(
-                child_schema.clone(),
-                child,
-                expr.clone(),
-                params.clone(),
-                ctx.clone(),
-            ));
-
-            if let Some(n) = *project_prefix_len {
-                if n == 0 {
-                    return Ok((node, None, None));
-                }
-                let proj_fields = child_schema.fields[..n].to_vec();
-                let proj_schema = Schema {
-                    fields: proj_fields.clone(),
-                };
-                let exprs: Vec<(ScalarExpr, String)> = (0..n)
-                    .map(|i| (ScalarExpr::ColumnIdx(i), proj_fields[i].name.clone()))
-                    .collect();
-                node = Box::new(ProjectExec::new(
-                    proj_schema,
-                    node,
-                    exprs,
-                    params.clone(),
-                    ctx.clone(),
-                ));
-            }
-
-            Ok((node, None, None))
-        }
-
-        Plan::Order { input, keys } => {
-            let (child, _tag, cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            let schema = child.schema().clone();
-            let exec = Box::new(OrderExec::new(
-                schema,
-                child,
-                keys.clone(),
-                params.clone(),
-                ctx.clone(),
-            )?);
-            Ok((exec, None, cnt))
-        }
-
-        Plan::Limit {
-            input,
-            limit,
-            offset,
-        } => {
-            let limit_val = *limit;
-            let offset_val = *offset;
-            let (child, _tag, cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                input,
-                params.clone(),
-                ctx,
-            )?;
-            let remaining_after_offset = cnt.map(|c| c.saturating_sub(offset_val));
-            let out_cnt = match (remaining_after_offset, limit_val) {
-                (Some(c), Some(lim)) => Some(c.min(lim)),
-                (Some(c), None) => Some(c),
-                _ => None,
-            };
-            let schema = child.schema().clone();
-            Ok((
-                Box::new(LimitExec::new(schema, child, limit_val, offset_val)),
-                None,
-                out_cnt,
-            ))
-        }
-        Plan::Join {
-            left,
-            right,
-            schema,
-        } => {
-            let (left_exec, _ltag, left_cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                left,
-                params.clone(),
-                ctx,
-            )?;
-            let (right_exec, _rtag, right_cnt) = build_executor(
-                db,
-                txn_manager,
-                session,
-                snapshot_xid,
-                right,
-                params.clone(),
-                ctx,
-            )?;
-            let out_cnt = match (left_cnt, right_cnt) {
-                (Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
-                _ => None,
-            };
-            Ok((
-                Box::new(NestedLoopJoinExec::new(
-                    schema.clone(),
-                    left_exec,
-                    right_exec,
-                )),
-                None,
-                out_cnt,
-            ))
-        }
-
         Plan::CreateTable {
             table,
             cols,
@@ -1228,182 +956,4 @@ fn materialize_returning_rows(
         out.push(projected);
     }
     Ok(out)
-}
-
-struct LockApplyExec {
-    schema: Schema,
-    child: Box<dyn ExecNode>,
-    lock_spec: LockSpec,
-    row_id_idx: usize,
-    owner: LockOwner,
-    locks: LockHandle,
-}
-
-enum AcquireOutcome {
-    Acquired,
-    Skipped,
-}
-
-impl LockApplyExec {
-    fn new(
-        schema: Schema,
-        child: Box<dyn ExecNode>,
-        lock_spec: LockSpec,
-        row_id_idx: usize,
-        owner: LockOwner,
-        locks: LockHandle,
-    ) -> Self {
-        Self {
-            schema,
-            child,
-            lock_spec,
-            row_id_idx,
-            owner,
-            locks,
-        }
-    }
-}
-
-#[async_trait]
-impl ExecNode for LockApplyExec {
-    async fn open(&mut self) -> PgWireResult<()> {
-        self.child.open().await
-    }
-
-    async fn next(&mut self) -> PgWireResult<Option<Vec<Value>>> {
-        loop {
-            let Some(mut row) = self.child.next().await? else {
-                return Ok(None);
-            };
-            if row.len() <= self.row_id_idx {
-                return Err(fe("row identifier column missing from plan output"));
-            }
-            let row_id_value = row.remove(self.row_id_idx);
-            let Value::Int64(raw_id) = row_id_value else {
-                return Err(fe("row identifier column has unexpected type"));
-            };
-            if raw_id < 0 {
-                return Err(fe("row identifier cannot be negative"));
-            }
-            let row_id = raw_id as RowId;
-            let acquire_result = if self.lock_spec.skip_locked {
-                self.locks
-                    .lock_row_skip_locked(self.lock_spec.target, row_id, self.owner)
-                    .map(|acquired| {
-                        if acquired {
-                            AcquireOutcome::Acquired
-                        } else {
-                            AcquireOutcome::Skipped
-                        }
-                    })
-            } else if self.lock_spec.nowait {
-                self.locks
-                    .lock_row_nowait(self.lock_spec.target, row_id, self.owner)
-                    .map(|_| AcquireOutcome::Acquired)
-            } else {
-                self.locks
-                    .lock_row_blocking(self.lock_spec.target, row_id, self.owner)
-                    .await
-                    .map(|_| AcquireOutcome::Acquired)
-            };
-            match acquire_result {
-                Ok(AcquireOutcome::Acquired) => return Ok(Some(row)),
-                Ok(AcquireOutcome::Skipped) => continue,
-                Err(e) => return Err(map_db_err(e)),
-            }
-        }
-    }
-
-    async fn close(&mut self) -> PgWireResult<()> {
-        self.child.close().await
-    }
-
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-}
-
-fn writer_txid(session: &Arc<Session>, txn_manager: &Arc<TransactionManager>) -> (TxId, bool) {
-    if let Some(txid) = session.current_tx() {
-        (txid, false)
-    } else {
-        let txid = txn_manager.allocate();
-        txn_manager.set_status(txid, TxnStatus::InProgress);
-        (txid, true)
-    }
-}
-
-fn finish_writer_tx(
-    txn_manager: &Arc<TransactionManager>,
-    txid: TxId,
-    autocommit: bool,
-    success: bool,
-) {
-    if autocommit {
-        let status = if success {
-            TxnStatus::Committed
-        } else {
-            TxnStatus::Aborted
-        };
-        txn_manager.set_status(txid, status);
-    }
-}
-
-fn begin_transaction(
-    session: &Arc<Session>,
-    txn_manager: &Arc<TransactionManager>,
-) -> PgWireResult<()> {
-    if session.current_tx().is_some() {
-        return Err(fe_code("25001", "transaction already in progress"));
-    }
-    let txid = txn_manager.allocate();
-    txn_manager.set_status(txid, TxnStatus::InProgress);
-    session.begin_transaction_epoch();
-    session.set_current_tx(Some(txid));
-    session.reset_changes();
-    session.set_txn_start_micros(now_utc_micros());
-    Ok(())
-}
-
-fn commit_transaction(
-    session: &Arc<Session>,
-    txn_manager: &Arc<TransactionManager>,
-    db: &Arc<parking_lot::RwLock<Db>>,
-) -> PgWireResult<()> {
-    let Some(txid) = session.current_tx() else {
-        return Err(fe_code("25P01", "no transaction in progress"));
-    };
-    txn_manager.set_status(txid, TxnStatus::Committed);
-    session.set_current_tx(None);
-    session.reset_changes();
-    session.clear_txn_start_micros();
-    if let Some(epoch) = session.end_transaction_epoch() {
-        let db_read = db.read();
-        db_read.release_locks(LockOwner::new(session.id(), epoch));
-    }
-    Ok(())
-}
-
-fn rollback_transaction(
-    session: &Arc<Session>,
-    txn_manager: &Arc<TransactionManager>,
-    db: &Arc<parking_lot::RwLock<Db>>,
-) -> PgWireResult<()> {
-    let Some(txid) = session.current_tx() else {
-        return Err(fe_code("25P01", "no transaction in progress"));
-    };
-    let changes = session.take_changes();
-    session.set_current_tx(None);
-    session.clear_txn_start_micros();
-    {
-        let mut db = db.write();
-        db.rollback_transaction_changes(&changes, txid)
-            .map_err(map_db_err)?;
-    }
-    txn_manager.set_status(txid, TxnStatus::Aborted);
-    if let Some(epoch) = session.end_transaction_epoch() {
-        let db_read = db.read();
-        db_read.release_locks(LockOwner::new(session.id(), epoch));
-    }
-    Ok(())
 }

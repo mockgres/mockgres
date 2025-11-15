@@ -190,8 +190,7 @@ fn bind_with_search_path(
             agg_exprs,
             schema: _,
         } => {
-            let child =
-                bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
             let child_schema = child.schema().clone();
             let mut bound_group_exprs = Vec::with_capacity(group_exprs.len());
             let mut fields = Vec::new();
@@ -207,10 +206,7 @@ fn bind_with_search_path(
                 )?;
                 let dt = scalar_expr_type(&bound, &child_schema).unwrap_or(DataType::Text);
                 let origin = if let ScalarExpr::ColumnIdx(idx) = &bound {
-                    child_schema
-                        .fields
-                        .get(*idx)
-                        .and_then(|f| f.origin.clone())
+                    child_schema.fields.get(*idx).and_then(|f| f.origin.clone())
                 } else {
                     None
                 };

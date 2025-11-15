@@ -1,6 +1,7 @@
 mod config;
 mod describe;
 mod errors;
+mod exec;
 mod exec_builder;
 mod insert;
 mod mapping;

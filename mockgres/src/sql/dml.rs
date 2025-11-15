@@ -13,9 +13,9 @@ use pg_query::protobuf::{
 use pgwire::error::PgWireResult;
 
 use super::expr::{
-    agg_func_from_name, collect_columns_from_bool_expr, collect_columns_from_scalar_expr,
-    derive_expr_name, is_aggregate_func_name, parse_bool_expr, parse_bool_expr_with_aggregates,
-    parse_column_ref, parse_scalar_expr, AggregateExprCollector,
+    AggregateExprCollector, agg_func_from_name, collect_columns_from_bool_expr,
+    collect_columns_from_scalar_expr, derive_expr_name, is_aggregate_func_name, parse_bool_expr,
+    parse_bool_expr_with_aggregates, parse_column_ref, parse_scalar_expr,
 };
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
@@ -42,15 +42,15 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         None
     };
     let mut having_aggs = Vec::new();
-    let mut having_expr =
-        if let Some(h) = sel.having_clause.as_ref().and_then(|n| n.node.as_ref()) {
-            let mut collector = AggregateExprCollector::new("__having_agg");
-            let expr = parse_bool_expr_with_aggregates(h, &mut collector)?;
-            having_aggs = collector.into_aggs();
-            Some(expr)
-        } else {
-            None
-        };
+    let mut having_expr = if let Some(h) = sel.having_clause.as_ref().and_then(|n| n.node.as_ref())
+    {
+        let mut collector = AggregateExprCollector::new("__having_agg");
+        let expr = parse_bool_expr_with_aggregates(h, &mut collector)?;
+        having_aggs = collector.into_aggs();
+        Some(expr)
+    } else {
+        None
+    };
     let has_having = having_expr.is_some();
 
     let selection_needs_projection =
@@ -226,7 +226,10 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
                         "column must appear in the GROUP BY clause or be used in an aggregate function",
                     ));
                 };
-                select_proj.push(SelectProjection::Group { group_idx: idx, alias });
+                select_proj.push(SelectProjection::Group {
+                    group_idx: idx,
+                    alias,
+                });
             }
         }
         if select_proj.is_empty() {
@@ -415,7 +418,9 @@ fn target_list_contains_aggregates(target_list: &[pg_query::Node]) -> bool {
     use pg_query::NodeEnum;
 
     for t in target_list {
-        let Some(NodeEnum::ResTarget(rt)) = t.node.as_ref() else { continue };
+        let Some(NodeEnum::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
         let Some(expr_node) = rt.val.as_ref().and_then(|n| n.node.as_ref()) else {
             continue;
         };
@@ -537,9 +542,7 @@ fn parse_aggregate_select_list(
     Ok(items)
 }
 
-fn parse_group_clause(
-    group_clause: &[pg_query::Node],
-) -> PgWireResult<Vec<(ScalarExpr, String)>> {
+fn parse_group_clause(group_clause: &[pg_query::Node]) -> PgWireResult<Vec<(ScalarExpr, String)>> {
     use pg_query::NodeEnum;
 
     let mut out = Vec::with_capacity(group_clause.len());
