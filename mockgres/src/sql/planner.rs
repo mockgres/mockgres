@@ -2,7 +2,7 @@ use crate::engine::{Plan, fe};
 use pg_query::{NodeEnum, parse};
 use pgwire::error::PgWireResult;
 
-use super::{ddl, dml};
+use super::{ddl, delete, dml, insert, update};
 
 pub struct Planner;
 
@@ -36,9 +36,9 @@ impl Planner {
             Some(NodeEnum::VariableSetStmt(set)) => ddl::plan_set(set),
             Some(NodeEnum::AlterDatabaseStmt(db)) => ddl::plan_alter_database(db),
             Some(NodeEnum::AlterDatabaseSetStmt(db)) => ddl::plan_alter_database_set(db),
-            Some(NodeEnum::InsertStmt(ins)) => dml::plan_insert(*ins),
-            Some(NodeEnum::UpdateStmt(upd)) => dml::plan_update(*upd),
-            Some(NodeEnum::DeleteStmt(del)) => dml::plan_delete(*del),
+            Some(NodeEnum::InsertStmt(ins)) => insert::plan_insert(*ins),
+            Some(NodeEnum::UpdateStmt(upd)) => update::plan_update(*upd),
+            Some(NodeEnum::DeleteStmt(del)) => delete::plan_delete(*del),
             _ => Err(fe("unsupported statement type")),
         }
     }
