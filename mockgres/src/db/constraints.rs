@@ -8,6 +8,12 @@ use crate::txn::VisibilityContext;
 use super::sql_err;
 use super::visibility::visible_row_clone;
 
+#[derive(Clone, Debug)]
+pub struct ConflictInfo {
+    pub index_name: String,
+    pub existing_rowid: RowId,
+}
+
 #[derive(Clone)]
 pub(crate) struct InboundForeignKey {
     pub(crate) schema: String,
@@ -104,12 +110,11 @@ pub(crate) fn build_unique_index_values(
     entries
 }
 
-#[allow(dead_code)]
-pub(crate) fn ensure_unique_constraints(
+pub(crate) fn find_unique_violation(
     unique_maps: &HashMap<String, HashMap<Vec<Value>, RowId>>,
     entries: &[(String, Option<Vec<Value>>)],
     row_id: Option<RowId>,
-) -> anyhow::Result<()> {
+) -> Option<ConflictInfo> {
     for (index_name, maybe_values) in entries {
         let Some(values) = maybe_values else {
             continue;
@@ -117,16 +122,31 @@ pub(crate) fn ensure_unique_constraints(
         if let Some(map) = unique_maps.get(index_name) {
             if let Some(existing) = map.get(values) {
                 if row_id.map_or(true, |rid| *existing != rid) {
-                    return Err(sql_err(
-                        "23505",
-                        format!(
-                            "duplicate key value violates unique constraint {}",
-                            index_name
-                        ),
-                    ));
+                    return Some(ConflictInfo {
+                        index_name: index_name.clone(),
+                        existing_rowid: *existing,
+                    });
                 }
             }
         }
+    }
+    None
+}
+
+#[allow(dead_code)]
+pub(crate) fn ensure_unique_constraints(
+    unique_maps: &HashMap<String, HashMap<Vec<Value>, RowId>>,
+    entries: &[(String, Option<Vec<Value>>)],
+    row_id: Option<RowId>,
+) -> anyhow::Result<()> {
+    if let Some(conflict) = find_unique_violation(unique_maps, entries, row_id) {
+        return Err(sql_err(
+            "23505",
+            format!(
+                "duplicate key value violates unique constraint {}",
+                conflict.index_name
+            ),
+        ));
     }
     Ok(())
 }

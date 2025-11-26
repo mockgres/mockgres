@@ -199,7 +199,10 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
                 collect_param_hints_from_scalar(arg, out);
             }
         }
-        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(..) | ScalarExpr::Literal(_) => {}
+        ScalarExpr::Column(..)
+        | ScalarExpr::ColumnIdx(..)
+        | ScalarExpr::ExcludedIdx(..)
+        | ScalarExpr::Literal(_) => {}
     }
 }
 
@@ -357,7 +360,10 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
                 collect_param_indexes_from_scalar(arg, out);
             }
         }
-        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(..) | ScalarExpr::Literal(_) => {}
+        ScalarExpr::Column(..)
+        | ScalarExpr::ColumnIdx(..)
+        | ScalarExpr::ExcludedIdx(..)
+        | ScalarExpr::Literal(_) => {}
     }
 }
 

@@ -150,7 +150,7 @@ pub(super) fn parse_column_def(
 fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
     match expr {
         ScalarExpr::Literal(_) => Ok(()),
-        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(_) => {
+        ScalarExpr::Column(..) | ScalarExpr::ColumnIdx(_) | ScalarExpr::ExcludedIdx(_) => {
             Err(fe("DEFAULT expressions cannot reference columns"))
         }
         ScalarExpr::Param { .. } => Err(fe("DEFAULT expressions cannot reference parameters")),

@@ -56,3 +56,30 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
         returning_schema: None,
     })
 }
+
+pub fn parse_update_target_list(
+    target_list: &[pg_query::protobuf::Node],
+) -> PgWireResult<Vec<UpdateSet>> {
+    let mut sets = Vec::new();
+    for tgt in target_list {
+        let Some(NodeEnum::ResTarget(rt)) = tgt.node.as_ref() else {
+            return Err(fe("bad update target"));
+        };
+        let col_name = if !rt.name.is_empty() {
+            rt.name.clone()
+        } else {
+            extract_col_name(rt)?
+        };
+        let expr_node = rt
+            .val
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("missing update value"))?;
+        let expr = parse_scalar_expr(expr_node)?;
+        sets.push(UpdateSet::ByName(col_name, expr));
+    }
+    if sets.is_empty() {
+        return Err(fe("UPDATE requires SET clauses"));
+    }
+    Ok(sets)
+}

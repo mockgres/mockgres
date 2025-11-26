@@ -457,7 +457,7 @@ fn parse_function_call(
 pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
     match expr {
         ScalarExpr::Column(col) => out.push(col.column.clone()),
-        ScalarExpr::ColumnIdx(_) | ScalarExpr::Literal(_) => {}
+        ScalarExpr::ColumnIdx(_) | ScalarExpr::ExcludedIdx(_) | ScalarExpr::Literal(_) => {}
         ScalarExpr::Param { .. } => {}
         ScalarExpr::BinaryOp { left, right, .. } => {
             collect_columns_from_scalar_expr(left, out);
@@ -494,6 +494,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
     match expr {
         ScalarExpr::Column(col) => col.column.clone(),
         ScalarExpr::ColumnIdx(idx) => format!("?column{}?", idx + 1),
+        ScalarExpr::ExcludedIdx(idx) => format!("?column{}?", idx + 1),
         ScalarExpr::Param { idx, .. } => format!("param{}", idx + 1),
         ScalarExpr::Literal(_) => "?column?".into(),
         ScalarExpr::BinaryOp { .. } => "?column?".into(),

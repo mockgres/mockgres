@@ -42,6 +42,7 @@ pub enum ScalarExpr {
     Literal(Value),
     Column(ColumnRefName),
     ColumnIdx(usize),
+    ExcludedIdx(usize),
     Cast {
         expr: Box<ScalarExpr>,
         ty: DataType,
@@ -482,6 +483,12 @@ pub enum OnConflictTarget {
 
 #[derive(Clone, Debug)]
 pub enum OnConflictAction {
-    DoNothing { target: OnConflictTarget },
-    // DO UPDATE will be added later (Phase 2)
+    DoNothing {
+        target: OnConflictTarget,
+    },
+    DoUpdate {
+        target: OnConflictTarget,
+        sets: Vec<UpdateSet>,
+        where_clause: Option<BoolExpr>,
+    },
 }

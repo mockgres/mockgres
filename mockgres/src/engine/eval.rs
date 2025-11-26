@@ -122,6 +122,9 @@ pub fn eval_scalar_expr_with_mode(
             .get(*i)
             .cloned()
             .ok_or_else(|| fe("column index out of range")),
+        ScalarExpr::ExcludedIdx(_) => Err(fe(
+            "EXCLUDED references are only allowed in ON CONFLICT DO UPDATE",
+        )),
         ScalarExpr::Column(colref) => Err(fe(format!("unbound column reference: {colref}"))),
         ScalarExpr::Param { idx, .. } => params
             .get(*idx)

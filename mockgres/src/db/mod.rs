@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, SchemaId, TableId, TableMeta};
 use crate::engine::{
     BoolExpr, Column, DataType, EvalContext, IdentitySpec, OnConflictTarget, ReferentialAction,
-    ScalarExpr, SqlError, Value, eval_bool_expr, eval_scalar_expr,
+    ScalarExpr, SqlError, UpdateSet, Value, eval_bool_expr, eval_scalar_expr,
 };
 use crate::session::{RowPointer, TxnChanges};
 use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
@@ -45,6 +45,16 @@ pub struct Db {
     pub tables: HashMap<TableId, Table>,
     pub next_rel_id: u32,
     locks: Arc<LockRegistry>,
+}
+
+#[derive(Clone, Debug)]
+pub enum ResolvedOnConflictKind {
+    DoNothing(ResolvedOnConflictTarget),
+    DoUpdate {
+        target: ResolvedOnConflictTarget,
+        sets: Vec<UpdateSet>,
+        where_clause: Option<BoolExpr>,
+    },
 }
 
 impl Default for Db {

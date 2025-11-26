@@ -1,10 +1,11 @@
 use std::collections::HashSet;
 
-use crate::catalog::SchemaId;
+use crate::catalog::{SchemaId, TableMeta};
 use crate::db::Db;
 use crate::engine::{
     AggCall, AggFunc, DataType, DbDdlKind, Field, FieldOrigin, InsertSource, LockSpec, ObjName,
-    Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet, fe, fe_code,
+    OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet, fe,
+    fe_code,
 };
 use crate::session::Session;
 use anyhow::Error;
@@ -14,7 +15,10 @@ mod expr;
 mod returning;
 mod time;
 
-use self::expr::{bind_bool_expr, bind_scalar_expr, scalar_expr_type};
+use self::expr::{
+    bind_bool_expr, bind_bool_expr_allow_excluded, bind_scalar_expr,
+    bind_scalar_expr_allow_excluded, scalar_expr_type,
+};
 use self::returning::bind_returning_clause;
 pub(super) use self::time::{BindTimeContext, bind_time_scalar_func};
 
@@ -360,44 +364,16 @@ fn bind_with_search_path(
                     })
                     .collect(),
             };
-            let mut bound_sets = Vec::with_capacity(sets.len());
-            for set in sets {
-                match set {
-                    UpdateSet::ByIndex(idx, expr) => {
-                        let hint = schema.field(idx).data_type.clone();
-                        let bound_expr = bind_scalar_expr(
-                            &expr,
-                            &schema,
-                            Some(&hint),
-                            db,
-                            search_path,
-                            current_database,
-                            time_ctx,
-                        )?;
-                        bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
-                    }
-                    UpdateSet::ByName(name, expr) => {
-                        let idx =
-                            tm.columns
-                                .iter()
-                                .position(|c| c.name == name)
-                                .ok_or_else(|| {
-                                    fe_code("42703", format!("unknown column in UPDATE: {name}"))
-                                })?;
-                        let hint = schema.field(idx).data_type.clone();
-                        let bound_expr = bind_scalar_expr(
-                            &expr,
-                            &schema,
-                            Some(&hint),
-                            db,
-                            search_path,
-                            current_database,
-                            time_ctx,
-                        )?;
-                        bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
-                    }
-                }
-            }
+            let bound_sets = bind_update_sets(
+                sets,
+                &schema,
+                tm,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                false,
+            )?;
             let bound_filter = match filter {
                 Some(f) => Some(bind_bool_expr(
                     &f,
@@ -574,6 +550,45 @@ fn bind_with_search_path(
                     })
                     .collect(),
             };
+            let bound_on_conflict = match on_conflict {
+                Some(OnConflictAction::DoUpdate {
+                    target,
+                    sets,
+                    where_clause,
+                }) => {
+                    let bound_sets = bind_update_sets(
+                        sets,
+                        &table_schema,
+                        tm,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        true,
+                    )?;
+                    let bound_where = where_clause
+                        .map(|c| {
+                            bind_bool_expr_allow_excluded(
+                                &c,
+                                &table_schema,
+                                db,
+                                search_path,
+                                current_database,
+                                time_ctx,
+                            )
+                        })
+                        .transpose()?;
+                    Some(OnConflictAction::DoUpdate {
+                        target,
+                        sets: bound_sets,
+                        where_clause: bound_where,
+                    })
+                }
+                Some(OnConflictAction::DoNothing { target }) => {
+                    Some(OnConflictAction::DoNothing { target })
+                }
+                None => None,
+            };
             let column_positions = if let Some(cols) = &columns {
                 let mut seen = HashSet::new();
                 let mut positions = Vec::with_capacity(cols.len());
@@ -660,7 +675,7 @@ fn bind_with_search_path(
                 columns,
                 rows: bound_rows,
                 override_system_value,
-                on_conflict,
+                on_conflict: bound_on_conflict,
                 returning,
                 returning_schema,
             })
@@ -723,4 +738,80 @@ fn map_catalog_err(err: Error) -> PgWireError {
     } else {
         fe(err.to_string())
     }
+}
+
+fn bind_update_sets(
+    sets: Vec<UpdateSet>,
+    schema: &Schema,
+    tm: &TableMeta,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+    allow_excluded: bool,
+) -> PgWireResult<Vec<UpdateSet>> {
+    let mut bound_sets = Vec::with_capacity(sets.len());
+    for set in sets {
+        match set {
+            UpdateSet::ByIndex(idx, expr) => {
+                let hint = schema.field(idx).data_type.clone();
+                let bound_expr = if allow_excluded {
+                    bind_scalar_expr_allow_excluded(
+                        &expr,
+                        schema,
+                        Some(&hint),
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?
+                } else {
+                    bind_scalar_expr(
+                        &expr,
+                        schema,
+                        Some(&hint),
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?
+                };
+                bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
+            }
+            UpdateSet::ByName(name, expr) => {
+                let idx = tm
+                    .columns
+                    .iter()
+                    .position(|c| c.name == name)
+                    .ok_or_else(|| fe_code("42703", format!("unknown column in UPDATE: {name}")))?;
+                let hint = schema.field(idx).data_type.clone();
+                let bound_expr = if allow_excluded {
+                    bind_scalar_expr_allow_excluded(
+                        &expr,
+                        schema,
+                        Some(&hint),
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?
+                } else {
+                    bind_scalar_expr(
+                        &expr,
+                        schema,
+                        Some(&hint),
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?
+                };
+                bound_sets.push(UpdateSet::ByIndex(idx, bound_expr));
+            }
+        }
+    }
+    if bound_sets.is_empty() {
+        return Err(fe("UPDATE requires SET clauses"));
+    }
+    Ok(bound_sets)
 }

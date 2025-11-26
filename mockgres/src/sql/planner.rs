@@ -249,6 +249,9 @@ mod tests {
                 OnConflictAction::DoNothing { target } => {
                     assert!(matches!(target, OnConflictTarget::None));
                 }
+                OnConflictAction::DoUpdate { .. } => {
+                    unreachable!("do update not covered in this parser test")
+                }
             },
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -266,6 +269,9 @@ mod tests {
                     OnConflictTarget::Columns(cols) => assert_eq!(cols, vec!["id", "qty"]),
                     other => panic!("unexpected target: {other:?}"),
                 },
+                OnConflictAction::DoUpdate { .. } => {
+                    unreachable!("do update not covered in this parser test")
+                }
             },
             other => panic!("unexpected plan: {other:?}"),
         }
@@ -283,6 +289,9 @@ mod tests {
                     OnConflictTarget::Constraint(name) => assert_eq!(name, "gadgets_id_key"),
                     other => panic!("unexpected target: {other:?}"),
                 },
+                OnConflictAction::DoUpdate { .. } => {
+                    unreachable!("do update not covered in this parser test")
+                }
             },
             other => panic!("unexpected plan: {other:?}"),
         }

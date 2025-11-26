@@ -8,18 +8,19 @@ use pgwire::error::PgWireResult;
 
 use super::{BindTimeContext, bind_time_scalar_func, current_schema_name, schema_names_for_path};
 
-pub(crate) fn bind_bool_expr(
+fn bind_bool_expr_inner(
     expr: &BoolExpr,
     schema: &Schema,
     db: &Db,
     search_path: &[SchemaId],
     current_database: Option<&str>,
     time_ctx: BindTimeContext,
+    allow_excluded: bool,
 ) -> PgWireResult<BoolExpr> {
     Ok(match expr {
         BoolExpr::Literal(b) => BoolExpr::Literal(*b),
         BoolExpr::Comparison { lhs, op, rhs } => {
-            let mut lhs_bound = bind_scalar_expr(
+            let mut lhs_bound = bind_scalar_expr_inner(
                 lhs,
                 schema,
                 None,
@@ -27,8 +28,9 @@ pub(crate) fn bind_bool_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?;
-            let mut rhs_bound = bind_scalar_expr(
+            let mut rhs_bound = bind_scalar_expr_inner(
                 rhs,
                 schema,
                 None,
@@ -36,6 +38,7 @@ pub(crate) fn bind_bool_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?;
             let lhs_hint = scalar_expr_type(&lhs_bound, schema);
             let rhs_hint = scalar_expr_type(&rhs_bound, schema);
@@ -50,25 +53,46 @@ pub(crate) fn bind_bool_expr(
         BoolExpr::And(exprs) => BoolExpr::And(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database, time_ctx))
+                .map(|e| {
+                    bind_bool_expr_inner(
+                        e,
+                        schema,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        allow_excluded,
+                    )
+                })
                 .collect::<PgWireResult<Vec<_>>>()?,
         ),
         BoolExpr::Or(exprs) => BoolExpr::Or(
             exprs
                 .iter()
-                .map(|e| bind_bool_expr(e, schema, db, search_path, current_database, time_ctx))
+                .map(|e| {
+                    bind_bool_expr_inner(
+                        e,
+                        schema,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        allow_excluded,
+                    )
+                })
                 .collect::<PgWireResult<Vec<_>>>()?,
         ),
-        BoolExpr::Not(inner) => BoolExpr::Not(Box::new(bind_bool_expr(
+        BoolExpr::Not(inner) => BoolExpr::Not(Box::new(bind_bool_expr_inner(
             inner,
             schema,
             db,
             search_path,
             current_database,
             time_ctx,
+            allow_excluded,
         )?)),
         BoolExpr::IsNull { expr, negated } => BoolExpr::IsNull {
-            expr: bind_scalar_expr(
+            expr: bind_scalar_expr_inner(
                 expr,
                 schema,
                 None,
@@ -76,13 +100,52 @@ pub(crate) fn bind_bool_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?,
             negated: *negated,
         },
     })
 }
 
-pub(crate) fn bind_scalar_expr(
+pub(crate) fn bind_bool_expr(
+    expr: &BoolExpr,
+    schema: &Schema,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+) -> PgWireResult<BoolExpr> {
+    bind_bool_expr_inner(
+        expr,
+        schema,
+        db,
+        search_path,
+        current_database,
+        time_ctx,
+        false,
+    )
+}
+
+pub(crate) fn bind_bool_expr_allow_excluded(
+    expr: &BoolExpr,
+    schema: &Schema,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+) -> PgWireResult<BoolExpr> {
+    bind_bool_expr_inner(
+        expr,
+        schema,
+        db,
+        search_path,
+        current_database,
+        time_ctx,
+        true,
+    )
+}
+
+fn bind_scalar_expr_inner(
     expr: &ScalarExpr,
     schema: &Schema,
     hint: Option<&DataType>,
@@ -90,21 +153,41 @@ pub(crate) fn bind_scalar_expr(
     search_path: &[SchemaId],
     current_database: Option<&str>,
     time_ctx: BindTimeContext,
+    allow_excluded: bool,
 ) -> PgWireResult<ScalarExpr> {
     Ok(match expr {
         ScalarExpr::Literal(v) => ScalarExpr::Literal(v.clone()),
         ScalarExpr::Column(colref) => {
-            let idx = resolve_column_reference(schema, colref)?;
-            ScalarExpr::ColumnIdx(idx)
+            let is_excluded = allow_excluded
+                && colref.schema.is_none()
+                && colref
+                    .relation
+                    .as_ref()
+                    .is_some_and(|rel| rel.eq_ignore_ascii_case("excluded"));
+            if is_excluded {
+                let idx = resolve_column_reference(
+                    schema,
+                    &ColumnRefName {
+                        schema: None,
+                        relation: None,
+                        column: colref.column.clone(),
+                    },
+                )?;
+                ScalarExpr::ExcludedIdx(idx)
+            } else {
+                let idx = resolve_column_reference(schema, colref)?;
+                ScalarExpr::ColumnIdx(idx)
+            }
         }
         ScalarExpr::ColumnIdx(i) => ScalarExpr::ColumnIdx(*i),
+        ScalarExpr::ExcludedIdx(i) => ScalarExpr::ExcludedIdx(*i),
         ScalarExpr::Param { idx, ty } => ScalarExpr::Param {
             idx: *idx,
             ty: ty.clone().or_else(|| hint.cloned()),
         },
         ScalarExpr::BinaryOp { op, left, right } => ScalarExpr::BinaryOp {
             op: *op,
-            left: Box::new(bind_scalar_expr(
+            left: Box::new(bind_scalar_expr_inner(
                 left,
                 schema,
                 hint,
@@ -112,8 +195,9 @@ pub(crate) fn bind_scalar_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?),
-            right: Box::new(bind_scalar_expr(
+            right: Box::new(bind_scalar_expr_inner(
                 right,
                 schema,
                 hint,
@@ -121,11 +205,12 @@ pub(crate) fn bind_scalar_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?),
         },
         ScalarExpr::UnaryOp { op, expr } => ScalarExpr::UnaryOp {
             op: *op,
-            expr: Box::new(bind_scalar_expr(
+            expr: Box::new(bind_scalar_expr_inner(
                 expr,
                 schema,
                 hint,
@@ -133,10 +218,11 @@ pub(crate) fn bind_scalar_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?),
         },
         ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
-            expr: Box::new(bind_scalar_expr(
+            expr: Box::new(bind_scalar_expr_inner(
                 expr,
                 schema,
                 Some(ty),
@@ -144,6 +230,7 @@ pub(crate) fn bind_scalar_expr(
                 search_path,
                 current_database,
                 time_ctx,
+                allow_excluded,
             )?),
             ty: ty.clone(),
         },
@@ -151,7 +238,16 @@ pub(crate) fn bind_scalar_expr(
             let bound_args = args
                 .iter()
                 .map(|a| {
-                    bind_scalar_expr(a, schema, hint, db, search_path, current_database, time_ctx)
+                    bind_scalar_expr_inner(
+                        a,
+                        schema,
+                        hint,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        allow_excluded,
+                    )
                 })
                 .collect::<PgWireResult<Vec<_>>>()?;
             if let Some(result) = bind_time_scalar_func(*func, &bound_args, time_ctx) {
@@ -193,6 +289,48 @@ pub(crate) fn bind_scalar_expr(
             }
         }
     })
+}
+
+pub(crate) fn bind_scalar_expr(
+    expr: &ScalarExpr,
+    schema: &Schema,
+    hint: Option<&DataType>,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+) -> PgWireResult<ScalarExpr> {
+    bind_scalar_expr_inner(
+        expr,
+        schema,
+        hint,
+        db,
+        search_path,
+        current_database,
+        time_ctx,
+        false,
+    )
+}
+
+pub(crate) fn bind_scalar_expr_allow_excluded(
+    expr: &ScalarExpr,
+    schema: &Schema,
+    hint: Option<&DataType>,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+) -> PgWireResult<ScalarExpr> {
+    bind_scalar_expr_inner(
+        expr,
+        schema,
+        hint,
+        db,
+        search_path,
+        current_database,
+        time_ctx,
+        true,
+    )
 }
 
 pub(crate) fn resolve_column_reference(
@@ -250,6 +388,7 @@ pub(crate) fn column_ref_matches(field: &Field, colref: &ColumnRefName) -> bool 
 pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<DataType> {
     match expr {
         ScalarExpr::ColumnIdx(i) => Some(schema.field(*i).data_type.clone()),
+        ScalarExpr::ExcludedIdx(i) => Some(schema.field(*i).data_type.clone()),
         ScalarExpr::Param { ty, .. } => ty.clone(),
         ScalarExpr::Literal(v) => match v {
             Value::Int64(i) => {

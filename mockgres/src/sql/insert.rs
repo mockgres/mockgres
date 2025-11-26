@@ -9,9 +9,10 @@ use pg_query::protobuf::{
 use pgwire::error::PgWireResult;
 
 use super::dml::extract_col_name;
-use super::expr::parse_scalar_expr;
+use super::expr::{parse_bool_expr, parse_scalar_expr};
 use super::returning::parse_returning_clause;
 use super::tokens::parse_index_columns;
+use super::update::parse_update_target_list;
 
 pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
     let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
@@ -126,7 +127,30 @@ fn parse_on_conflict_clause(
             Ok(Some(OnConflictAction::DoNothing { target }))
         }
         PgOnConflictAction::OnconflictUpdate => {
-            Err(fe_code("0A000", "ON CONFLICT DO UPDATE is not supported"))
+            let target = if let Some(infer) = occ.infer.as_ref() {
+                if !infer.index_elems.is_empty() {
+                    let cols = parse_index_columns(&infer.index_elems)?;
+                    OnConflictTarget::Columns(cols)
+                } else if !infer.conname.is_empty() {
+                    OnConflictTarget::Constraint(infer.conname.clone())
+                } else {
+                    OnConflictTarget::None
+                }
+            } else {
+                OnConflictTarget::None
+            };
+            let sets = parse_update_target_list(&occ.target_list)?;
+            let where_clause =
+                if let Some(w) = occ.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+                    Some(parse_bool_expr(w)?)
+                } else {
+                    None
+                };
+            Ok(Some(OnConflictAction::DoUpdate {
+                target,
+                sets,
+                where_clause,
+            }))
         }
         PgOnConflictAction::OnconflictNone | PgOnConflictAction::Undefined => {
             Err(fe("ON CONFLICT action required"))

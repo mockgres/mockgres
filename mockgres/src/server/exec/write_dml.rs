@@ -3,7 +3,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use pgwire::error::PgWireResult;
 
-use crate::db::{CellInput, Db, LockOwner, ResolvedOnConflictTarget};
+use crate::db::{CellInput, Db, LockOwner, ResolvedOnConflictKind};
 use crate::engine::{
     BoolExpr, EvalContext, ExecNode, InsertSource, ObjName, OnConflictAction, ReturningClause,
     ReturningExpr, Schema, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
@@ -38,15 +38,30 @@ pub(crate) fn build_insert_executor(
             .map_err(map_db_err)?
             .clone()
     };
-    let resolved_conflict: Option<ResolvedOnConflictTarget> = match on_conflict {
-        Some(OnConflictAction::DoNothing { target }) => {
-            let db = db.read();
-            Some(
-                db.resolve_on_conflict_target(&table_meta, target)
-                    .map_err(map_db_err)?,
-            )
-        }
+    let resolved_conflict: Option<ResolvedOnConflictKind> = match on_conflict {
         None => None,
+        Some(OnConflictAction::DoNothing { target }) => {
+            let db_read = db.read();
+            Some(ResolvedOnConflictKind::DoNothing(
+                db_read
+                    .resolve_on_conflict_target(&table_meta, target)
+                    .map_err(map_db_err)?,
+            ))
+        }
+        Some(OnConflictAction::DoUpdate {
+            target,
+            sets,
+            where_clause,
+        }) => {
+            let db_read = db.read();
+            Some(ResolvedOnConflictKind::DoUpdate {
+                target: db_read
+                    .resolve_on_conflict_target(&table_meta, target)
+                    .map_err(map_db_err)?,
+                sets: sets.clone(),
+                where_clause: where_clause.clone(),
+            })
+        }
     };
     let column_map = if let Some(cols) = columns {
         let mut indexes = Vec::with_capacity(cols.len());
@@ -107,7 +122,13 @@ pub(crate) fn build_insert_executor(
         realized.push(full);
     }
     let (txid, autocommit) = writer_txid(session, txn_manager);
-    let (inserted, inserted_rows, inserted_ptrs): (usize, Vec<Row>, Vec<RowPointer>) = {
+    let (inserted, inserted_rows, inserted_ptrs, updated_rows, updated_ptrs): (
+        usize,
+        Vec<Row>,
+        Vec<RowPointer>,
+        Vec<Row>,
+        Vec<RowPointer>,
+    ) = {
         let mut db = db.write();
         match db.insert_full_rows(
             schema_name,
@@ -115,6 +136,7 @@ pub(crate) fn build_insert_executor(
             realized,
             override_system_value,
             txid,
+            params.as_ref(),
             ctx,
             resolved_conflict.clone(),
         ) {
@@ -128,14 +150,21 @@ pub(crate) fn build_insert_executor(
     if autocommit {
         finish_writer_tx(txn_manager, txid, true, true);
     } else {
-        session.record_inserts(inserted_ptrs);
+        session.record_inserts(inserted_ptrs.clone());
+        session.record_touched(updated_ptrs.clone());
     }
     let tag = format!("INSERT 0 {}", inserted);
     if let Some(clause) = returning.clone() {
         let schema = returning_schema
             .clone()
             .expect("returning schema missing for INSERT");
-        let rows = materialize_returning_rows(&clause, &inserted_rows, &params, ctx)?;
+        let all_rows: Vec<Row> = inserted_rows
+            .iter()
+            .zip(inserted_ptrs.iter())
+            .chain(updated_rows.iter().zip(updated_ptrs.iter()))
+            .map(|(row, _)| row.clone())
+            .collect();
+        let rows = materialize_returning_rows(&clause, &all_rows, &params, ctx)?;
         Ok((
             Box::new(ValuesExec::from_values(schema, rows)),
             Some(tag),
