@@ -114,9 +114,9 @@ pub(crate) fn build_insert_executor(
             &table.name,
             realized,
             override_system_value,
-            resolved_conflict.clone(),
             txid,
             ctx,
+            resolved_conflict.clone(),
         ) {
             Ok(res) => res,
             Err(e) => {

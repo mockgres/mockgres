@@ -14,9 +14,9 @@ impl Db {
         name: &str,
         rows: Vec<Vec<CellInput>>,
         override_system_value: bool,
-        on_conflict: Option<ResolvedOnConflictTarget>,
         txid: TxId,
         ctx: &EvalContext,
+        on_conflict: Option<ResolvedOnConflictTarget>,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
         let meta = self
             .catalog
