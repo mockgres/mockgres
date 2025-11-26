@@ -367,6 +367,7 @@ pub enum Plan {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<InsertSource>>,
         override_system_value: bool,
+        on_conflict: Option<OnConflictAction>,
         returning: Option<ReturningClause>,
         returning_schema: Option<Schema>,
     },
@@ -428,7 +429,9 @@ impl Plan {
                 input.schema()
             }
             Plan::InsertValues {
-                returning_schema, ..
+                on_conflict: _,
+                returning_schema,
+                ..
             }
             | Plan::Update {
                 returning_schema, ..
@@ -465,4 +468,20 @@ impl Plan {
             }
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum OnConflictTarget {
+    /// ON CONFLICT DO NOTHING (no explicit target)
+    None,
+    /// ON CONFLICT (col1, col2, ...)
+    Columns(Vec<String>),
+    /// ON CONFLICT ON CONSTRAINT constraint_name
+    Constraint(String),
+}
+
+#[derive(Clone, Debug)]
+pub enum OnConflictAction {
+    DoNothing { target: OnConflictTarget },
+    // DO UPDATE will be added later (Phase 2)
 }

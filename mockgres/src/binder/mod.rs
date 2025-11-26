@@ -550,6 +550,7 @@ fn bind_with_search_path(
             columns,
             rows,
             override_system_value,
+            on_conflict,
             mut returning,
             mut returning_schema,
         } => {
@@ -659,6 +660,7 @@ fn bind_with_search_path(
                 columns,
                 rows: bound_rows,
                 override_system_value,
+                on_conflict,
                 returning,
                 returning_schema,
             })

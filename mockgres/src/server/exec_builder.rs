@@ -117,6 +117,7 @@ pub fn build_executor(
             columns,
             rows,
             override_system_value,
+            on_conflict,
             returning,
             returning_schema,
         } => build_insert_executor(
@@ -127,6 +128,7 @@ pub fn build_executor(
             columns,
             rows,
             *override_system_value,
+            on_conflict,
             returning,
             returning_schema,
             params.clone(),

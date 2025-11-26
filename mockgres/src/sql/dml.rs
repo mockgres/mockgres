@@ -1,7 +1,9 @@
 use crate::catalog::{SchemaName, TableId};
+#[allow(unused_imports)]
 use crate::engine::{
-    AggCall, AggFunc, BoolExpr, DataType, Field, LockMode, LockRequest, LockSpec, ObjName, Plan,
-    ScalarExpr, Schema, Selection, SortKey, Value, fe, fe_code,
+    AggCall, AggFunc, BoolExpr, DataType, Field, LockMode, LockRequest, LockSpec, ObjName,
+    OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema, Selection, SortKey, Value, fe,
+    fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;

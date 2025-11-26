@@ -1,12 +1,17 @@
 use crate::catalog::SchemaName;
-use crate::engine::{InsertSource, ObjName, Plan, ScalarExpr, fe, fe_code};
+use crate::engine::{
+    InsertSource, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, fe, fe_code,
+};
 use pg_query::NodeEnum;
-use pg_query::protobuf::{InsertStmt, OverridingKind};
+use pg_query::protobuf::{
+    InsertStmt, OnConflictAction as PgOnConflictAction, OnConflictClause, OverridingKind,
+};
 use pgwire::error::PgWireResult;
 
 use super::dml::extract_col_name;
 use super::expr::parse_scalar_expr;
 use super::returning::parse_returning_clause;
+use super::tokens::parse_index_columns;
 
 pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
     let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
@@ -53,12 +58,14 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
         }
         all_rows.push(row);
     }
+    let on_conflict = parse_on_conflict_clause(&ins.on_conflict_clause)?;
     let returning = parse_returning_clause(&ins.returning_list)?;
     Ok(Plan::InsertValues {
         table,
         columns: insert_columns,
         rows: all_rows,
         override_system_value,
+        on_conflict,
         returning,
         returning_schema: None,
     })
@@ -88,6 +95,43 @@ fn parse_insert_columns(cols: &[pg_query::Node]) -> PgWireResult<Option<Vec<Stri
         out.push(name);
     }
     Ok(Some(out))
+}
+
+fn parse_on_conflict_clause(
+    clause: &Option<Box<OnConflictClause>>,
+) -> PgWireResult<Option<OnConflictAction>> {
+    let Some(occ) = clause.as_ref() else {
+        return Ok(None);
+    };
+
+    let action = PgOnConflictAction::try_from(occ.action)
+        .map_err(|_| fe("unsupported ON CONFLICT action"))?;
+    match action {
+        PgOnConflictAction::OnconflictNothing => {
+            if !occ.target_list.is_empty() || occ.where_clause.is_some() {
+                return Err(fe_code("0A000", "ON CONFLICT DO UPDATE is not supported"));
+            }
+            let target = if let Some(infer) = occ.infer.as_ref() {
+                if !infer.index_elems.is_empty() {
+                    let cols = parse_index_columns(&infer.index_elems)?;
+                    OnConflictTarget::Columns(cols)
+                } else if !infer.conname.is_empty() {
+                    OnConflictTarget::Constraint(infer.conname.clone())
+                } else {
+                    OnConflictTarget::None
+                }
+            } else {
+                OnConflictTarget::None
+            };
+            Ok(Some(OnConflictAction::DoNothing { target }))
+        }
+        PgOnConflictAction::OnconflictUpdate => {
+            Err(fe_code("0A000", "ON CONFLICT DO UPDATE is not supported"))
+        }
+        PgOnConflictAction::OnconflictNone | PgOnConflictAction::Undefined => {
+            Err(fe("ON CONFLICT action required"))
+        }
+    }
 }
 
 fn parse_insert_value_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {

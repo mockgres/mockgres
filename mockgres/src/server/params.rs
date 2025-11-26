@@ -122,7 +122,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::InsertValues {
-            rows, returning, ..
+            rows,
+            returning,
+            on_conflict: _,
+            ..
         } => {
             for row in rows {
                 for src in row {

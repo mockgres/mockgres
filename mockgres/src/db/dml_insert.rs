@@ -1,12 +1,20 @@
 use super::*;
 
+#[derive(Clone)]
+struct PendingInsert {
+    row: Row,
+    pk_key: Option<RowKey>,
+    unique_keys: Vec<(String, Option<Vec<Value>>)>,
+}
+
 impl Db {
-    pub fn insert_full_rows(
+    pub(crate) fn insert_full_rows(
         &mut self,
         schema: &str,
         name: &str,
         rows: Vec<Vec<CellInput>>,
         override_system_value: bool,
+        on_conflict: Option<ResolvedOnConflictTarget>,
         txid: TxId,
         ctx: &EvalContext,
     ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>)> {
@@ -17,13 +25,6 @@ impl Db {
             .clone();
         let table_id = meta.id;
         let ncols = meta.columns.len();
-        #[derive(Clone)]
-        struct PendingInsert {
-            row: Row,
-            pk_key: Option<RowKey>,
-            fk_keys: Vec<Option<Vec<Value>>>,
-            unique_keys: Vec<(String, Option<Vec<Value>>)>,
-        }
         let mut staged: Vec<PendingInsert> = Vec::with_capacity(rows.len());
 
         for (ridx, row) in rows.into_iter().enumerate() {
@@ -45,18 +46,10 @@ impl Db {
                 Self::materialize_insert_row(table_entry, &meta, row, override_system_value, ctx)?
             };
             let unique_keys = build_unique_index_values(&meta, &out);
-            if !unique_keys.is_empty() {
-                let table_ref = self.tables.get(&table_id).ok_or_else(|| {
-                    sql_err("XX000", format!("missing storage for table id {table_id}"))
-                })?;
-                ensure_unique_constraints(&table_ref.unique_maps, &unique_keys, None)?;
-            }
             let pk_key = build_primary_key_row_key(&meta, &out)?;
-            let fk_keys = self.ensure_outbound_foreign_keys(schema, name, &meta, &out)?;
             staged.push(PendingInsert {
                 row: out,
                 pk_key,
-                fk_keys,
                 unique_keys,
             });
         }
@@ -71,13 +64,33 @@ impl Db {
             let mut inserted_ptrs = Vec::with_capacity(staged.len());
 
             for pending_insert in staged.into_iter() {
-                ensure_unique_constraints(&table.unique_maps, &pending_insert.unique_keys, None)?;
+                if let Some(conflict) = detect_conflict(&meta, &table, &pending_insert) {
+                    if let Some(ref target) = on_conflict {
+                        if conflict_matches_target(&conflict, target) {
+                            continue;
+                        }
+                    }
+                    let index_name = conflict.index_name();
+                    return Err(sql_err(
+                        "23505",
+                        format!(
+                            "duplicate key value violates unique constraint {}",
+                            index_name
+                        ),
+                    ));
+                }
                 let PendingInsert {
                     row,
                     pk_key,
-                    fk_keys,
                     unique_keys,
                 } = pending_insert;
+                let fk_keys = self.ensure_outbound_foreign_keys(
+                    schema,
+                    name,
+                    &meta,
+                    &row,
+                    Some((&table_id, &table)),
+                )?;
                 let row_id = table.alloc_rowid();
                 if let Some(pk) = pk_key.clone() {
                     let constraint = meta
@@ -188,5 +201,65 @@ impl Db {
             out.push(coerced);
         }
         Ok(out)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum InsertConflict {
+    PrimaryKey(String),
+    UniqueIndex(String),
+}
+
+impl InsertConflict {
+    fn index_name(&self) -> &str {
+        match self {
+            InsertConflict::PrimaryKey(name) | InsertConflict::UniqueIndex(name) => name.as_str(),
+        }
+    }
+}
+
+fn detect_conflict(
+    meta: &TableMeta,
+    table: &Table,
+    pending: &PendingInsert,
+) -> Option<InsertConflict> {
+    if let Some(pk_key) = pending.pk_key.as_ref() {
+        if table
+            .pk_map
+            .as_ref()
+            .and_then(|pk_map| pk_map.get(pk_key))
+            .is_some()
+        {
+            let constraint = meta
+                .primary_key
+                .as_ref()
+                .expect("pk metadata exists when pk_key is present");
+            return Some(InsertConflict::PrimaryKey(constraint.name.clone()));
+        }
+    }
+    for (index_name, maybe_values) in &pending.unique_keys {
+        let Some(values) = maybe_values else {
+            continue;
+        };
+        if let Some(map) = table.unique_maps.get(index_name) {
+            if map.get(values).is_some() {
+                return Some(InsertConflict::UniqueIndex(index_name.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn conflict_matches_target(conflict: &InsertConflict, target: &ResolvedOnConflictTarget) -> bool {
+    match target {
+        ResolvedOnConflictTarget::AnyConstraint => true,
+        ResolvedOnConflictTarget::UniqueIndex { index_name } => {
+            matches!(conflict, InsertConflict::UniqueIndex(name) if name == index_name)
+        }
+        ResolvedOnConflictTarget::Constraint { index_name } => match conflict {
+            InsertConflict::PrimaryKey(name) | InsertConflict::UniqueIndex(name) => {
+                name == index_name
+            }
+        },
     }
 }

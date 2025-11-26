@@ -1,7 +1,7 @@
 use crate::catalog::{Catalog, SchemaId, TableId, TableMeta};
 use crate::engine::{
-    BoolExpr, Column, DataType, EvalContext, IdentitySpec, ReferentialAction, ScalarExpr, SqlError,
-    Value, eval_bool_expr, eval_scalar_expr,
+    BoolExpr, Column, DataType, EvalContext, IdentitySpec, OnConflictTarget, ReferentialAction,
+    ScalarExpr, SqlError, Value, eval_bool_expr, eval_scalar_expr,
 };
 use crate::session::{RowPointer, TxnChanges};
 use crate::storage::{Row, RowId, RowKey, Table, VersionedRow};
@@ -401,15 +401,98 @@ impl Db {
         table_name: &str,
         meta: &TableMeta,
         row: &[Value],
+        current_table: Option<(&TableId, &Table)>,
     ) -> anyhow::Result<Vec<Option<Vec<Value>>>> {
         let mut keys = Vec::with_capacity(meta.foreign_keys.len());
         for fk in &meta.foreign_keys {
             let key = build_fk_parent_key(row, fk);
             if let Some(ref vals) = key {
-                ensure_parent_exists(&self.tables, fk, table_schema, table_name, vals)?;
+                ensure_parent_exists(
+                    &self.tables,
+                    current_table,
+                    fk,
+                    table_schema,
+                    table_name,
+                    vals,
+                )?;
             }
             keys.push(key);
         }
         Ok(keys)
+    }
+
+    pub(crate) fn resolve_on_conflict_target(
+        &self,
+        meta: &TableMeta,
+        target: &OnConflictTarget,
+    ) -> anyhow::Result<ResolvedOnConflictTarget> {
+        use crate::engine::OnConflictTarget::*;
+
+        match target {
+            None => Ok(ResolvedOnConflictTarget::AnyConstraint),
+
+            Columns(cols) => {
+                let mut positions = Vec::with_capacity(cols.len());
+                for col_name in cols {
+                    let idx = meta
+                        .columns
+                        .iter()
+                        .position(|c| c.name == *col_name)
+                        .ok_or_else(|| {
+                            sql_err(
+                                "42703",
+                                format!("unknown column in ON CONFLICT target: {col_name}"),
+                            )
+                        })?;
+                    positions.push(idx);
+                }
+
+                if let Some(pk) = meta.primary_key.as_ref() {
+                    if pk.columns == positions {
+                        return Ok(ResolvedOnConflictTarget::Constraint {
+                            index_name: pk.name.clone(),
+                        });
+                    }
+                }
+
+                let idx_meta = meta
+                    .indexes
+                    .iter()
+                    .find(|idx| idx.unique && idx.columns == positions)
+                    .ok_or_else(|| {
+                        sql_err(
+                            "42P10",
+                            "no unique or exclusion constraint matching given ON CONFLICT target",
+                        )
+                    })?;
+
+                Ok(ResolvedOnConflictTarget::UniqueIndex {
+                    index_name: idx_meta.name.clone(),
+                })
+            }
+
+            Constraint(name) => {
+                if let Some(pk) = &meta.primary_key {
+                    if pk.name == *name {
+                        return Ok(ResolvedOnConflictTarget::Constraint {
+                            index_name: pk.name.clone(),
+                        });
+                    }
+                }
+                if let Some(idx) = meta
+                    .indexes
+                    .iter()
+                    .find(|idx| idx.unique && idx.name == *name)
+                {
+                    return Ok(ResolvedOnConflictTarget::Constraint {
+                        index_name: idx.name.clone(),
+                    });
+                }
+                Err(sql_err(
+                    "42P10",
+                    format!("constraint {name} does not exist"),
+                ))
+            }
+        }
     }
 }

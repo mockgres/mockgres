@@ -93,8 +93,13 @@ impl Db {
                     .iter()
                     .map(|fk| build_fk_parent_key(&snapshot, fk))
                     .collect();
-                let new_fk_keys =
-                    self.ensure_outbound_foreign_keys(schema, name, &meta, &updated)?;
+                let new_fk_keys = self.ensure_outbound_foreign_keys(
+                    schema,
+                    name,
+                    &meta,
+                    &updated,
+                    Some((&meta.id, &table)),
+                )?;
                 let old_unique = build_unique_index_values(&meta, &snapshot);
                 let new_unique = build_unique_index_values(&meta, &updated);
                 pending.push(PendingUpdate {

@@ -33,6 +33,16 @@ pub(crate) struct CascadeFrame {
     pub(crate) expanded: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ResolvedOnConflictTarget {
+    /// ON CONFLICT DO NOTHING with no explicit target
+    AnyConstraint,
+    /// ON CONFLICT (col1, col2, ...)
+    UniqueIndex { index_name: String },
+    /// ON CONFLICT ON CONSTRAINT constraint_name
+    Constraint { index_name: String },
+}
+
 pub(crate) fn build_primary_key_row_key(
     meta: &TableMeta,
     row: &[Value],
@@ -94,6 +104,7 @@ pub(crate) fn build_unique_index_values(
     entries
 }
 
+#[allow(dead_code)]
 pub(crate) fn ensure_unique_constraints(
     unique_maps: &HashMap<String, HashMap<Vec<Value>, RowId>>,
     entries: &[(String, Option<Vec<Value>>)],
@@ -231,20 +242,32 @@ pub(crate) fn remove_unique_entry(
 
 pub(crate) fn ensure_parent_exists(
     tables: &HashMap<TableId, Table>,
+    current_table: Option<(&TableId, &Table)>,
     fk: &ForeignKeyMeta,
     table_schema: &str,
     table_name: &str,
     parent_key: &[Value],
 ) -> anyhow::Result<()> {
-    let parent_table = tables.get(&fk.referenced_table).ok_or_else(|| {
-        sql_err(
-            "XX000",
-            format!(
-                "missing storage for referenced table id {}",
-                fk.referenced_table
-            ),
-        )
-    })?;
+    let parent_table = tables
+        .get(&fk.referenced_table)
+        .or_else(|| {
+            current_table.and_then(|(id, table)| {
+                if *id == fk.referenced_table {
+                    Some(table)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| {
+            sql_err(
+                "XX000",
+                format!(
+                    "missing storage for referenced table id {}",
+                    fk.referenced_table
+                ),
+            )
+        })?;
     let Some(pk_map) = parent_table.pk_map.as_ref() else {
         return Err(sql_err(
             "42830",

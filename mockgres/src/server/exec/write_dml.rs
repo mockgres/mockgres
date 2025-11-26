@@ -3,10 +3,10 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use pgwire::error::PgWireResult;
 
-use crate::db::{CellInput, Db, LockOwner};
+use crate::db::{CellInput, Db, LockOwner, ResolvedOnConflictTarget};
 use crate::engine::{
-    BoolExpr, EvalContext, ExecNode, InsertSource, ObjName, ReturningClause, ReturningExpr, Schema,
-    UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    BoolExpr, EvalContext, ExecNode, InsertSource, ObjName, OnConflictAction, ReturningClause,
+    ReturningExpr, Schema, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
 };
 use crate::server::errors::map_db_err;
 use crate::server::exec_builder::schema_or_public;
@@ -25,6 +25,7 @@ pub(crate) fn build_insert_executor(
     columns: &Option<Vec<String>>,
     rows: &[Vec<InsertSource>],
     override_system_value: bool,
+    on_conflict: &Option<OnConflictAction>,
     returning: &Option<ReturningClause>,
     returning_schema: &Option<Schema>,
     params: Arc<Vec<Value>>,
@@ -36,6 +37,16 @@ pub(crate) fn build_insert_executor(
         db.resolve_table(schema_name, &table.name)
             .map_err(map_db_err)?
             .clone()
+    };
+    let resolved_conflict: Option<ResolvedOnConflictTarget> = match on_conflict {
+        Some(OnConflictAction::DoNothing { target }) => {
+            let db = db.read();
+            Some(
+                db.resolve_on_conflict_target(&table_meta, target)
+                    .map_err(map_db_err)?,
+            )
+        }
+        None => None,
     };
     let column_map = if let Some(cols) = columns {
         let mut indexes = Vec::with_capacity(cols.len());
@@ -103,6 +114,7 @@ pub(crate) fn build_insert_executor(
             &table.name,
             realized,
             override_system_value,
+            resolved_conflict.clone(),
             txid,
             ctx,
         ) {
@@ -127,13 +139,13 @@ pub(crate) fn build_insert_executor(
         Ok((
             Box::new(ValuesExec::from_values(schema, rows)),
             Some(tag),
-            None,
+            Some(inserted),
         ))
     } else {
         Ok((
             Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
             Some(tag),
-            None,
+            Some(inserted),
         ))
     }
 }

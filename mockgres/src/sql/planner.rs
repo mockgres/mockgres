@@ -47,7 +47,9 @@ impl Planner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{InsertSource, Plan, ScalarExpr, Value};
+    use crate::engine::{
+        InsertSource, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Value,
+    };
 
     #[test]
     fn parses_alter_table_add_column_default() {
@@ -72,7 +74,12 @@ mod tests {
         let plan =
             Planner::plan_sql("insert into things values (DEFAULT, 1)").expect("plan insert");
         match plan {
-            Plan::InsertValues { columns, rows, .. } => {
+            Plan::InsertValues {
+                columns,
+                rows,
+                on_conflict: _,
+                ..
+            } => {
                 assert!(columns.is_none());
                 assert_eq!(rows.len(), 1);
                 assert!(matches!(rows[0][0], InsertSource::Default));
@@ -87,7 +94,12 @@ mod tests {
             Planner::plan_sql("insert into gadgets (id, qty, note) values (1, 2 + 3, upper('hi'))")
                 .expect("plan insert");
         match plan {
-            Plan::InsertValues { columns, rows, .. } => {
+            Plan::InsertValues {
+                columns,
+                rows,
+                on_conflict: _,
+                ..
+            } => {
                 let cols = columns.expect("columns");
                 assert_eq!(cols, vec!["id", "qty", "note"]);
                 assert_eq!(rows.len(), 1);
@@ -104,7 +116,11 @@ mod tests {
         )
         .expect("plan insert");
         match plan {
-            Plan::InsertValues { returning, .. } => {
+            Plan::InsertValues {
+                returning,
+                on_conflict: _,
+                ..
+            } => {
                 assert!(returning.is_some(), "expected returning clause");
             }
             other => panic!("unexpected plan: {other:?}"),
@@ -220,6 +236,54 @@ mod tests {
                 assert_eq!(name, "client_min_messages");
                 assert_eq!(value, Some(vec!["warning".to_string()]));
             }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_on_conflict_do_nothing_no_target() {
+        let plan = Planner::plan_sql("insert into gadgets(id) values (1) on conflict do nothing")
+            .expect("plan insert");
+        match plan {
+            Plan::InsertValues { on_conflict, .. } => match on_conflict.expect("on conflict") {
+                OnConflictAction::DoNothing { target } => {
+                    assert!(matches!(target, OnConflictTarget::None));
+                }
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_on_conflict_do_nothing_columns() {
+        let plan = Planner::plan_sql(
+            "insert into gadgets(id, qty) values (1, 2) on conflict (id, qty) do nothing",
+        )
+        .expect("plan insert");
+        match plan {
+            Plan::InsertValues { on_conflict, .. } => match on_conflict.expect("on conflict") {
+                OnConflictAction::DoNothing { target } => match target {
+                    OnConflictTarget::Columns(cols) => assert_eq!(cols, vec!["id", "qty"]),
+                    other => panic!("unexpected target: {other:?}"),
+                },
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn insert_on_conflict_do_nothing_constraint() {
+        let plan = Planner::plan_sql(
+            "insert into gadgets(id) values (1) on conflict on constraint gadgets_id_key do nothing",
+        )
+        .expect("plan insert");
+        match plan {
+            Plan::InsertValues { on_conflict, .. } => match on_conflict.expect("on conflict") {
+                OnConflictAction::DoNothing { target } => match target {
+                    OnConflictTarget::Constraint(name) => assert_eq!(name, "gadgets_id_key"),
+                    other => panic!("unexpected target: {other:?}"),
+                },
+            },
             other => panic!("unexpected plan: {other:?}"),
         }
     }
