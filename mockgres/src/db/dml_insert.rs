@@ -609,5 +609,11 @@ fn substitute_excluded_in_bool(
             expr: substitute_excluded_in_scalar(expr, excluded, meta)?,
             negated: *negated,
         },
+        BoolExpr::InSubquery { .. } | BoolExpr::InListValues { .. } => {
+            return Err(sql_err(
+                "0A000",
+                "subqueries are not supported in this context",
+            ));
+        }
     })
 }

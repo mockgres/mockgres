@@ -93,6 +93,27 @@ fn parse_bool_expr_internal(
                 negated: matches!(nt_type, NullTestType::IsNotNull),
             })
         }
+        NodeEnum::SubLink(sl) => {
+            let testexpr = sl
+                .testexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("subquery requires test expression"))?;
+            let lhs = parse_scalar_expr_internal(testexpr, agg_ctx.as_deref_mut())?;
+            let subselect = sl
+                .subselect
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("subquery missing SELECT"))?;
+            let NodeEnum::SelectStmt(sel) = subselect else {
+                return Err(fe("only SELECT supported in subquery"));
+            };
+            let plan = crate::sql::dml::plan_select(*sel.clone())?;
+            Ok(BoolExpr::InSubquery {
+                expr: lhs,
+                subplan: Box::new(plan),
+            })
+        }
         NodeEnum::AConst(c) => match const_to_value(c)? {
             Value::Bool(b) => Ok(BoolExpr::Literal(b)),
             _ => Err(fe("boolean literal expected")),
@@ -141,6 +162,28 @@ fn parse_scalar_expr_internal(
                 ty: dt,
             })
         }
+        NodeEnum::MinMaxExpr(mm) => {
+            let op = pg_query::protobuf::MinMaxOp::try_from(mm.op)
+                .map_err(|_| fe("unsupported minmax op"))?;
+            if op != pg_query::protobuf::MinMaxOp::IsGreatest {
+                return Err(fe("only GREATEST is supported"));
+            }
+            if mm.args.is_empty() {
+                return Err(fe("greatest() requires arguments"));
+            }
+            let mut args = Vec::new();
+            for arg in &mm.args {
+                let node = arg
+                    .node
+                    .as_ref()
+                    .ok_or_else(|| fe("bad greatest argument"))?;
+                args.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
+            }
+            Ok(ScalarExpr::Func {
+                func: ScalarFunc::Greatest,
+                args,
+            })
+        }
         _ => {
             if let Some(v) = try_parse_literal(node)? {
                 Ok(ScalarExpr::Literal(v))
@@ -187,29 +230,46 @@ fn parse_in_expr(
         .as_ref()
         .and_then(|n| n.node.as_ref())
         .ok_or_else(|| fe("IN expression missing rhs"))?;
-    let NodeEnum::List(list) = rexpr_node else {
-        return Err(fe("IN expression expects value list"));
-    };
-    if list.items.is_empty() {
-        return Err(fe("IN list must have at least one element"));
-    }
-    let mut comparisons = Vec::with_capacity(list.items.len());
-    for item in &list.items {
-        let node = item
-            .node
-            .as_ref()
-            .ok_or_else(|| fe("bad IN list element"))?;
-        let rhs = parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?;
-        comparisons.push(BoolExpr::Comparison {
-            lhs: lhs.clone(),
-            op: CmpOp::Eq,
-            rhs,
-        });
-    }
-    if comparisons.len() == 1 {
-        Ok(comparisons.pop().unwrap())
-    } else {
-        Ok(BoolExpr::Or(comparisons))
+    match rexpr_node {
+        NodeEnum::List(list) => {
+            if list.items.is_empty() {
+                return Err(fe("IN list must have at least one element"));
+            }
+            let mut comparisons = Vec::with_capacity(list.items.len());
+            for item in &list.items {
+                let node = item
+                    .node
+                    .as_ref()
+                    .ok_or_else(|| fe("bad IN list element"))?;
+                let rhs = parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?;
+                comparisons.push(BoolExpr::Comparison {
+                    lhs: lhs.clone(),
+                    op: CmpOp::Eq,
+                    rhs,
+                });
+            }
+            if comparisons.len() == 1 {
+                Ok(comparisons.pop().unwrap())
+            } else {
+                Ok(BoolExpr::Or(comparisons))
+            }
+        }
+        NodeEnum::SubLink(sl) => {
+            let subselect = sl
+                .subselect
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("IN subquery missing subselect"))?;
+            let NodeEnum::SelectStmt(sel) = subselect else {
+                return Err(fe("only SELECT supported in IN subquery"));
+            };
+            let plan = crate::sql::dml::plan_select(*sel.clone())?;
+            Ok(BoolExpr::InSubquery {
+                expr: lhs,
+                subplan: Box::new(plan),
+            })
+        }
+        _ => Err(fe("IN expression expects list or subquery")),
     }
 }
 
@@ -371,7 +431,7 @@ fn parse_function_call(
     let name = fc
         .funcname
         .iter()
-        .find_map(|n| {
+        .filter_map(|n| {
             n.node.as_ref().and_then(|nn| {
                 if let NodeEnum::String(s) = nn {
                     Some(s.sval.to_ascii_lowercase())
@@ -380,6 +440,7 @@ fn parse_function_call(
                 }
             })
         })
+        .last()
         .ok_or_else(|| fe("bad function name"))?;
     if is_aggregate_func_name(&name) {
         if let Some(ctx) = agg_ctx.as_deref_mut() {
@@ -398,6 +459,25 @@ fn parse_function_call(
             .ok_or_else(|| fe("bad function argument"))?;
         args.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
     }
+    if name == "extract" || name == "date_part" {
+        if args.len() != 2 {
+            return Err(fe("extract() requires field and source expression"));
+        }
+        let field = &args[0];
+        let field_name = match field {
+            ScalarExpr::Literal(Value::Text(s)) => s.to_ascii_lowercase(),
+            ScalarExpr::Column(col) => col.column.to_ascii_lowercase(),
+            _ => return Err(fe("extract(field FROM expr) requires literal field name")),
+        };
+        if field_name != "epoch" {
+            return Err(fe(format!("unsupported extract field: {field_name}")));
+        }
+        return Ok(ScalarExpr::Func {
+            func: ScalarFunc::ExtractEpoch,
+            args: vec![args.remove(1)],
+        });
+    }
+
     let func = match name.as_str() {
         "coalesce" => ScalarFunc::Coalesce,
         "upper" => ScalarFunc::Upper,
@@ -412,6 +492,10 @@ fn parse_function_call(
         "transaction_timestamp" => ScalarFunc::TransactionTimestamp,
         "clock_timestamp" => ScalarFunc::ClockTimestamp,
         "current_date" => ScalarFunc::CurrentDate,
+        "abs" => ScalarFunc::Abs,
+        "ln" => ScalarFunc::Ln,
+        "log" => ScalarFunc::Log,
+        "greatest" => ScalarFunc::Greatest,
         other => return Err(fe(format!("unsupported function: {other}"))),
     };
     match func {
@@ -440,6 +524,16 @@ fn parse_function_call(
                 return Err(fe("current_database() takes no arguments"));
             }
         }
+        ScalarFunc::Abs | ScalarFunc::Ln | ScalarFunc::Log => {
+            if !(args.len() == 1 || (matches!(func, ScalarFunc::Log) && args.len() == 2)) {
+                return Err(fe("invalid number of arguments"));
+            }
+        }
+        ScalarFunc::Greatest => {
+            if args.len() < 2 {
+                return Err(fe("greatest() requires at least two arguments"));
+            }
+        }
         ScalarFunc::Now
         | ScalarFunc::CurrentTimestamp
         | ScalarFunc::StatementTimestamp
@@ -448,6 +542,11 @@ fn parse_function_call(
         | ScalarFunc::CurrentDate => {
             if !args.is_empty() {
                 return Err(fe("function takes no arguments"));
+            }
+        }
+        ScalarFunc::ExtractEpoch => {
+            if args.len() != 1 {
+                return Err(fe("extract(epoch from x) requires one source expression"));
             }
         }
     }
@@ -487,6 +586,8 @@ pub fn collect_columns_from_bool_expr(expr: &BoolExpr, out: &mut Vec<String>) {
         }
         BoolExpr::Not(inner) => collect_columns_from_bool_expr(inner, out),
         BoolExpr::IsNull { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+        BoolExpr::InSubquery { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+        BoolExpr::InListValues { expr, .. } => collect_columns_from_scalar_expr(expr, out),
     }
 }
 

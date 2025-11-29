@@ -99,22 +99,66 @@ async fn nested_inner_joins_and_where_are_conjoined() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn non_inner_join_is_rejected_for_now() {
+async fn left_join_produces_nulls_for_unmatched_rows() {
     let ctx = common::start().await;
-    ctx.client
-        .batch_execute("create table x(i int)")
-        .await
-        .unwrap();
-    ctx.client
-        .batch_execute("create table y(j int)")
-        .await
-        .unwrap();
-    let err = ctx
+    seed_authors_and_books(&ctx).await;
+
+    let rows = ctx
         .client
-        .simple_query("select * from x left join y on true")
+        .query(
+            "select name, title
+           from authors
+           left join books on authors.author_pk = books.author_fk
+       order by name, title",
+            &[],
+        )
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("only INNER JOIN is supported"));
+        .unwrap();
+
+    let got: Vec<(String, Option<String>)> =
+        rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Ada".into(), Some("A".into())),
+            ("Bob".into(), Some("B".into())),
+            ("Bob".into(), Some("C".into())),
+            ("Cara".into(), None),
+        ]
+    );
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn left_join_on_predicate_keeps_left_rows() {
+    let ctx = common::start().await;
+    seed_authors_and_books(&ctx).await;
+
+    let rows = ctx
+        .client
+        .query(
+            "select name, title
+           from authors
+           left join books on authors.author_pk = books.author_fk
+                             and books.title = 'B'
+       order by name, title",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let got: Vec<(String, Option<String>)> =
+        rows.into_iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(
+        got,
+        vec![
+            ("Ada".into(), None),
+            ("Bob".into(), Some("B".into())),
+            ("Cara".into(), None),
+        ]
+    );
+
     let _ = ctx.shutdown.send(());
 }
 
@@ -149,7 +193,7 @@ async fn seed_authors_and_books(ctx: &common::TestCtx) {
         .await
         .unwrap();
     ctx.client
-        .batch_execute("insert into authors values (1,'Ada'), (2,'Bob')")
+        .batch_execute("insert into authors values (1,'Ada'), (2,'Bob'), (3,'Cara')")
         .await
         .unwrap();
     ctx.client

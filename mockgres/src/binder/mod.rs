@@ -122,17 +122,63 @@ fn bind_with_search_path(
                 lock,
             })
         }
-        Plan::UnboundJoin { left, right } => {
+        Plan::Alias {
+            input,
+            alias,
+            schema: _,
+        } => {
+            let child = bind_with_search_path(db, search_path, current_database, time_ctx, *input)?;
+            let mut fields = Vec::with_capacity(child.schema().fields.len());
+            let mut exprs = Vec::with_capacity(child.schema().fields.len());
+            for (idx, f) in child.schema().fields.iter().enumerate() {
+                fields.push(Field {
+                    name: f.name.clone(),
+                    data_type: f.data_type.clone(),
+                    origin: Some(FieldOrigin {
+                        schema: None,
+                        table: None,
+                        alias: Some(alias.alias.clone()),
+                    }),
+                });
+                exprs.push((ScalarExpr::ColumnIdx(idx), f.name.clone()));
+            }
+            Ok(Plan::Projection {
+                input: Box::new(child),
+                exprs,
+                schema: Schema { fields },
+            })
+        }
+        Plan::UnboundJoin {
+            left,
+            right,
+            join_type,
+            on,
+        } => {
             let left_bound =
                 bind_with_search_path(db, search_path, current_database, time_ctx, *left)?;
             let right_bound =
                 bind_with_search_path(db, search_path, current_database, time_ctx, *right)?;
             let mut fields = left_bound.schema().fields.clone();
             fields.extend(right_bound.schema().fields.clone());
+            let schema = Schema { fields };
+            let bound_on = if let Some(expr) = on.as_ref() {
+                Some(bind_bool_expr(
+                    expr,
+                    &schema,
+                    db,
+                    search_path,
+                    current_database,
+                    time_ctx,
+                )?)
+            } else {
+                None
+            };
             Ok(Plan::Join {
                 left: Box::new(left_bound),
                 right: Box::new(right_bound),
-                schema: Schema { fields },
+                on: bound_on,
+                join_type,
+                schema,
             })
         }
 
@@ -341,6 +387,8 @@ fn bind_with_search_path(
             mut table,
             sets,
             filter,
+            from,
+            mut from_schema,
             mut returning,
             mut returning_schema,
         } => {
@@ -353,7 +401,7 @@ fn bind_with_search_path(
                 table: Some(tm.name.clone()),
                 alias: None,
             });
-            let schema = Schema {
+            let target_schema = Schema {
                 fields: tm
                     .columns
                     .iter()
@@ -364,9 +412,19 @@ fn bind_with_search_path(
                     })
                     .collect(),
             };
+            let (bound_from, combined_schema) = if let Some(plan) = from {
+                let bound =
+                    bind_with_search_path(db, search_path, current_database, time_ctx, *plan)?;
+                let mut fields = target_schema.fields.clone();
+                fields.extend(bound.schema().fields.clone());
+                from_schema = Some(bound.schema().clone());
+                (Some(bound), Schema { fields })
+            } else {
+                (None, target_schema.clone())
+            };
             let bound_sets = bind_update_sets(
                 sets,
-                &schema,
+                &combined_schema,
                 tm,
                 db,
                 search_path,
@@ -377,7 +435,7 @@ fn bind_with_search_path(
             let bound_filter = match filter {
                 Some(f) => Some(bind_bool_expr(
                     &f,
-                    &schema,
+                    &combined_schema,
                     db,
                     search_path,
                     current_database,
@@ -388,7 +446,7 @@ fn bind_with_search_path(
             returning_schema = match returning.as_mut() {
                 Some(clause) => Some(bind_returning_clause(
                     clause,
-                    &schema,
+                    &combined_schema,
                     db,
                     search_path,
                     current_database,
@@ -400,6 +458,8 @@ fn bind_with_search_path(
                 table,
                 sets: bound_sets,
                 filter: bound_filter,
+                from: bound_from.map(Box::new),
+                from_schema,
                 returning,
                 returning_schema,
             })

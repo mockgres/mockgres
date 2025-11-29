@@ -1,9 +1,9 @@
 use crate::catalog::{SchemaName, TableId};
 #[allow(unused_imports)]
 use crate::engine::{
-    AggCall, AggFunc, BoolExpr, DataType, Field, LockMode, LockRequest, LockSpec, ObjName,
-    OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema, Selection, SortKey, Value, fe,
-    fe_code,
+    AggCall, AggFunc, AliasSpec, BoolExpr, DataType, Field, JoinType, LockMode, LockRequest,
+    LockSpec, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema, Selection,
+    SortKey, Value, fe, fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
@@ -34,7 +34,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let multi_from = from_count > 1 || has_join;
     let lock_request = parse_locking_clause(&mut sel.locking_clause, multi_from)?;
 
-    let mut where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
+    let where_expr = if let Some(w) = sel.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
     } else {
         None
@@ -89,7 +89,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     let mut from_nodes = sel.from_clause;
-    let (mut plan, mut accumulated_on) = parse_from_item(from_nodes.remove(0))?;
+    let mut plan = parse_from_item(from_nodes.remove(0))?;
     let mut first_table: Option<ObjName> = None;
     if !multi_from {
         plan = match plan {
@@ -106,20 +106,12 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
     for item in from_nodes {
-        let (right, on) = parse_from_item(item)?;
+        let right = parse_from_item(item)?;
         plan = Plan::UnboundJoin {
             left: Box::new(plan),
             right: Box::new(right),
-        };
-        if let Some(p) = on {
-            accumulated_on = combine_bool_exprs(accumulated_on, p);
-        }
-    }
-
-    if let Some(onp) = accumulated_on {
-        where_expr = match where_expr {
-            None => Some(onp),
-            Some(existing) => Some(BoolExpr::And(vec![existing, onp])),
+            join_type: JoinType::Inner,
+            on: None,
         };
     }
 
@@ -658,7 +650,7 @@ fn from_item_is_join(node: &pg_query::Node) -> bool {
     matches!(node.node.as_ref(), Some(NodeEnum::JoinExpr(_)))
 }
 
-fn parse_from_item(node: pg_query::Node) -> PgWireResult<(Plan, Option<BoolExpr>)> {
+pub(super) fn parse_from_item(node: pg_query::Node) -> PgWireResult<Plan> {
     use pg_query::NodeEnum;
     let n = node.node.ok_or_else(|| fe("missing FROM item"))?;
     match n {
@@ -679,22 +671,21 @@ fn parse_from_item(node: pg_query::Node) -> PgWireResult<(Plan, Option<BoolExpr>
                     Some(a.aliasname)
                 }
             });
-            Ok((
-                Plan::UnboundSeqScan {
-                    table,
-                    alias,
-                    selection: Selection::Star,
-                    lock: None,
-                },
-                None,
-            ))
+            Ok(Plan::UnboundSeqScan {
+                table,
+                alias,
+                selection: Selection::Star,
+                lock: None,
+            })
         }
         NodeEnum::JoinExpr(j) => {
             let jt = pg_query::protobuf::JoinType::try_from(j.jointype)
                 .unwrap_or(pg_query::protobuf::JoinType::JoinInner);
-            if jt != pg_query::protobuf::JoinType::JoinInner {
-                return Err(fe_code("0A000", "only INNER JOIN is supported"));
-            }
+            let join_type = match jt {
+                pg_query::protobuf::JoinType::JoinInner => JoinType::Inner,
+                pg_query::protobuf::JoinType::JoinLeft => JoinType::Left,
+                _ => return Err(fe_code("0A000", "only INNER and LEFT JOIN are supported")),
+            };
             if !j.using_clause.is_empty() {
                 return Err(fe_code(
                     "0A000",
@@ -703,57 +694,49 @@ fn parse_from_item(node: pg_query::Node) -> PgWireResult<(Plan, Option<BoolExpr>
             }
             let left_node = *j.larg.ok_or_else(|| fe("join missing left"))?;
             let right_node = *j.rarg.ok_or_else(|| fe("join missing right"))?;
-            let (left_plan, left_on) = parse_from_item(left_node)?;
-            let (right_plan, right_on) = parse_from_item(right_node)?;
-            let subtree = Plan::UnboundJoin {
-                left: Box::new(left_plan),
-                right: Box::new(right_plan),
-            };
+            let left_plan = parse_from_item(left_node)?;
+            let right_plan = parse_from_item(right_node)?;
             let on_expr_node = j.quals.and_then(|n| n.node);
             let on_bool = if let Some(nn) = on_expr_node {
                 Some(parse_bool_expr(&nn)?)
             } else {
                 None
             };
-            let combined_on = combine_optional_bools(vec![left_on, right_on, on_bool]);
-            Ok((subtree, combined_on))
+            Ok(Plan::UnboundJoin {
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+                join_type,
+                on: on_bool,
+            })
+        }
+        NodeEnum::RangeSubselect(rs) => {
+            let sub_node = rs
+                .subquery
+                .ok_or_else(|| fe("missing subquery"))?
+                .node
+                .ok_or_else(|| fe("bad subquery"))?;
+            let NodeEnum::SelectStmt(sel) = sub_node else {
+                return Err(fe("only SELECT subqueries are supported in FROM"));
+            };
+            let plan = plan_select(*sel)?;
+            let alias = rs.alias.and_then(|a| {
+                if a.aliasname.is_empty() {
+                    None
+                } else {
+                    Some(a.aliasname)
+                }
+            });
+            if let Some(a) = alias {
+                Ok(Plan::Alias {
+                    input: Box::new(plan),
+                    alias: AliasSpec { alias: a },
+                    schema: Schema { fields: vec![] },
+                })
+            } else {
+                Ok(plan)
+            }
         }
         _ => Err(fe("unsupported FROM item")),
-    }
-}
-
-fn combine_bool_exprs(existing: Option<BoolExpr>, next: BoolExpr) -> Option<BoolExpr> {
-    match existing {
-        None => Some(next),
-        Some(prev) => Some(and_chain(vec![prev, next])),
-    }
-}
-
-fn combine_optional_bools(parts: Vec<Option<BoolExpr>>) -> Option<BoolExpr> {
-    let mut exprs = Vec::new();
-    for part in parts.into_iter().flatten() {
-        flatten_and(part, &mut exprs);
-    }
-    match exprs.len() {
-        0 => None,
-        1 => Some(exprs.remove(0)),
-        _ => Some(BoolExpr::And(exprs)),
-    }
-}
-
-fn and_chain(exprs: Vec<BoolExpr>) -> BoolExpr {
-    let mut flat = Vec::new();
-    for expr in exprs {
-        flatten_and(expr, &mut flat);
-    }
-    BoolExpr::And(flat)
-}
-
-fn flatten_and(expr: BoolExpr, acc: &mut Vec<BoolExpr>) {
-    if let BoolExpr::And(inner) = expr {
-        acc.extend(inner);
-    } else {
-        acc.push(expr);
     }
 }
 

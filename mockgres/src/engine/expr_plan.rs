@@ -96,6 +96,11 @@ pub enum ScalarFunc {
     TransactionTimestamp,
     ClockTimestamp,
     CurrentDate,
+    Abs,
+    Ln,
+    Log, // base determined by args (1 arg -> base10, 2 args -> base arg0)
+    Greatest,
+    ExtractEpoch,
 }
 
 /// Logical aggregate function identifiers.
@@ -130,6 +135,14 @@ pub enum BoolExpr {
         expr: ScalarExpr,
         negated: bool,
     },
+    InSubquery {
+        expr: ScalarExpr,
+        subplan: Box<Plan>,
+    },
+    InListValues {
+        expr: ScalarExpr,
+        values: Vec<Value>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +169,17 @@ pub enum Selection {
 }
 
 pub type ObjName = QualifiedName;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+}
+
+#[derive(Clone, Debug)]
+pub struct AliasSpec {
+    pub alias: String,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferentialAction {
@@ -223,6 +247,11 @@ pub enum Plan {
         selection: Selection,
         lock: Option<LockRequest>,
     },
+    Alias {
+        input: Box<Plan>,
+        alias: AliasSpec,
+        schema: Schema,
+    },
     Filter {
         input: Box<Plan>,
         expr: BoolExpr,
@@ -240,10 +269,14 @@ pub enum Plan {
     UnboundJoin {
         left: Box<Plan>,
         right: Box<Plan>,
+        join_type: JoinType,
+        on: Option<BoolExpr>,
     },
     Join {
         left: Box<Plan>,
         right: Box<Plan>,
+        on: Option<BoolExpr>,
+        join_type: JoinType,
         schema: Schema,
     },
     SeqScan {
@@ -376,6 +409,8 @@ pub enum Plan {
         table: ObjName,
         sets: Vec<UpdateSet>,
         filter: Option<BoolExpr>,
+        from: Option<Box<Plan>>,
+        from_schema: Option<Schema>,
         returning: Option<ReturningClause>,
         returning_schema: Option<Schema>,
     },
@@ -467,6 +502,7 @@ impl Plan {
                 static EMPTY: Schema = Schema { fields: vec![] };
                 &EMPTY
             }
+            Plan::Alias { input, .. } => input.schema(),
         }
     }
 }

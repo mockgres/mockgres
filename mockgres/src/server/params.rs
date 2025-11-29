@@ -6,6 +6,7 @@ use pgwire::api::Type;
 use pgwire::api::results::FieldFormat;
 use pgwire::error::PgWireResult;
 
+use crate::engine::types::parse_interval_literal;
 use crate::engine::{
     BoolExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr, UpdateSet,
     Value, fe,
@@ -93,19 +94,31 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::CountRows { input, .. } => collect_param_hints_from_plan(input, out),
-        Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
+        Plan::Join {
+            left, right, on, ..
+        }
+        | Plan::UnboundJoin {
+            left, right, on, ..
+        } => {
             collect_param_hints_from_plan(left, out);
             collect_param_hints_from_plan(right, out);
+            if let Some(expr) = on {
+                collect_param_hints_from_bool(expr, out);
+            }
         }
         Plan::Update {
             sets,
             filter,
             returning,
+            from,
             ..
         } => {
             collect_param_hints_from_update_sets(sets, out);
             if let Some(expr) = filter {
                 collect_param_hints_from_bool(expr, out);
+            }
+            if let Some(plan) = from {
+                collect_param_hints_from_plan(plan, out);
             }
             if let Some(clause) = returning {
                 collect_param_hints_from_returning(clause, out);
@@ -138,6 +151,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_returning(clause, out);
             }
         }
+        Plan::Alias { input, .. } => collect_param_hints_from_plan(input, out),
         Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
@@ -178,6 +192,13 @@ fn collect_param_hints_from_bool(expr: &BoolExpr, out: &mut HashMap<usize, DataT
         }
         BoolExpr::Not(inner) => collect_param_hints_from_bool(inner, out),
         BoolExpr::IsNull { expr, .. } => collect_param_hints_from_scalar(expr, out),
+        BoolExpr::InSubquery { expr, subplan } => {
+            collect_param_hints_from_scalar(expr, out);
+            collect_param_hints_from_plan(subplan, out);
+        }
+        BoolExpr::InListValues { expr, .. } => {
+            collect_param_hints_from_scalar(expr, out);
+        }
     }
 }
 
@@ -259,19 +280,31 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             }
         }
         Plan::CountRows { input, .. } => collect_param_indexes(input, out),
-        Plan::Join { left, right, .. } | Plan::UnboundJoin { left, right } => {
+        Plan::Join {
+            left, right, on, ..
+        }
+        | Plan::UnboundJoin {
+            left, right, on, ..
+        } => {
             collect_param_indexes(left, out);
             collect_param_indexes(right, out);
+            if let Some(expr) = on {
+                collect_param_indexes_from_bool(expr, out);
+            }
         }
         Plan::Update {
             sets,
             filter,
             returning,
+            from,
             ..
         } => {
             collect_param_indexes_from_update_sets(sets, out);
             if let Some(expr) = filter {
                 collect_param_indexes_from_bool(expr, out);
+            }
+            if let Some(plan) = from {
+                collect_param_indexes(plan, out);
             }
             if let Some(clause) = returning {
                 collect_param_indexes_from_returning(clause, out);
@@ -301,6 +334,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_returning(clause, out);
             }
         }
+        Plan::Alias { input, .. } => collect_param_indexes(input, out),
         Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
@@ -341,6 +375,13 @@ fn collect_param_indexes_from_bool(expr: &BoolExpr, out: &mut BTreeSet<usize>) {
         }
         BoolExpr::Not(inner) => collect_param_indexes_from_bool(inner, out),
         BoolExpr::IsNull { expr, .. } => collect_param_indexes_from_scalar(expr, out),
+        BoolExpr::InSubquery { expr, subplan } => {
+            collect_param_indexes_from_scalar(expr, out);
+            collect_param_indexes(subplan, out);
+        }
+        BoolExpr::InListValues { expr, .. } => {
+            collect_param_indexes_from_scalar(expr, out);
+        }
     }
 }
 
@@ -444,6 +485,11 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             let bytes = parse_bytea_text(s).map_err(fe)?;
             Ok(Value::Bytes(bytes))
         }
+        DataType::Interval => {
+            let micros =
+                parse_interval_literal(s).map_err(|e| fe(format!("bad interval param: {e}")))?;
+            Ok(Value::IntervalMicros(micros))
+        }
     }
 }
 
@@ -502,6 +548,13 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgW
             let pg_micros = i64::from_be_bytes(arr);
             let micros = postgres_micros_to_timestamp(pg_micros);
             Ok(Value::TimestamptzMicros(micros))
+        }
+        DataType::Interval => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
+            let micros =
+                parse_interval_literal(s).map_err(|e| fe(format!("bad interval param: {e}")))?;
+            Ok(Value::IntervalMicros(micros))
         }
     }
 }

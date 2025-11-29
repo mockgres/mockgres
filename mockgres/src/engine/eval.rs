@@ -11,6 +11,7 @@ use pgwire::messages::data::DataRow;
 use std::sync::Arc;
 
 use super::exec::ExecNode;
+use super::types::format_interval_micros;
 use super::{
     BoolExpr, CmpOp, DataType, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value,
     cast_value_to_type, fe, fe_code,
@@ -162,6 +163,37 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
     if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(Value::Null);
     }
+    if let ScalarBinaryOp::Add | ScalarBinaryOp::Sub = op {
+        match (&left, &right) {
+            (Value::TimestamptzMicros(l), Value::IntervalMicros(r)) => {
+                let res = if matches!(op, ScalarBinaryOp::Add) {
+                    l + r
+                } else {
+                    l - r
+                };
+                return Ok(Value::TimestamptzMicros(res));
+            }
+            (Value::IntervalMicros(l), Value::TimestamptzMicros(r))
+                if matches!(op, ScalarBinaryOp::Add) =>
+            {
+                return Ok(Value::TimestamptzMicros(l + r));
+            }
+            (Value::IntervalMicros(l), Value::IntervalMicros(r)) => {
+                let res = if matches!(op, ScalarBinaryOp::Add) {
+                    l + r
+                } else {
+                    l - r
+                };
+                return Ok(Value::IntervalMicros(res));
+            }
+            (Value::TimestamptzMicros(l), Value::TimestamptzMicros(r))
+                if matches!(op, ScalarBinaryOp::Sub) =>
+            {
+                return Ok(Value::IntervalMicros(l - r));
+            }
+            _ => {}
+        }
+    }
     match op {
         ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul => {
             let (l_val, r_val, use_float) = coerce_numeric_pair(left, right)?;
@@ -229,6 +261,7 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
                 let f = f64::from_bits(bits);
                 Ok(Value::from_f64(-f))
             }
+            Value::IntervalMicros(v) => Ok(Value::IntervalMicros(-v)),
             other => Err(fe(format!("cannot negate value {:?}", other))),
         },
     }
@@ -289,6 +322,81 @@ fn eval_function(
             let days = timestamp_micros_to_date_days(micros).map_err(fe)?;
             Ok(Value::Date(days))
         }
+        ScalarFunc::Abs => match args.into_iter().next() {
+            Some(Value::Int64(i)) => Ok(Value::Int64(i.abs())),
+            Some(Value::Float64Bits(bits)) => Ok(Value::from_f64(f64::from_bits(bits).abs())),
+            Some(Value::Null) | None => Ok(Value::Null),
+            other => Err(fe(format!("abs() unsupported for {other:?}"))),
+        },
+        ScalarFunc::Ln => {
+            let v = args.into_iter().next().unwrap_or(Value::Null);
+            if matches!(v, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let num = value_to_numeric(v)?;
+            let f = num.to_f64().ok_or_else(|| fe("ln() requires numeric"))?;
+            if f <= 0.0 {
+                return Err(fe("cannot take natural log of non-positive number"));
+            }
+            Ok(Value::from_f64(f.ln()))
+        }
+        ScalarFunc::Log => {
+            if args.len() == 2 {
+                let mut it = args.into_iter();
+                let base_val = it.next().unwrap();
+                let x_val = it.next().unwrap();
+                if matches!(base_val, Value::Null) || matches!(x_val, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let base_num = value_to_numeric(base_val)?;
+                let x_num = value_to_numeric(x_val)?;
+                let base = base_num
+                    .to_f64()
+                    .ok_or_else(|| fe("log() requires numeric base"))?;
+                let x = x_num.to_f64().ok_or_else(|| fe("log() requires numeric"))?;
+                if base <= 0.0 || base == 1.0 || x <= 0.0 {
+                    return Err(fe("log(base, x) requires base>0, base!=1, x>0"));
+                }
+                Ok(Value::from_f64(x.ln() / base.ln()))
+            } else {
+                let v = args.into_iter().next().unwrap_or(Value::Null);
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let num = value_to_numeric(v)?;
+                let f = num.to_f64().ok_or_else(|| fe("log() requires numeric"))?;
+                if f <= 0.0 {
+                    return Err(fe("log() requires positive input"));
+                }
+                Ok(Value::from_f64(f.log10()))
+            }
+        }
+        ScalarFunc::Greatest => {
+            let mut best: Option<Value> = None;
+            for arg in args {
+                if matches!(arg, Value::Null) {
+                    continue;
+                }
+                if let Some(current) = &best {
+                    if let Some(ord) = compare_values(&arg, current) {
+                        if ord == std::cmp::Ordering::Greater {
+                            best = Some(arg);
+                        }
+                    } else {
+                        return Err(fe("greatest() arguments are not comparable"));
+                    }
+                } else {
+                    best = Some(arg);
+                }
+            }
+            Ok(best.unwrap_or(Value::Null))
+        }
+        ScalarFunc::ExtractEpoch => match args.into_iter().next() {
+            Some(Value::TimestamptzMicros(m)) => Ok(Value::from_f64(m as f64 / 1_000_000f64)),
+            Some(Value::TimestampMicros(m)) => Ok(Value::from_f64(m as f64 / 1_000_000f64)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            other => Err(fe(format!("extract(epoch ...) unsupported for {other:?}"))),
+        },
     }
 }
 
@@ -355,6 +463,7 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
         Value::Bool(b) => Some(if b { "t" } else { "f" }.into()),
         Value::Bytes(bytes) => Some(String::from_utf8_lossy(&bytes).into()),
+        Value::IntervalMicros(v) => Some(format_interval_micros(v)),
         Value::Date(_) | Value::TimestampMicros(_) | Value::TimestamptzMicros(_) => {
             return Err(fe("text conversion not supported for date/timestamp"));
         }
@@ -416,6 +525,24 @@ pub fn eval_bool_expr(
                 _ => Some(*negated),
             }
         }
+        BoolExpr::InListValues { expr, values } => {
+            let lhs = eval_scalar_expr(row, expr, params, ctx)?;
+            if matches!(lhs, Value::Null) {
+                return Ok(None);
+            }
+            let mut saw_null = false;
+            for v in values {
+                if matches!(v, Value::Null) {
+                    saw_null = true;
+                    continue;
+                }
+                if compare_values(&lhs, v) == Some(std::cmp::Ordering::Equal) {
+                    return Ok(Some(true));
+                }
+            }
+            if saw_null { None } else { Some(false) }
+        }
+        BoolExpr::InSubquery { .. } => return Err(fe("unplanned subquery in filter")),
     })
 }
 
@@ -472,6 +599,7 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
         (Value::TimestampMicros(a), Value::TimestampMicros(b)) => a.cmp(b),
         (Value::TimestamptzMicros(a), Value::TimestamptzMicros(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
+        (Value::IntervalMicros(a), Value::IntervalMicros(b)) => a.cmp(b),
         _ => return None,
     })
 }
@@ -506,6 +634,9 @@ pub async fn to_pgwire_stream(
                         for (i, v) in vals.into_iter().enumerate() {
                             let dt = &schema.field(i).data_type;
                             let res = match (v, dt) {
+                                (Value::Null, DataType::Interval) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
                                 (Value::Null, DataType::Int4) => {
                                     enc.encode_field(&Option::<i32>::None)
                                 }
@@ -587,6 +718,10 @@ pub async fn to_pgwire_stream(
                                         };
                                         enc.encode_field(&text)
                                     }
+                                }
+                                (Value::IntervalMicros(micros), DataType::Interval) => {
+                                    let text = format_interval_micros(micros);
+                                    enc.encode_field(&text)
                                 }
                                 (Value::Bytes(bytes), DataType::Bytea) => {
                                     if fmt == FieldFormat::Binary {

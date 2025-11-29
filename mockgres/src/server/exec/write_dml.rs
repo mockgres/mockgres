@@ -5,15 +5,19 @@ use pgwire::error::PgWireResult;
 
 use crate::db::{CellInput, Db, LockOwner, ResolvedOnConflictKind};
 use crate::engine::{
-    BoolExpr, EvalContext, ExecNode, InsertSource, ObjName, OnConflictAction, ReturningClause,
-    ReturningExpr, Schema, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe, fe_code,
+    BoolExpr, EvalContext, ExecNode, InsertSource, ObjName, OnConflictAction, Plan,
+    ReturningClause, ReturningExpr, Schema, UpdateSet, Value, ValuesExec, eval_scalar_expr, fe,
+    fe_code,
 };
 use crate::server::errors::map_db_err;
+use crate::server::exec::read::subquery::materialize_in_subqueries;
 use crate::server::exec_builder::schema_or_public;
 use crate::server::insert::evaluate_insert_source;
 use crate::session::{RowPointer, Session};
 use crate::storage::Row;
 use crate::txn::{TransactionManager, TxId, VisibilityContext};
+
+use futures::executor::block_on;
 
 use super::tx::{finish_writer_tx, writer_txid};
 
@@ -187,6 +191,8 @@ pub(crate) fn build_update_executor(
     table: &ObjName,
     sets: &[UpdateSet],
     filter: &Option<BoolExpr>,
+    from: &Option<Box<Plan>>,
+    _from_schema: &Option<Schema>,
     returning: &Option<ReturningClause>,
     returning_schema: &Option<Schema>,
     params: Arc<Vec<Value>>,
@@ -207,6 +213,39 @@ pub(crate) fn build_update_executor(
         .current_epoch()
         .ok_or_else(|| fe("missing transaction context for UPDATE"))?;
     let lock_owner = LockOwner::new(session.id(), epoch);
+    let from_rows: Option<Vec<Row>> = if let Some(plan) = from {
+        let (mut exec, _, _) = crate::server::exec_builder::build_executor(
+            db,
+            txn_manager,
+            session,
+            snapshot_xid,
+            plan,
+            params.clone(),
+            ctx,
+        )?;
+        block_on(exec.open())?;
+        let mut rows = Vec::new();
+        while let Some(r) = block_on(exec.next())? {
+            rows.push(r);
+        }
+        block_on(exec.close())?;
+        Some(rows)
+    } else {
+        None
+    };
+    let materialized_filter = if let Some(f) = filter {
+        Some(materialize_in_subqueries(
+            f,
+            db,
+            txn_manager,
+            session,
+            snapshot_xid,
+            params.clone(),
+            ctx,
+        )?)
+    } else {
+        None
+    };
     let (count, updated_rows, inserted_ptrs, touched_ptrs): (
         usize,
         Vec<Row>,
@@ -218,7 +257,8 @@ pub(crate) fn build_update_executor(
             schema_name,
             &table.name,
             &assignments,
-            filter.as_ref(),
+            materialized_filter.as_ref(),
+            from_rows.as_deref(),
             &params,
             &visibility,
             txid,
@@ -270,6 +310,19 @@ pub(crate) fn build_delete_executor(
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
 ) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+    let materialized_filter = if let Some(f) = filter {
+        Some(materialize_in_subqueries(
+            f,
+            db,
+            txn_manager,
+            session,
+            snapshot_xid,
+            params.clone(),
+            ctx,
+        )?)
+    } else {
+        None
+    };
     let schema_name = schema_or_public(&table.schema);
     let (txid, autocommit) = writer_txid(session, txn_manager);
     let current_tx = session.current_tx();
@@ -283,7 +336,7 @@ pub(crate) fn build_delete_executor(
         match db.delete_rows(
             schema_name,
             &table.name,
-            filter.as_ref(),
+            materialized_filter.as_ref(),
             &params,
             &visibility,
             txid,

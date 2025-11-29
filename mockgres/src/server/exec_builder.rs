@@ -40,7 +40,8 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Limit { .. }
         | Plan::LockRows { .. }
         | Plan::UnboundJoin { .. }
-        | Plan::Join { .. } => "SELECT",
+        | Plan::Join { .. }
+        | Plan::Alias { .. } => "SELECT",
 
         Plan::CreateTable { .. } => "CREATE TABLE",
         Plan::AlterTableAddColumn { .. }
@@ -91,7 +92,8 @@ pub fn build_executor(
         | Plan::Filter { .. }
         | Plan::Order { .. }
         | Plan::Limit { .. }
-        | Plan::Join { .. } => {
+        | Plan::Join { .. }
+        | Plan::Alias { .. } => {
             return build_read_executor(db, txn_manager, session, snapshot_xid, p, params, ctx);
         }
         Plan::CreateTable { .. }
@@ -138,6 +140,8 @@ pub fn build_executor(
             table,
             sets,
             filter,
+            from,
+            from_schema,
             returning,
             returning_schema,
         } => build_update_executor(
@@ -148,6 +152,8 @@ pub fn build_executor(
             table,
             sets,
             filter,
+            from,
+            from_schema,
             returning,
             returning_schema,
             params.clone(),

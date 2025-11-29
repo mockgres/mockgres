@@ -4,7 +4,7 @@ use pgwire::error::PgWireResult;
 use std::sync::Arc;
 
 use super::eval::{EvalContext, eval_bool_expr, eval_scalar_expr};
-use super::{AggCall, AggFunc, BoolExpr, ScalarExpr, Schema, SortKey, Value, fe};
+use super::{AggCall, AggFunc, BoolExpr, JoinType, ScalarExpr, Schema, SortKey, Value, fe};
 
 mod values;
 
@@ -151,17 +151,36 @@ pub struct NestedLoopJoinExec {
     left: Option<Box<dyn ExecNode>>,
     right: Option<Box<dyn ExecNode>>,
     rows: Vec<Row>,
+    right_width: usize,
+    join_type: JoinType,
+    on: Option<BoolExpr>,
+    params: Arc<Vec<Value>>,
+    ctx: EvalContext,
     pos: usize,
     built: bool,
 }
 
 impl NestedLoopJoinExec {
-    pub fn new(schema: Schema, left: Box<dyn ExecNode>, right: Box<dyn ExecNode>) -> Self {
+    pub fn new(
+        schema: Schema,
+        left: Box<dyn ExecNode>,
+        right: Box<dyn ExecNode>,
+        join_type: JoinType,
+        on: Option<BoolExpr>,
+        params: Arc<Vec<Value>>,
+        ctx: EvalContext,
+    ) -> Self {
+        let right_width = right.schema().fields.len();
         Self {
             schema,
             left: Some(left),
             right: Some(right),
             rows: Vec::new(),
+            right_width,
+            join_type,
+            on,
+            params,
+            ctx,
             pos: 0,
             built: false,
         }
@@ -187,13 +206,56 @@ impl NestedLoopJoinExec {
         }
         right.close().await?;
 
-        let mut rows = Vec::with_capacity(left_rows.len() * right_rows.len());
-        if !left_rows.is_empty() && !right_rows.is_empty() {
-            for l in &left_rows {
-                for r in &right_rows {
-                    let mut combined = l.clone();
-                    combined.extend(r.clone());
-                    rows.push(combined);
+        let mut rows = Vec::new();
+        match self.join_type {
+            JoinType::Inner => {
+                rows.reserve(left_rows.len().saturating_mul(right_rows.len()));
+                for l in &left_rows {
+                    for r in &right_rows {
+                        let mut combined = l.clone();
+                        combined.extend(r.clone());
+                        if let Some(on_expr) = &self.on {
+                            let pass = eval_bool_expr(&combined, on_expr, &self.params, &self.ctx)?
+                                .unwrap_or(false);
+                            if !pass {
+                                continue;
+                            }
+                        }
+                        rows.push(combined);
+                    }
+                }
+            }
+            JoinType::Left => {
+                let mut null_right = Vec::with_capacity(self.right_width);
+                null_right.resize(self.right_width, Value::Null);
+                let estimated = left_rows.len().saturating_mul(right_rows.len().max(1));
+                rows.reserve(estimated);
+                for l in &left_rows {
+                    let mut matched = false;
+                    if right_rows.is_empty() {
+                        let mut combined = l.clone();
+                        combined.extend(null_right.clone());
+                        rows.push(combined);
+                        continue;
+                    }
+                    for r in &right_rows {
+                        let mut combined = l.clone();
+                        combined.extend(r.clone());
+                        if let Some(on_expr) = &self.on {
+                            let pass = eval_bool_expr(&combined, on_expr, &self.params, &self.ctx)?
+                                .unwrap_or(false);
+                            if !pass {
+                                continue;
+                            }
+                        }
+                        matched = true;
+                        rows.push(combined);
+                    }
+                    if !matched {
+                        let mut combined = l.clone();
+                        combined.extend(null_right.clone());
+                        rows.push(combined);
+                    }
                 }
             }
         }

@@ -5,15 +5,18 @@ use pgwire::error::PgWireResult;
 
 use crate::db::{Db, LockOwner};
 use crate::engine::{
-    CountExec, EvalContext, ExecNode, FilterExec, HashAggregateExec, LimitExec, NestedLoopJoinExec,
-    OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, Value, ValuesExec, fe,
+    CountExec, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinType, LimitExec,
+    NestedLoopJoinExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, Value,
+    ValuesExec, fe,
 };
 use crate::server::errors::map_db_err;
 use crate::session::Session;
 use crate::txn::{TransactionManager, TxId, VisibilityContext};
 
 use super::locks::wrap_with_lock_apply;
+pub(crate) mod subquery;
 use crate::server::exec_builder::{assert_supported_aggs, build_executor, schema_or_public};
+use subquery::materialize_in_subqueries;
 
 pub fn build_read_executor(
     db: &Arc<RwLock<Db>>,
@@ -177,6 +180,15 @@ pub fn build_read_executor(
             expr,
             project_prefix_len,
         } => {
+            let materialized_expr = materialize_in_subqueries(
+                expr,
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                params.clone(),
+                ctx,
+            )?;
             let (child, _tag, _cnt) = build_executor(
                 db,
                 txn_manager,
@@ -190,7 +202,7 @@ pub fn build_read_executor(
             let mut node: Box<dyn ExecNode> = Box::new(FilterExec::new(
                 child_schema.clone(),
                 child,
-                expr.clone(),
+                materialized_expr,
                 params.clone(),
                 ctx.clone(),
             ));
@@ -266,10 +278,15 @@ pub fn build_read_executor(
                 out_cnt,
             ))
         }
+        Plan::Alias { input, .. } => {
+            build_executor(db, txn_manager, session, snapshot_xid, input, params, ctx)
+        }
         Plan::Join {
             left,
             right,
             schema,
+            on,
+            join_type,
         } => {
             let (left_exec, _ltag, left_cnt) = build_executor(
                 db,
@@ -289,8 +306,9 @@ pub fn build_read_executor(
                 params.clone(),
                 ctx,
             )?;
-            let out_cnt = match (left_cnt, right_cnt) {
-                (Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
+            let out_cnt = match (join_type, on, left_cnt, right_cnt) {
+                (JoinType::Inner, None, Some(lc), Some(rc)) => Some(lc.saturating_mul(rc)),
+                (JoinType::Left, _, Some(lc), _) => Some(lc),
                 _ => None,
             };
             Ok((
@@ -298,6 +316,10 @@ pub fn build_read_executor(
                     schema.clone(),
                     left_exec,
                     right_exec,
+                    *join_type,
+                    on.clone(),
+                    params.clone(),
+                    ctx.clone(),
                 )),
                 None,
                 out_cnt,

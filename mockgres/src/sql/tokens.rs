@@ -78,6 +78,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "timestamp" => DataType::Timestamp,
             "timestamptz" => DataType::Timestamptz,
             "bytea" => DataType::Bytea,
+            "interval" => DataType::Interval,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
     };
@@ -336,7 +337,8 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         | Value::Date(_)
                         | Value::TimestampMicros(_)
                         | Value::TimestamptzMicros(_)
-                        | Value::Bytes(_) => Err(fe("minus over non-numeric literal")),
+                        | Value::Bytes(_)
+                        | Value::IntervalMicros(_) => Err(fe("minus over non-numeric literal")),
                     },
                     _ => Err(fe("minus over non-const")),
                 }

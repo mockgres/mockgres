@@ -1,10 +1,10 @@
 use crate::catalog::SchemaName;
-use crate::engine::{ObjName, Plan, UpdateSet, fe};
+use crate::engine::{JoinType, ObjName, Plan, UpdateSet, fe};
 use pg_query::NodeEnum;
 use pg_query::protobuf::UpdateStmt;
 use pgwire::error::PgWireResult;
 
-use super::dml::extract_col_name;
+use super::dml::{extract_col_name, parse_from_item};
 use super::expr::{parse_bool_expr, parse_scalar_expr};
 use super::returning::parse_returning_clause;
 
@@ -47,11 +47,28 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
     } else {
         None
     };
+    let mut from_plan = None;
+    if !upd.from_clause.is_empty() {
+        let mut items = upd.from_clause;
+        let mut plan = parse_from_item(items.remove(0))?;
+        for item in items {
+            let right = parse_from_item(item)?;
+            plan = Plan::UnboundJoin {
+                left: Box::new(plan),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                on: None,
+            };
+        }
+        from_plan = Some(Box::new(plan));
+    }
     let returning = parse_returning_clause(&upd.returning_list)?;
     Ok(Plan::Update {
         table,
         sets,
         filter,
+        from: from_plan,
+        from_schema: None,
         returning,
         returning_schema: None,
     })

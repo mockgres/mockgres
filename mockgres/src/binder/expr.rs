@@ -104,6 +104,42 @@ fn bind_bool_expr_inner(
             )?,
             negated: *negated,
         },
+        BoolExpr::InSubquery { expr, subplan } => {
+            let bound_expr = bind_scalar_expr_inner(
+                expr,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                allow_excluded,
+            )?;
+            let bound_plan = super::bind_with_search_path(
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                *subplan.clone(),
+            )?;
+            BoolExpr::InSubquery {
+                expr: bound_expr,
+                subplan: Box::new(bound_plan),
+            }
+        }
+        BoolExpr::InListValues { expr, values } => BoolExpr::InListValues {
+            expr: bind_scalar_expr_inner(
+                expr,
+                schema,
+                None,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                allow_excluded,
+            )?,
+            values: values.clone(),
+        },
     })
 }
 
@@ -405,6 +441,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             Value::TimestampMicros(_) => Some(DataType::Timestamp),
             Value::TimestamptzMicros(_) => Some(DataType::Timestamptz),
             Value::Bytes(_) => Some(DataType::Bytea),
+            Value::IntervalMicros(_) => Some(DataType::Interval),
             Value::Null => None,
         },
         ScalarExpr::BinaryOp { op, left, right } => match op {
@@ -415,6 +452,30 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             | ScalarBinaryOp::Div => {
                 let l = scalar_expr_type(left.as_ref(), schema);
                 let r = scalar_expr_type(right.as_ref(), schema);
+                if matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
+                    if matches!(l, Some(DataType::Timestamptz))
+                        && matches!(r, Some(DataType::Interval))
+                    {
+                        return Some(DataType::Timestamptz);
+                    }
+                    if matches!(l, Some(DataType::Interval))
+                        && matches!(r, Some(DataType::Timestamptz))
+                        && matches!(op, ScalarBinaryOp::Add)
+                    {
+                        return Some(DataType::Timestamptz);
+                    }
+                    if matches!(l, Some(DataType::Interval))
+                        && matches!(r, Some(DataType::Interval))
+                    {
+                        return Some(DataType::Interval);
+                    }
+                    if matches!(op, ScalarBinaryOp::Sub)
+                        && matches!(l, Some(DataType::Timestamptz))
+                        && matches!(r, Some(DataType::Timestamptz))
+                    {
+                        return Some(DataType::Interval);
+                    }
+                }
                 match (l, r) {
                     (Some(DataType::Float8), _) | (_, Some(DataType::Float8)) => {
                         Some(DataType::Float8)
@@ -444,6 +505,16 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             | ScalarFunc::TransactionTimestamp
             | ScalarFunc::ClockTimestamp => Some(DataType::Timestamptz),
             ScalarFunc::CurrentDate => Some(DataType::Date),
+            ScalarFunc::Abs => args
+                .get(0)
+                .and_then(|a| scalar_expr_type(a, schema))
+                .or(Some(DataType::Int8)),
+            ScalarFunc::Ln | ScalarFunc::Log => Some(DataType::Float8),
+            ScalarFunc::Greatest => args
+                .iter()
+                .filter_map(|a| scalar_expr_type(a, schema))
+                .next(),
+            ScalarFunc::ExtractEpoch => Some(DataType::Float8),
             ScalarFunc::Coalesce => args
                 .iter()
                 .filter_map(|a| scalar_expr_type(a, schema))

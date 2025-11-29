@@ -9,6 +9,7 @@ impl Db {
         name: &str,
         sets: &[(usize, ScalarExpr)],
         filter: Option<&BoolExpr>,
+        source_rows: Option<&[Row]>,
         params: &[Value],
         visibility: &VisibilityContext,
         txid: TxId,
@@ -61,6 +62,7 @@ impl Db {
                 new_fk: Vec<Option<Vec<Value>>>,
                 old_unique: Vec<(String, Option<Vec<Value>>)>,
                 new_unique: Vec<(String, Option<Vec<Value>>)>,
+                return_row: Row,
             }
             let mut pending: Vec<PendingUpdate> = Vec::new();
             for (key, versions) in table.rows_by_key.iter() {
@@ -68,7 +70,25 @@ impl Db {
                     continue;
                 };
                 let snapshot = versions[idx].data.clone();
-                let passes = if let Some(expr) = filter {
+                let mut chosen_source: Option<Row> = None;
+                let passes = if let Some(src_rows) = source_rows {
+                    for src in src_rows.iter() {
+                        let mut combined = snapshot.clone();
+                        combined.extend(src.clone());
+                        let ok = if let Some(expr) = filter {
+                            eval_bool_expr(&combined, expr, params, ctx)
+                                .map_err(|e| sql_err("XX000", e.to_string()))?
+                                .unwrap_or(false)
+                        } else {
+                            true
+                        };
+                        if ok {
+                            chosen_source = Some(src.clone());
+                            break;
+                        }
+                    }
+                    chosen_source.is_some()
+                } else if let Some(expr) = filter {
                     eval_bool_expr(&snapshot, expr, params, ctx)
                         .map_err(|e| sql_err("XX000", e.to_string()))?
                         .unwrap_or(false)
@@ -79,12 +99,23 @@ impl Db {
                     continue;
                 }
                 let mut updated = snapshot.clone();
+                let eval_row = if let Some(src) = &chosen_source {
+                    let mut combined = snapshot.clone();
+                    combined.extend(src.clone());
+                    combined
+                } else {
+                    snapshot.clone()
+                };
                 for (idx, expr) in sets {
-                    let value = eval_scalar_expr(&snapshot, expr, params, ctx)
+                    let value = eval_scalar_expr(&eval_row, expr, params, ctx)
                         .map_err(|e| sql_err("XX000", e.to_string()))?;
                     let coerced =
                         coerce_value_for_column(value, &meta.columns[*idx], *idx, &meta, ctx)?;
                     updated[*idx] = coerced;
+                }
+                let mut return_row = updated.clone();
+                if let Some(src) = chosen_source {
+                    return_row.extend(src);
                 }
                 let old_pk_key = build_primary_key_row_key(&meta, &snapshot)?;
                 let new_pk_key = build_primary_key_row_key(&meta, &updated)?;
@@ -111,6 +142,7 @@ impl Db {
                     new_fk: new_fk_keys,
                     old_unique,
                     new_unique,
+                    return_row,
                 });
             }
             let mut count = 0usize;
@@ -127,6 +159,7 @@ impl Db {
                     new_fk,
                     old_unique,
                     new_unique,
+                    return_row,
                 } = pending_update;
                 let Some(_) = table
                     .rows_by_key
@@ -169,7 +202,7 @@ impl Db {
                     xmax: None,
                     data: updated.clone(),
                 });
-                updated_rows.push(updated.clone());
+                updated_rows.push(return_row.clone());
                 if let Some(pk_meta) = pk_meta {
                     update_pk_map_for_row(
                         &mut table,
