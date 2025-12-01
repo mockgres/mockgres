@@ -15,8 +15,12 @@
 - [License](#license)
 
 ## Overview
-- One or two sentences on what mockgres is and why it exists.
-- Mention PG wire compatibility and intended use (tests only).
+Mockgres was born out of my frustration for the Postgres docker container taking too long, in my opinion, to start up.
+I didn't want to have to write mocks, but I also wanted my unit tests to run as fast as possible.
+I also didn't want to have to manage local installations and cleaning up in between test runs.
+
+Mockgres aims to replicate a reasonable subset of Postgres functionality and semantics for two use cases.
+The first use case is that of a typical CRUD app. The second use case is for a basic task queue using `SELECT FOR UPDATE SKIP LOCKED`.
 
 ## Quickstart
 - Prereqs: Rust toolchain, `cargo`.
