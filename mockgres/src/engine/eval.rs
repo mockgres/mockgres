@@ -8,6 +8,7 @@ use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::types::format::FormatOptions;
 use std::sync::Arc;
 
 use super::exec::ExecNode;
@@ -300,6 +301,16 @@ fn eval_function(
         },
         ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas | ScalarFunc::CurrentDatabase => {
             Err(fe("context-dependent function evaluated without binding"))
+        }
+        ScalarFunc::PgTableIsVisible => {
+            if args.len() != 1 {
+                return Err(fe("pg_table_is_visible(oid) requires one argument"));
+            }
+            Ok(Value::Bool(true))
+        }
+        ScalarFunc::Version => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::Text(crate::server::mapping::server_version_string()))
         }
         ScalarFunc::Now | ScalarFunc::CurrentTimestamp | ScalarFunc::StatementTimestamp => {
             ensure_no_args(&func, &args)?;
@@ -649,6 +660,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Text) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Json) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
                                 (Value::Null, DataType::Bool) => {
                                     enc.encode_field(&Option::<bool>::None)
                                 }
@@ -675,6 +689,7 @@ pub async fn to_pgwire_stream(
                                     enc.encode_field(&f)
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
+                                (Value::Text(s), DataType::Json) => enc.encode_field(&s),
                                 (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
                                 (Value::Date(days), DataType::Date) => {
                                     if fmt == FieldFormat::Binary {
@@ -729,6 +744,7 @@ pub async fn to_pgwire_stream(
                                             &bytes,
                                             &Type::BYTEA,
                                             FieldFormat::Binary,
+                                            &FormatOptions::default(),
                                         )
                                     } else {
                                         let text = format_bytea(bytes.as_slice());
@@ -741,10 +757,8 @@ pub async fn to_pgwire_stream(
                                 return Some((Err(e), (node, fields, schema)));
                             }
                         }
-                        match enc.finish() {
-                            Ok(dr) => Some((Ok(dr), (node, fields, schema))),
-                            Err(e) => Some((Err(e), (node, fields, schema))),
-                        }
+                        let dr = enc.take_row();
+                        Some((Ok(dr), (node, fields, schema)))
                     }
                     Ok(None) => match node.close().await {
                         Ok(()) => None,

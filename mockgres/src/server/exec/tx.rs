@@ -51,6 +51,8 @@ pub(crate) fn begin_transaction(
     session.set_current_tx(Some(txid));
     session.reset_changes();
     session.set_txn_start_micros(now_utc_micros());
+    let iso = session.default_txn_isolation();
+    session.set_txn_isolation(iso);
     Ok(())
 }
 
@@ -66,6 +68,7 @@ pub(crate) fn commit_transaction(
     session.set_current_tx(None);
     session.reset_changes();
     session.clear_txn_start_micros();
+    session.clear_txn_isolation();
     if let Some(epoch) = session.end_transaction_epoch() {
         let db_read = db.read();
         db_read.release_locks(LockOwner::new(session.id(), epoch));
@@ -84,6 +87,7 @@ pub(crate) fn rollback_transaction(
     let changes = session.take_changes();
     session.set_current_tx(None);
     session.clear_txn_start_micros();
+    session.clear_txn_isolation();
     {
         let mut db = db.write();
         db.rollback_transaction_changes(&changes, txid)

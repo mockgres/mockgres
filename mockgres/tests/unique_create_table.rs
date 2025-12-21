@@ -17,10 +17,9 @@ async fn unique_constraints_from_create_table() {
         .batch_execute("insert into t_unique_col values (10, 2, 2)")
         .await
         .expect_err("duplicate unique column insert");
-    assert!(
-        err.to_string()
-            .contains("duplicate key value violates unique constraint"),
-        "unexpected error: {err}"
+    common::assert_db_error_contains(
+        &err,
+        "duplicate key value violates unique constraint",
     );
     ctx.client
         .batch_execute("insert into t_unique_col values (NULL, 3, 3)")
@@ -46,10 +45,9 @@ async fn unique_constraints_from_create_table() {
         .batch_execute("insert into t_unique_table values (2, 5, 6)")
         .await
         .expect_err("duplicate unique table insert");
-    assert!(
-        err.to_string()
-            .contains("duplicate key value violates unique constraint"),
-        "unexpected error: {err}"
+    common::assert_db_error_contains(
+        &err,
+        "duplicate key value violates unique constraint",
     );
     ctx.client
         .batch_execute("insert into t_unique_table values (3, 5, NULL)")

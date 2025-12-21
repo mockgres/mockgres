@@ -26,10 +26,7 @@ async fn create_and_drop_index_noop() {
         .execute("create index idx_things_qty on things (qty)", &[])
         .await
         .expect_err("duplicate index create should fail");
-    assert!(
-        dup_err.to_string().contains("already exists"),
-        "unexpected duplicate error: {dup_err}"
-    );
+    common::assert_db_error_contains(&dup_err, "already exists");
 
     ctx.client
         .execute(
@@ -49,10 +46,7 @@ async fn create_and_drop_index_noop() {
         .execute("drop index idx_things_qty", &[])
         .await
         .expect_err("second drop should error");
-    assert!(
-        drop_err.to_string().contains("does not exist"),
-        "unexpected drop error: {drop_err}"
-    );
+    common::assert_db_error_contains(&drop_err, "does not exist");
 
     ctx.client
         .execute("drop index if exists idx_things_qty", &[])
@@ -64,10 +58,7 @@ async fn create_and_drop_index_noop() {
         .execute("create index idx_things_missing on things (missing)", &[])
         .await
         .expect_err("unknown column should fail");
-    assert!(
-        bad_col.to_string().contains("unknown column"),
-        "unexpected missing column error: {bad_col}"
-    );
+    common::assert_db_error_contains(&bad_col, "unknown column");
 
     let _ = ctx.shutdown.send(());
 }

@@ -1,4 +1,3 @@
-// tests/order_by_nulls_default.rs
 mod common;
 
 use tokio_postgres::Row;

@@ -140,10 +140,7 @@ async fn restrict_fk_blocks_cascade() {
         .execute("delete from parents where id = 1", &[])
         .await
         .expect_err("restrict child should block delete");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     ctx.client
         .execute("delete from restrict_child where id = 20", &[])

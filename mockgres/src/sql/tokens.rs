@@ -73,12 +73,15 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "bigint" | "int8" => DataType::Int8,
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
+            "json" => DataType::Json,
             "bool" | "boolean" => DataType::Bool,
+            "oid" => DataType::Int8,
             "date" => DataType::Date,
             "timestamp" => DataType::Timestamp,
             "timestamptz" => DataType::Timestamptz,
             "bytea" => DataType::Bytea,
             "interval" => DataType::Interval,
+            "regtype" => DataType::Text,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
     };

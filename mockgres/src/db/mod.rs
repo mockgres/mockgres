@@ -17,6 +17,7 @@ mod dml_insert;
 mod dml_update;
 mod locks;
 mod mvcc;
+mod pg_type;
 mod schema_ddl;
 mod visibility;
 
@@ -45,6 +46,18 @@ pub struct Db {
     pub tables: HashMap<TableId, Table>,
     pub next_rel_id: u32,
     locks: Arc<LockRegistry>,
+}
+
+impl Clone for Db {
+    fn clone(&self) -> Self {
+        Self {
+            catalog: self.catalog.clone(),
+            tables: self.tables.clone(),
+            next_rel_id: self.next_rel_id,
+            // each clone gets a fresh LockRegistry
+            locks: Arc::new(LockRegistry::new()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,9 +141,17 @@ impl Db {
             default: None,
             identity: None,
         };
+        let table_empty = self
+            .tables
+            .get(&table_id)
+            .map(|t| t.rows_by_key.is_empty())
+            .unwrap_or(true);
         let append_value = if let Some(expr) = &default_expr {
             eval_column_default(expr, &temp_column, new_col_index, &meta_snapshot, ctx)?
         } else if nullable {
+            Value::Null
+        } else if table_empty {
+            // safe because there are no rows to backfill.
             Value::Null
         } else {
             return Err(sql_err(
@@ -173,7 +194,7 @@ impl Db {
         column: &str,
         if_exists: bool,
     ) -> anyhow::Result<()> {
-        let (table_id, drop_idx) = {
+        let (table_id, drop_idx, dropped_index_names, old_column_count) = {
             let meta = self
                 .catalog
                 .get_table(schema, name)
@@ -185,11 +206,8 @@ impl Db {
                     return Err(sql_err("42703", format!("column {column} does not exist")));
                 }
             };
-            if idx != meta.columns.len() - 1 {
-                return Err(sql_err(
-                    "0A000",
-                    format!("can only drop the last column ({column} is at position {idx})"),
-                ));
+            if meta.columns.len() <= 1 {
+                return Err(sql_err("0A000", "cannot drop the only column"));
             }
             if meta
                 .primary_key
@@ -202,7 +220,13 @@ impl Db {
                     format!("cannot drop primary key column {column}"),
                 ));
             }
-            (meta.id, idx)
+            let dropped_index_names: Vec<String> = meta
+                .indexes
+                .iter()
+                .filter(|index| index.columns.contains(&idx))
+                .map(|index| index.name.clone())
+                .collect();
+            (meta.id, idx, dropped_index_names, meta.columns.len())
         };
         {
             let meta = self
@@ -233,16 +257,25 @@ impl Db {
         if let Some(table) = self.tables.get_mut(&table_id) {
             for versions in table.rows_by_key.values_mut() {
                 for version in versions.iter_mut() {
-                    if version.data.len() != drop_idx + 1 {
+                    if version.data.len() != old_column_count {
                         return Err(sql_err(
                             "XX000",
                             format!("row length mismatch while dropping column {column}"),
                         ));
                     }
-                    version.data.pop();
+                    version.data.remove(drop_idx);
                 }
             }
-            table.identities.pop();
+            if table.identities.len() != old_column_count {
+                return Err(sql_err(
+                    "XX000",
+                    format!("row length mismatch while dropping column {column}"),
+                ));
+            }
+            table.identities.remove(drop_idx);
+            for index_name in &dropped_index_names {
+                table.unique_maps.remove(index_name);
+            }
         } else {
             return Err(sql_err(
                 "XX000",
@@ -252,11 +285,53 @@ impl Db {
         if self.catalog.schema_entry(schema).is_none() {
             return Err(sql_err("3F000", format!("no such schema {schema}")));
         }
+
+        for inbound_fk in &inbound {
+            if let Some(child_meta) = self.catalog.get_table_mut_by_id(&inbound_fk.table_id) {
+                for fk in &mut child_meta.foreign_keys {
+                    if fk.name != inbound_fk.fk.name {
+                        continue;
+                    }
+                    for col in fk.referenced_columns.iter_mut() {
+                        if *col > drop_idx {
+                            *col -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
         let table_meta = self
             .catalog
             .table_meta_mut(schema, name)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
-        table_meta.columns.pop();
+        table_meta.columns.remove(drop_idx);
+        if let Some(pk) = table_meta.primary_key.as_mut() {
+            for col in pk.columns.iter_mut() {
+                if *col > drop_idx {
+                    *col -= 1;
+                }
+            }
+        }
+        for fk in &mut table_meta.foreign_keys {
+            for col in fk.local_columns.iter_mut() {
+                if *col > drop_idx {
+                    *col -= 1;
+                }
+            }
+        }
+        for index in &mut table_meta.indexes {
+            for col in index.columns.iter_mut() {
+                if *col > drop_idx {
+                    *col -= 1;
+                }
+            }
+        }
+        if !dropped_index_names.is_empty() {
+            table_meta
+                .indexes
+                .retain(|index| !dropped_index_names.contains(&index.name));
+        }
         Ok(())
     }
 

@@ -22,10 +22,7 @@ async fn alter_table_add_and_drop_unique_constraints() {
         .batch_execute("insert into u values (2, 10, 2)")
         .await
         .expect_err("duplicate on a");
-    assert!(
-        err.to_string().contains("unique constraint u_a_key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "unique constraint u_a_key");
 
     ctx.client
         .batch_execute("alter table u drop constraint u_a_key")
@@ -49,10 +46,7 @@ async fn alter_table_add_and_drop_unique_constraints() {
         .batch_execute("insert into u values (4, 20, 3)")
         .await
         .expect_err("duplicate on (a,b)");
-    assert!(
-        err.to_string().contains("unique constraint uniq_ab"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "unique constraint uniq_ab");
 
     ctx.client
         .batch_execute("alter table u drop constraint uniq_ab")

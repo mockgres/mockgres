@@ -68,7 +68,7 @@ async fn run_server(
                     Ok((socket, _peer)) => {
                         let h2 = handler.clone();
                         tokio::spawn(async move {
-                            let _ = pgwire::tokio::process_socket(socket, None, h2).await;
+                            let _ = mockgres::process_socket_with_terminate(socket, None, h2).await;
                         });
                     }
                     Err(e) => {
@@ -109,4 +109,13 @@ pub async fn simple_first_cell(client: &Client, sql: &str) -> String {
         })
         .expect("expected one row");
     row.get(0).expect("one column").to_string()
+}
+
+pub fn assert_db_error_contains(err: &tokio_postgres::Error, needle: &str) {
+    let db_err = err.as_db_error().expect("expected db error");
+    assert!(
+        db_err.message().contains(needle),
+        "unexpected error: {:?}",
+        db_err.message()
+    );
 }

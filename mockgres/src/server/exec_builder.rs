@@ -47,6 +47,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableDropConstraint { .. } => "ALTER TABLE",
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
@@ -64,6 +65,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         },
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
+        Plan::CallBuiltin { .. } => "SELECT",
         Plan::InsertValues { .. } => "INSERT",
         Plan::Update { .. } => "UPDATE",
         Plan::Delete { .. } => "DELETE",
@@ -100,6 +102,7 @@ pub fn build_executor(
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableDropConstraint { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
@@ -204,6 +207,7 @@ pub fn build_executor(
                 None,
             ))
         }
+        Plan::CallBuiltin { .. } => Err(fe("builtin execution not supported here")),
         Plan::UnboundSeqScan { .. } | Plan::UnboundJoin { .. } => {
             Err(fe("unbound plan; call binder first"))
         }

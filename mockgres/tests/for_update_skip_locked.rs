@@ -124,10 +124,7 @@ async fn update_conflicts_with_locked_row() {
         .execute("update accounts set balance = 5 where id = 1", &[])
         .await
         .expect_err("update should fail while locked");
-    assert!(
-        err.to_string().contains("lock"),
-        "expected lock error, got {err}"
-    );
+    common::assert_db_error_contains(&err, "lock");
 
     ctx.client
         .execute("rollback", &[])
@@ -291,10 +288,9 @@ async fn join_with_for_update_not_supported() {
         .query("select parents.id from parents, children for update", &[])
         .await
         .expect_err("joins with FOR UPDATE should be rejected");
-    assert!(
-        err.to_string()
-            .contains("FOR UPDATE is only supported for single-table SELECT"),
-        "expected not supported error, got {err}"
+    common::assert_db_error_contains(
+        &err,
+        "FOR UPDATE is only supported for single-table SELECT",
     );
 
     let _ = ctx.shutdown.send(());

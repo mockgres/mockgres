@@ -11,7 +11,7 @@ async fn insert_int_into_float8_and_mixed_types() {
         .await
         .expect("create");
 
-    // extended protocol (execute) but insert must use constants in your engine
+    // extended protocol (execute) but insert must use constants
     ctx.client
         .execute("insert into t values (1),(2),(3.5)", &[])
         .await
@@ -47,7 +47,11 @@ async fn reject_float_into_int4_on_insert() {
         .expect_err("should error");
 
     // keep assertion loose: just ensure we got a db error
-    let msg = err.to_string().to_lowercase();
+    let msg = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_lowercase();
     assert!(msg.contains("type") && msg.contains("mismatch"));
 
     let _ = ctx.shutdown.send(());

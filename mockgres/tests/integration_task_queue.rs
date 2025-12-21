@@ -101,7 +101,7 @@ async fn test_task_queue_mvp() {
         .get(0);
     assert_eq!(processing, 3);
 
-    // long-running lock on a pending task
+    // long running lock on a pending task
     let mut locker = ctx.new_client().await;
     let locker_txn = locker.transaction().await.unwrap();
     let locked_row = locker_txn
@@ -113,7 +113,7 @@ async fn test_task_queue_mvp() {
         .unwrap();
     let locked_id: i32 = locked_row.get(0);
 
-    // worker1 should not see locked_id
+    // worker1 should not see locked id
     let probe_txn = w1.transaction().await.unwrap();
     let probe = probe_txn
         .query_one(
@@ -151,7 +151,7 @@ async fn test_task_queue_mvp() {
     assert!(statuses.contains(&"pending".to_string()));
     assert!(statuses.contains(&"processing".to_string()));
 
-    // re-pull failed task (t3)
+    // try again failed task (t3)
     let repull = c
         .query_one(
             "select id from tasks where status = 'pending' and id = $1 for update skip locked",

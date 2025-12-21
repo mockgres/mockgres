@@ -259,6 +259,11 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                         columns,
                     })
                 }
+                pg_query::protobuf::ConstrType::ConstrForeign => {
+                    let fk = parse_foreign_key_constraint(cons, None)?
+                        .ok_or_else(|| fe("FOREIGN KEY requires definition"))?;
+                    Ok(Plan::AlterTableAddConstraintForeignKey { table, fk })
+                }
                 _ => Err(fe("unsupported ALTER TABLE constraint")),
             }
         }
@@ -400,10 +405,15 @@ pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {
 
 pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let name_lower = set.name.to_ascii_lowercase();
-    let normalized = name_lower.replace(' ', "");
+    let normalized = name_lower.replace(' ', "_");
     let supported = matches!(
         normalized.as_str(),
-        "client_min_messages" | "search_path" | "timezone"
+        "client_min_messages"
+            | "search_path"
+            | "timezone"
+            | "time_zone"
+            | "transaction_isolation"
+            | "default_transaction_isolation"
     );
     if !supported {
         return Err(fe_code("0A000", format!("SET {} not supported", set.name)));
@@ -421,10 +431,9 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
         }
         VariableSetKind::Undefined => return Err(fe("bad SET kind")),
     };
-    let plan_name = if normalized == "timezone" {
-        "timezone".to_string()
-    } else {
-        name_lower
+    let plan_name = match normalized.as_str() {
+        "time_zone" => "timezone".to_string(),
+        other => other.to_string(),
     };
     Ok(Plan::SetVariable {
         name: plan_name,

@@ -14,7 +14,8 @@ impl Db {
                 ))
             };
         }
-        self.catalog.ensure_schema(name);
+        let id = self.catalog.ensure_schema(name);
+        self.insert_pg_namespace_row(id, name);
         Ok(())
     }
 
@@ -53,6 +54,7 @@ impl Db {
             self.drop_table(name, &table_name, false, cascade)?;
         }
         self.catalog.drop_schema_entry(schema_id);
+        self.remove_pg_namespace_row(schema_id);
         Ok(())
     }
 
@@ -107,6 +109,7 @@ impl Db {
                 return Err(sql_err("3F000", format!("no such schema {schema}")));
             }
         };
+        self.remove_pg_class_row(schema_id, name);
         match self.catalog.remove_table(schema_id, name) {
             Some(meta) => {
                 if self.tables.remove(&meta.id).is_none() {

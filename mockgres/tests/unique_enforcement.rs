@@ -21,10 +21,7 @@ async fn unique_index_blocks_duplicates_and_allows_nulls() {
         .batch_execute("insert into u values (2, 10, 2)")
         .await
         .expect_err("dup");
-    assert!(
-        err.to_string().contains("unique constraint ux_a"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "unique constraint ux_a");
 
     ctx.client
         .batch_execute("insert into u values (3, NULL, 3)")
@@ -40,10 +37,7 @@ async fn unique_index_blocks_duplicates_and_allows_nulls() {
         .batch_execute("update u set a = 10 where id = 3")
         .await
         .expect_err("upd dup");
-    assert!(
-        err.to_string().contains("unique constraint ux_a"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "unique constraint ux_a");
 
     ctx.client.batch_execute("drop index ux_a").await.unwrap();
     ctx.client
@@ -60,10 +54,7 @@ async fn unique_index_blocks_duplicates_and_allows_nulls() {
         .batch_execute("insert into u values (6, 20, 5)")
         .await
         .expect_err("dup ab");
-    assert!(
-        err.to_string().contains("unique constraint ux_ab"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "unique constraint ux_ab");
 
     ctx.client
         .batch_execute("insert into u values (7, 20, NULL)")

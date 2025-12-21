@@ -50,10 +50,7 @@ async fn insert_with_column_list_and_defaults() {
         .execute("insert into gadgets (id) values (3)", &[])
         .await
         .expect_err("should fail missing NOT NULL column");
-    assert!(
-        err.to_string().contains("not null"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "not null");
 
     let _ = ctx.shutdown.send(());
 }

@@ -65,7 +65,7 @@ async fn update_rows_with_filters() {
         .execute("update t set active = 5 where id = 1", &[])
         .await
         .expect_err("type mismatch");
-    assert!(err.to_string().contains("type mismatch"));
+    common::assert_db_error_contains(&err, "type mismatch");
 
     let existing = ctx
         .client
@@ -83,7 +83,7 @@ async fn update_rows_with_filters() {
         .execute("update t set id = 2 where id = 10", &[])
         .await
         .expect_err("pk collision");
-    assert!(err.to_string().contains("duplicate key"));
+    common::assert_db_error_contains(&err, "duplicate key");
 
     let _ = ctx.shutdown.send(());
 }

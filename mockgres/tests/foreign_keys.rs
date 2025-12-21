@@ -21,10 +21,7 @@ async fn insert_requires_existing_parent() {
         .execute("insert into children values (1, 42)", &[])
         .await
         .expect_err("insert without parent");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     ctx.client
         .execute("insert into parents values (42)", &[])
@@ -67,10 +64,7 @@ async fn delete_parent_blocked_by_child() {
         .execute("delete from parent where id = 1", &[])
         .await
         .expect_err("delete parent with child");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     ctx.client
         .execute("delete from child where parent_id = 1", &[])
@@ -113,10 +107,7 @@ async fn drop_parent_blocked_when_child_exists() {
         .execute("drop table p", &[])
         .await
         .expect_err("drop parent");
-    assert!(
-        err.to_string().contains("referenced"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "referenced");
 
     let _ = ctx.shutdown.send(());
 }

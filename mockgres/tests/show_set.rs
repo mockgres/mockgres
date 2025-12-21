@@ -112,3 +112,80 @@ async fn show_and_set_commands() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_standard_conforming_strings() {
+    let ctx = common::start().await;
+    let rows = ctx
+        .client
+        .simple_query("show standard_conforming_strings")
+        .await
+        .expect("show standard_conforming_strings");
+    let val = rows
+        .iter()
+        .find_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => row.get(0).map(|s| s.to_string()),
+            _ => None,
+        })
+        .expect("row");
+    assert_eq!(val.to_ascii_lowercase(), "on");
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn show_and_set_transaction_isolation() {
+    let ctx = common::start().await;
+
+    let iso = ctx
+        .client
+        .simple_query("show transaction_isolation")
+        .await
+        .expect("show transaction_isolation");
+    let val = iso
+        .iter()
+        .find_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => row.get(0).map(|s| s.to_string()),
+            _ => None,
+        })
+        .expect("isolation row");
+    assert_eq!(val, "read committed");
+
+    ctx.client
+        .execute("set default_transaction_isolation = 'read committed'", &[])
+        .await
+        .expect("set default_transaction_isolation");
+
+    let err = ctx
+        .client
+        .execute("set transaction_isolation = 'serializable'", &[])
+        .await
+        .expect_err("unsupported isolation should error");
+    let message = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_ascii_lowercase();
+    assert!(message.contains("not supported"), "unexpected error: {message:?}");
+
+    ctx.client.execute("begin", &[]).await.expect("begin");
+    ctx.client
+        .execute("set transaction_isolation = 'read committed'", &[])
+        .await
+        .expect("set tx isolation");
+    let iso = ctx
+        .client
+        .simple_query("show transaction_isolation")
+        .await
+        .expect("show tx iso in txn");
+    let val = iso
+        .iter()
+        .find_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => row.get(0).map(|s| s.to_string()),
+            _ => None,
+        })
+        .expect("isolation row in txn");
+    assert_eq!(val, "read committed");
+    ctx.client.execute("commit", &[]).await.expect("commit");
+
+    let _ = ctx.shutdown.send(());
+}

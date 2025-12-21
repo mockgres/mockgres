@@ -22,10 +22,7 @@ async fn composite_primary_key_enforces_uniqueness() {
         .execute("insert into pk_demo values (1, 2)", &[])
         .await
         .expect_err("duplicate composite key");
-    assert!(
-        err.to_string().contains("duplicate key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "duplicate key");
 
     let _ = ctx.shutdown.send(());
 }
@@ -54,10 +51,7 @@ async fn composite_foreign_key_requires_parent() {
         .execute("insert into children values (1, 1)", &[])
         .await
         .expect_err("insert without parent");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     ctx.client
         .execute("insert into parents values (1, 1)", &[])
@@ -92,10 +86,7 @@ async fn update_primary_key_collision_rejected() {
         .execute("update pk_updates set a = 1, b = 1 where a = 2", &[])
         .await
         .expect_err("update into duplicate key");
-    assert!(
-        err.to_string().contains("duplicate key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "duplicate key");
 
     let _ = ctx.shutdown.send(());
 }
@@ -132,10 +123,7 @@ async fn update_foreign_key_requires_existing_parent() {
         .execute("update updates_child set x = 2 where id = 1", &[])
         .await
         .expect_err("update to missing parent");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     let _ = ctx.shutdown.send(());
 }
@@ -172,10 +160,7 @@ async fn delete_parent_blocked_by_child_composite_fk() {
         .execute("delete from del_parent where a = 1 and b = 1", &[])
         .await
         .expect_err("delete referenced parent");
-    assert!(
-        err.to_string().contains("foreign key"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "foreign key");
 
     let _ = ctx.shutdown.send(());
 }

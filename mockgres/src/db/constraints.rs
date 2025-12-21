@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::{Catalog, ForeignKeyMeta, PrimaryKeyMeta, TableId, TableMeta};
 use crate::engine::{ReferentialAction, Value};
-use crate::storage::{RowId, RowKey, Table};
+use crate::storage::{Row, RowId, RowKey, Table};
 use crate::txn::VisibilityContext;
 
 use super::sql_err;
@@ -29,6 +29,7 @@ pub(crate) struct DeleteTarget {
     pub(crate) meta: TableMeta,
     pub(crate) row_key: RowKey,
     pub(crate) row_id: RowId,
+    pub(crate) row: Row,
     pub(crate) pk_key: Option<RowKey>,
     pub(crate) fk_keys: Vec<Option<Vec<Value>>>,
     pub(crate) unique_keys: Vec<(String, Option<Vec<Value>>)>,
@@ -41,11 +42,11 @@ pub(crate) struct CascadeFrame {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ResolvedOnConflictTarget {
-    /// ON CONFLICT DO NOTHING with no explicit target
+    // ON CONFLICT DO NOTHING with no explicit target
     AnyConstraint,
-    /// ON CONFLICT (col1, col2, ...)
+    // ON CONFLICT (col1, col2, ...)
     UniqueIndex { index_name: String },
-    /// ON CONFLICT ON CONSTRAINT constraint_name
+    // ON CONFLICT ON CONSTRAINT constraint_name
     Constraint { index_name: String },
 }
 
@@ -288,22 +289,14 @@ pub(crate) fn ensure_parent_exists(
                 ),
             )
         })?;
-    let Some(pk_map) = parent_table.pk_map.as_ref() else {
-        return Err(sql_err(
-            "42830",
-            format!(
-                "referenced table {}.{} must have a primary key",
-                fk.referenced_schema.as_str(),
-                fk.referenced_table_name
-            ),
-        ));
-    };
-    let key = RowKey::Primary(parent_key.to_vec());
-    if let Some(row_id) = pk_map.get(&key) {
-        if let Some(versions) = parent_table.rows_by_key.get(&RowKey::RowId(*row_id)) {
-            if versions.iter().rev().any(|version| version.xmax.is_none()) {
-                return Ok(());
-            }
+    for versions in parent_table.rows_by_key.values() {
+        if versions
+            .iter()
+            .rev()
+            .filter(|version| version.xmax.is_none())
+            .any(|version| referenced_key_matches(&version.data, fk, parent_key))
+        {
+            return Ok(());
         }
     }
     Err(sql_err(
@@ -317,6 +310,31 @@ pub(crate) fn ensure_parent_exists(
             fk.referenced_table_name
         ),
     ))
+}
+
+pub(crate) fn build_referenced_parent_key(
+    row: &[Value],
+    fk: &ForeignKeyMeta,
+) -> Option<Vec<Value>> {
+    let mut out = Vec::with_capacity(fk.referenced_columns.len());
+    for idx in &fk.referenced_columns {
+        let value = row.get(*idx).cloned().unwrap_or(Value::Null);
+        if matches!(value, Value::Null) {
+            return None;
+        }
+        out.push(value);
+    }
+    Some(out)
+}
+
+fn referenced_key_matches(row: &[Value], fk: &ForeignKeyMeta, key: &[Value]) -> bool {
+    if fk.referenced_columns.len() != key.len() {
+        return false;
+    }
+    fk.referenced_columns
+        .iter()
+        .zip(key.iter())
+        .all(|(idx, expected)| row.get(*idx).is_some_and(|v| v == expected))
 }
 
 pub(crate) fn update_pk_map_for_row(
@@ -405,14 +423,16 @@ pub(crate) fn ensure_no_inbound_refs(
     table: &str,
     parent_id: TableId,
     inbound: &[InboundForeignKey],
-    parent_key: &[Value],
+    parent_row: &[Value],
     visibility: &VisibilityContext,
 ) -> anyhow::Result<()> {
-    let key_values = parent_key.to_vec();
     for fk in inbound {
         if fk.fk.on_delete != ReferentialAction::Restrict {
             continue;
         }
+        let Some(key_values) = build_referenced_parent_key(parent_row, &fk.fk) else {
+            continue;
+        };
         let child = match tables.get(&fk.table_id) {
             Some(t) => t,
             None => {
@@ -422,7 +442,7 @@ pub(crate) fn ensure_no_inbound_refs(
                 ));
             }
         };
-        let map_key = (parent_id, key_values.clone());
+        let map_key = (parent_id, key_values);
         if let Some(rows) = child.fk_rev.get(&map_key) {
             if rows
                 .iter()

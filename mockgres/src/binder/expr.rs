@@ -318,6 +318,14 @@ fn bind_scalar_expr_inner(
                     };
                     ScalarExpr::Literal(Value::Text(name.to_string()))
                 }
+                ScalarFunc::Version => {
+                    if !bound_args.is_empty() {
+                        return Err(fe("version() takes no arguments"));
+                    }
+                    ScalarExpr::Literal(
+                        Value::Text(crate::server::mapping::server_version_string()),
+                    )
+                }
                 _ => ScalarExpr::Func {
                     func: *func,
                     args: bound_args,
@@ -498,6 +506,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             | ScalarFunc::CurrentSchema
             | ScalarFunc::CurrentDatabase => Some(DataType::Text),
             ScalarFunc::CurrentSchemas => Some(DataType::Text),
+            ScalarFunc::PgTableIsVisible => Some(DataType::Bool),
+            ScalarFunc::Version => Some(DataType::Text),
             ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::Now
             | ScalarFunc::CurrentTimestamp

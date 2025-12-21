@@ -2,7 +2,7 @@ use super::{DataType, Field, IdentitySpec, Schema, Value};
 use crate::catalog::{QualifiedName, SchemaName, TableId};
 use std::fmt;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
     Neq,
@@ -80,7 +80,6 @@ pub enum ScalarUnaryOp {
     Negate,
 }
 
-/// Supported scalar functions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarFunc {
     Coalesce,
@@ -101,9 +100,10 @@ pub enum ScalarFunc {
     Log, // base determined by args (1 arg -> base10, 2 args -> base arg0)
     Greatest,
     ExtractEpoch,
+    Version,
+    PgTableIsVisible,
 }
 
-/// Logical aggregate function identifiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggFunc {
     Count,
@@ -113,7 +113,6 @@ pub enum AggFunc {
     Max,
 }
 
-/// Planner representation of an aggregate invocation.
 #[derive(Clone, Debug)]
 pub struct AggCall {
     pub func: AggFunc,
@@ -297,7 +296,6 @@ pub enum Plan {
         exprs: Vec<(ScalarExpr, String)>,
         schema: Schema,
     },
-    /// Hash-based aggregate node (group keys first, followed by aggregate outputs).
     Aggregate {
         input: Box<Plan>,
         group_exprs: Vec<(ScalarExpr, String)>,
@@ -341,6 +339,10 @@ pub enum Plan {
         table: ObjName,
         name: Option<String>,
         columns: Vec<String>,
+    },
+    AlterTableAddConstraintForeignKey {
+        table: ObjName,
+        fk: ForeignKeySpec,
     },
     AlterTableDropConstraint {
         table: ObjName,
@@ -395,6 +397,11 @@ pub enum Plan {
     SetVariable {
         name: String,
         value: Option<Vec<String>>,
+    },
+    CallBuiltin {
+        name: String,
+        args: Vec<ScalarExpr>,
+        schema: Schema,
     },
     InsertValues {
         table: ObjName,
@@ -461,6 +468,7 @@ impl Plan {
             | Plan::CountRows { schema, .. }
             | Plan::Join { schema, .. } => schema,
             Plan::ShowVariable { schema, .. } => schema,
+            Plan::CallBuiltin { schema, .. } => schema,
             Plan::Filter { input, .. } | Plan::Order { input, .. } | Plan::Limit { input, .. } => {
                 input.schema()
             }
@@ -484,6 +492,7 @@ impl Plan {
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
             | Plan::AlterTableAddConstraintUnique { .. }
+            | Plan::AlterTableAddConstraintForeignKey { .. }
             | Plan::AlterTableDropConstraint { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
@@ -509,11 +518,11 @@ impl Plan {
 
 #[derive(Clone, Debug)]
 pub enum OnConflictTarget {
-    /// ON CONFLICT DO NOTHING (no explicit target)
+    // ON CONFLICT DO NOTHING no target
     None,
-    /// ON CONFLICT (col1, col2, ...)
+    // ON CONFLICT col1, col2, etc
     Columns(Vec<String>),
-    /// ON CONFLICT ON CONSTRAINT constraint_name
+    // ON CONFLICT ON CONSTRAINT constraint_name
     Constraint(String),
 }
 

@@ -65,10 +65,12 @@ async fn commit_persists_and_errors_on_misuse() {
 
     // COMMIT without BEGIN should error.
     let err = ctx.client.execute("commit", &[]).await.expect_err("no txn");
-    assert!(
-        err.to_string().to_lowercase().contains("no transaction"),
-        "unexpected commit error: {err:?}"
-    );
+    let msg = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_lowercase();
+    assert!(msg.contains("no transaction"), "unexpected commit error: {msg:?}");
 
     ctx.client.execute("begin", &[]).await.expect("begin 2");
     let err = ctx
@@ -76,11 +78,14 @@ async fn commit_persists_and_errors_on_misuse() {
         .execute("begin", &[])
         .await
         .expect_err("double begin");
+    let msg = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_lowercase();
     assert!(
-        err.to_string()
-            .to_lowercase()
-            .contains("already in progress"),
-        "unexpected begin error: {err:?}"
+        msg.contains("already in progress"),
+        "unexpected begin error: {msg:?}"
     );
     ctx.client
         .execute("rollback", &[])

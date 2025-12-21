@@ -1,7 +1,8 @@
 use std::fmt::Debug;
+use std::io;
 use std::sync::Arc;
 
-use futures::Sink;
+use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::RwLock;
 use pgwire::api::portal::Format;
 use pgwire::api::{
@@ -13,14 +14,19 @@ use pgwire::api::{
         DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse,
         Response,
     },
+    PgWireConnectionState,
     store::PortalStore,
 };
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::startup::SecretKey;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, sleep};
 
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
+use crate::engine::exec::ValuesExec;
 use crate::engine::{EvalContext, Plan, Value, fe, fe_code, to_pgwire_stream};
 use crate::session::{Session, SessionManager, now_utc_micros};
 use crate::sql::Planner;
@@ -31,12 +37,15 @@ use super::describe::plan_fields;
 use super::exec_builder::{build_executor, command_tag};
 use super::params::{build_params_for_portal, plan_parameter_types};
 
+const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
+
 #[derive(Clone)]
 pub struct Mockgres {
     pub db: Arc<RwLock<Db>>,
     session_manager: Arc<SessionManager>,
     pub txn_manager: Arc<TransactionManager>,
     config: ServerConfig,
+    base_snapshot: Arc<RwLock<Option<Arc<RwLock<Db>>>>>,
 }
 
 impl Mockgres {
@@ -50,6 +59,7 @@ impl Mockgres {
             session_manager: Arc::new(SessionManager::new()),
             txn_manager: Arc::new(TransactionManager::new()),
             config,
+            base_snapshot: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -67,7 +77,7 @@ impl Mockgres {
             let (socket, _peer) = listener.accept().await?;
             let h = self.clone();
             tokio::spawn(async move {
-                let _ = pgwire::tokio::process_socket(socket, None, h).await;
+                let _ = process_socket_with_terminate(socket, None, h).await;
             });
         }
     }
@@ -115,26 +125,60 @@ impl Default for Mockgres {
 
 #[async_trait::async_trait]
 impl SimpleQueryHandler for Mockgres {
-    async fn do_query<'a, C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         match Planner::plan_sql(query) {
-            Ok(lp0) => {
+            Ok(plan) => {
                 let session = self.session_for_client(client)?;
+                if let Plan::CallBuiltin { name, schema, .. } = &plan {
+                    if name == "mockgres_freeze" {
+                        {
+                            let mut guard = self.base_snapshot.write();
+                            if guard.is_none() {
+                                let cloned = {
+                                    let db_read = self.db.read();
+                                    db_read.clone()
+                                };
+                                *guard = Some(Arc::new(RwLock::new(cloned)));
+                            }
+                        }
+                        let row = vec![Value::Bool(true)];
+                        let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+                        let eval_ctx = EvalContext::for_statement(&session);
+                        let (fields, rows) =
+                            to_pgwire_stream(Box::new(exec), FieldFormat::Text, eval_ctx).await?;
+                        let mut qr = QueryResponse::new(fields, rows);
+                        qr.set_command_tag("SELECT");
+                        return Ok(vec![Response::Query(qr)]);
+                    }
+                    if name == "mockgres_reset" {
+                        session.set_db_override(None);
+                        let row = vec![Value::Bool(true)];
+                        let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+                        let eval_ctx = EvalContext::for_statement(&session);
+                        let (fields, rows) =
+                            to_pgwire_stream(Box::new(exec), FieldFormat::Text, eval_ctx).await?;
+                        let mut qr = QueryResponse::new(fields, rows);
+                        qr.set_command_tag("SELECT");
+                        return Ok(vec![Response::Query(qr)]);
+                    }
+                }
+                let active_db = self.db_for_session(&session);
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
-                let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
+                let _stmt_guard = StatementEpochGuard::new(session.clone(), active_db.clone());
                 let snapshot_xid = self.capture_statement_snapshot(&session);
                 let eval_ctx = EvalContext::for_statement(&session);
                 // bind (names -> positions) using catalog
                 let bound = {
-                    let db_read = self.db.read();
-                    bind(&db_read, &session, lp0)?
+                    let db_read = active_db.read();
+                    bind(&db_read, &session, plan.clone())?
                 };
                 let (exec, tag, row_count) = build_executor(
-                    &self.db,
+                    &active_db,
                     &self.txn_manager,
                     &session,
                     snapshot_xid,
@@ -181,8 +225,9 @@ impl ExtendedQueryHandler for Mockgres {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = self.session_for_client(client)?;
+        let active_db = self.db_for_session(&session);
         let bound = {
-            let db = self.db.read();
+            let db = active_db.read();
             bind(&db, &session, target.statement.clone())?
         };
         let params = plan_parameter_types(&bound);
@@ -205,12 +250,12 @@ impl ExtendedQueryHandler for Mockgres {
         let fields = self.describe_plan(&session, &portal.statement.statement)?;
         Ok(DescribePortalResponse::new(fields))
     }
-    async fn do_query<'a, C>(
+    async fn do_query<C>(
         &self,
         client: &mut C,
         portal: &pgwire::api::portal::Portal<Self::Statement>,
         _max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -223,17 +268,52 @@ impl ExtendedQueryHandler for Mockgres {
         };
 
         let session = self.session_for_client(client)?;
-        let _stmt_guard = StatementEpochGuard::new(session.clone(), self.db.clone());
+        if let Plan::CallBuiltin { name, schema, .. } = &portal.statement.statement {
+            if name == "mockgres_freeze" {
+                {
+                    let mut guard = self.base_snapshot.write();
+                    if guard.is_none() {
+                        let cloned = {
+                            let db_read = self.db.read();
+                            db_read.clone()
+                        };
+                        *guard = Some(Arc::new(RwLock::new(cloned)));
+                    }
+                }
+
+                let row = vec![Value::Bool(true)];
+                let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+                let eval_ctx = EvalContext::for_statement(&session);
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), fmt, eval_ctx).await?;
+                let mut qr = QueryResponse::new(fields, rows);
+                qr.set_command_tag("SELECT");
+                return Ok(Response::Query(qr));
+            }
+
+            if name == "mockgres_reset" {
+                session.set_db_override(None);
+
+                let row = vec![Value::Bool(true)];
+                let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+                let eval_ctx = EvalContext::for_statement(&session);
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), fmt, eval_ctx).await?;
+                let mut qr = QueryResponse::new(fields, rows);
+                qr.set_command_tag("SELECT");
+                return Ok(Response::Query(qr));
+            }
+        }
+        let active_db = self.db_for_session(&session);
+        let _stmt_guard = StatementEpochGuard::new(session.clone(), active_db.clone());
         let snapshot_xid = self.capture_statement_snapshot(&session);
         let eval_ctx = EvalContext::for_statement(&session);
         let bound = {
-            let db = self.db.read();
+            let db = active_db.read();
             bind(&db, &session, portal.statement.statement.clone())?
         };
 
         let params = build_params_for_portal(&bound, portal, &eval_ctx.time_zone)?;
         let (exec, tag, row_count) = build_executor(
-            &self.db,
+            &active_db,
             &self.txn_manager,
             &session,
             snapshot_xid,
@@ -306,9 +386,31 @@ impl Drop for StatementEpochGuard {
 
 impl Mockgres {
     fn describe_plan(&self, session: &Session, plan: &Plan) -> PgWireResult<Vec<FieldInfo>> {
-        let db = self.db.read();
+        let active_db = self.db_for_session(session);
+        let db = active_db.read();
         let bound = bind(&db, session, plan.clone())?;
         Ok(plan_fields(&bound))
+    }
+
+    fn db_for_session(&self, session: &Session) -> Arc<RwLock<Db>> {
+        // 1. If this session already has its own copy, use that
+        if let Some(override_db) = session.db_override() {
+            return override_db;
+        }
+
+        // 2. If a frozen base exists, lazily clone it for this session
+        if let Some(base) = self.base_snapshot.read().as_ref() {
+            let cloned = {
+                let base_read = base.read();
+                base_read.clone()
+            };
+            let arc = Arc::new(RwLock::new(cloned));
+            session.set_db_override(Some(arc.clone()));
+            return arc;
+        }
+
+        // 3. Pre-freeze: use shared db
+        self.db.clone()
     }
 
     fn session_for_client<C>(&self, client: &C) -> PgWireResult<Arc<Session>>
@@ -349,11 +451,11 @@ impl Mockgres {
         snapshot
     }
 }
-
-/// Pgwire adapter: parse -> our `Plan`
-pub mod pgwire_parser {
+    pub mod pgwire_parser {
     use async_trait::async_trait;
     use pgwire::api::{ClientInfo, Type};
+    use pgwire::api::portal::Format;
+    use pgwire::api::results::FieldInfo;
     use pgwire::error::PgWireResult;
 
     use crate::engine::Plan;
@@ -369,12 +471,101 @@ pub mod pgwire_parser {
             &self,
             _client: &C,
             sql: &str,
-            _types: &[Type],
+            _types: &[Option<Type>],
         ) -> PgWireResult<Self::Statement>
         where
             C: ClientInfo + Unpin + Send + Sync,
         {
             Planner::plan_sql(sql)
         }
+
+        fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+            Ok(crate::server::params::plan_parameter_types(stmt))
+        }
+
+        fn get_result_schema(
+            &self,
+            stmt: &Self::Statement,
+            _column_format: Option<&Format>,
+        ) -> PgWireResult<Vec<FieldInfo>> {
+            Ok(crate::server::describe::plan_fields(stmt))
+        }
     }
+}
+
+pub async fn process_socket_with_terminate<H>(
+    tcp_socket: TcpStream,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    handlers: H,
+) -> Result<(), io::Error>
+where
+    H: PgWireServerHandlers,
+{
+    let startup_timeout = sleep(Duration::from_millis(STARTUP_TIMEOUT_MILLIS));
+    tokio::pin!(startup_timeout);
+
+    let socket = tokio::select! {
+        _ = &mut startup_timeout => {
+            return Ok(())
+        },
+        socket = negotiate_tls(tcp_socket, tls_acceptor) => {
+            socket?
+        }
+    };
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    let startup_handler = handlers.startup_handler();
+    let simple_query_handler = handlers.simple_query_handler();
+    let extended_query_handler = handlers.extended_query_handler();
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+
+    let socket = &mut socket;
+    loop {
+        let msg = if matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                msg = socket.next() => msg,
+            }
+        } else {
+            socket.next().await
+        };
+
+        match msg {
+            Some(Ok(PgWireFrontendMessage::Terminate(_))) => {
+                socket.close().await?;
+                break;
+            }
+            Some(Ok(msg)) => {
+                let is_extended_query = match socket.state() {
+                    PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+                    _ => msg.is_extended_query(),
+                };
+                if let Err(mut e) = process_message(
+                    msg,
+                    socket,
+                    startup_handler.clone(),
+                    simple_query_handler.clone(),
+                    extended_query_handler.clone(),
+                    copy_handler.clone(),
+                    cancel_handler.clone(),
+                )
+                .await
+                {
+                    error_handler.on_error(socket, &mut e);
+                    process_error(socket, e, is_extended_query).await?;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    Ok(())
 }

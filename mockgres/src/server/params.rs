@@ -54,7 +54,7 @@ pub fn build_params_for_portal(
             .statement
             .parameter_types
             .get(idx)
-            .and_then(map_pg_type_to_datatype);
+            .and_then(|ty| ty.as_ref().and_then(map_pg_type_to_datatype));
         let ty = ty_from_plan.or(ty_from_stmt);
         let val = decode_param_value(raw.as_ref().map(|b| b.as_ref()), fmt, ty, tz)?;
         values.push(val);
@@ -159,6 +159,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableDropConstraint { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
@@ -172,6 +173,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
+        | Plan::CallBuiltin { .. }
         | Plan::BeginTransaction
         | Plan::CommitTransaction
         | Plan::RollbackTransaction => {}
@@ -342,6 +344,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableDropConstraint { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
@@ -355,6 +358,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
+        | Plan::CallBuiltin { .. }
         | Plan::BeginTransaction
         | Plan::CommitTransaction
         | Plan::RollbackTransaction => {}
@@ -461,6 +465,7 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             Ok(Value::from_f64(v))
         }
         DataType::Text => Ok(Value::Text(s.to_string())),
+        DataType::Json => Ok(Value::Text(s.to_string())),
         DataType::Bool => {
             let lowered = s.to_ascii_lowercase();
             match lowered.as_str() {
@@ -520,6 +525,11 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgW
             Ok(Value::Bool(bytes[0] != 0))
         }
         DataType::Text => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
+            Ok(Value::Text(s.to_string()))
+        }
+        DataType::Json => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))

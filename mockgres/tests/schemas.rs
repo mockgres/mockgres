@@ -157,10 +157,7 @@ async fn cross_schema_fk_resolves_via_search_path() {
         .execute("insert into children.c values (2)", &[])
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("violates foreign key"),
-        "expected FK enforcement error, got {err}"
-    );
+    common::assert_db_error_contains(&err, "violates foreign key");
     let _ = ctx.shutdown.send(());
 }
 
@@ -174,7 +171,7 @@ async fn drop_schema_restrict_and_cascade() {
         .unwrap();
 
     let err = ctx.client.execute("drop schema ds", &[]).await.unwrap_err();
-    assert!(err.to_string().contains("not empty"));
+    common::assert_db_error_contains(&err, "not empty");
 
     ctx.client
         .execute("drop schema ds cascade", &[])

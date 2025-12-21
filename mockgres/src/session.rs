@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use dashmap::DashMap;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use time::OffsetDateTime;
 
 use crate::catalog::{SchemaId, TableId};
+use crate::db::Db;
 use crate::storage::RowKey;
 use crate::txn::TxId;
 
@@ -29,6 +30,31 @@ pub struct TxnChanges {
 pub enum SessionTimeZone {
     Utc,
     FixedOffset { seconds: i32, display: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionIsolation {
+    ReadCommitted,
+}
+
+impl TransactionIsolation {
+    pub fn parse(input: &str) -> Result<Self, String> {
+        let normalized = input
+            .trim()
+            .to_ascii_lowercase()
+            .replace('_', " ")
+            .replace('-', " ");
+        match normalized.as_str() {
+            "read committed" => Ok(TransactionIsolation::ReadCommitted),
+            other => Err(format!("isolation level {other} not supported")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransactionIsolation::ReadCommitted => "read committed",
+        }
+    }
 }
 
 impl Default for SessionTimeZone {
@@ -125,6 +151,9 @@ pub struct SessionState {
     pub statement_time_micros: Option<i64>,
     pub txn_start_micros: Option<i64>,
     pub time_zone: SessionTimeZone,
+    pub db_override: Option<Arc<RwLock<Db>>>,
+    pub default_txn_isolation: TransactionIsolation,
+    pub txn_isolation: Option<TransactionIsolation>,
 }
 
 impl Default for SessionState {
@@ -141,6 +170,9 @@ impl Default for SessionState {
             statement_time_micros: None,
             txn_start_micros: None,
             time_zone: SessionTimeZone::default(),
+            db_override: None,
+            default_txn_isolation: TransactionIsolation::ReadCommitted,
+            txn_isolation: None,
         }
     }
 }
@@ -275,6 +307,32 @@ impl Session {
         self.state.lock().time_zone.clone()
     }
 
+    pub fn set_default_txn_isolation(&self, iso: TransactionIsolation) {
+        let mut guard = self.state.lock();
+        guard.default_txn_isolation = iso;
+        if guard.txn_isolation.is_none() {
+            guard.txn_isolation = Some(iso);
+        }
+    }
+
+    pub fn default_txn_isolation(&self) -> TransactionIsolation {
+        self.state.lock().default_txn_isolation
+    }
+
+    pub fn set_txn_isolation(&self, iso: TransactionIsolation) {
+        let mut guard = self.state.lock();
+        guard.txn_isolation = Some(iso);
+    }
+
+    pub fn clear_txn_isolation(&self) {
+        let mut guard = self.state.lock();
+        guard.txn_isolation = None;
+    }
+
+    pub fn txn_isolation(&self) -> Option<TransactionIsolation> {
+        self.state.lock().txn_isolation
+    }
+
     pub fn set_statement_time_micros(&self, micros: i64) {
         let mut guard = self.state.lock();
         guard.statement_time_micros = Some(micros);
@@ -296,6 +354,15 @@ impl Session {
     pub fn clear_txn_start_micros(&self) {
         let mut guard = self.state.lock();
         guard.txn_start_micros = None;
+    }
+
+    pub fn set_db_override(&self, db: Option<Arc<RwLock<Db>>>) {
+        let mut guard = self.state.lock();
+        guard.db_override = db;
+    }
+
+    pub fn db_override(&self) -> Option<Arc<RwLock<Db>>> {
+        self.state.lock().db_override.clone()
     }
 }
 

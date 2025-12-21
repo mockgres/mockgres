@@ -159,10 +159,9 @@ async fn non_target_conflicts_error() {
         )
         .await
         .expect_err("conflict on non-target should fail");
-    assert!(
-        err.to_string()
-            .contains("duplicate key value violates unique constraint"),
-        "unexpected error: {err:?}"
+    common::assert_db_error_contains(
+        &err,
+        "duplicate key value violates unique constraint",
     );
 
     let _ = ctx.shutdown.send(());

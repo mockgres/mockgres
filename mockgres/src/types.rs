@@ -202,22 +202,22 @@ pub fn format_bytea(bytes: &[u8]) -> String {
     out
 }
 
-#[allow(dead_code)] // helper for binary DATE encoding when implemented
+#[allow(dead_code)]
 pub fn date_days_to_postgres(days: i32) -> i32 {
     days - POSTGRES_EPOCH_OFFSET_DAYS
 }
 
-#[allow(dead_code)] // helper for binary DATE decoding when implemented
+#[allow(dead_code)]
 pub fn postgres_days_to_date(days: i32) -> i32 {
     days + POSTGRES_EPOCH_OFFSET_DAYS
 }
 
-#[allow(dead_code)] // helper for binary TIMESTAMP encoding when implemented
+#[allow(dead_code)]
 pub fn timestamp_to_postgres_micros(micros: i64) -> i64 {
     micros - POSTGRES_EPOCH_MICROS
 }
 
-#[allow(dead_code)] // helper for binary TIMESTAMP decoding when implemented
+#[allow(dead_code)]
 pub fn postgres_micros_to_timestamp(micros: i64) -> i64 {
     micros + POSTGRES_EPOCH_MICROS
 }

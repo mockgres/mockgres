@@ -160,6 +160,26 @@ pub(crate) fn build_ddl_executor(
                 None,
             ))
         }
+        Plan::AlterTableAddConstraintForeignKey { table, fk } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let search_path = session.search_path();
+            let mut db_write = db.write();
+            db_write
+                .alter_table_add_foreign_key(&schema_name, &table.name, fk.clone(), &search_path)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
         Plan::AlterTableDropConstraint {
             table,
             name,
@@ -182,9 +202,25 @@ pub(crate) fn build_ddl_executor(
                 }
             };
             let constraint_name = name.clone();
-            {
-                let db_read = db.read();
-                let Some(meta) = db_read.catalog.get_table(&schema_name, &table.name) else {
+            let mut db_write = db.write();
+            let Some(table_id) = db_write.catalog.table_id(&schema_name, &table.name) else {
+                if *if_exists {
+                    return Ok((
+                        Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                        Some("ALTER TABLE".into()),
+                        None,
+                    ));
+                }
+                return Err(fe_code("42P01", format!("no such table {}", table.name)));
+            };
+            enum DropConstraintAction {
+                DropIndex(String),
+                Handled,
+                NotFound,
+            }
+
+            let action = {
+                let Some(meta) = db_write.catalog.get_table_mut_by_id(&table_id) else {
                     if *if_exists {
                         return Ok((
                             Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -194,11 +230,35 @@ pub(crate) fn build_ddl_executor(
                     }
                     return Err(fe_code("42P01", format!("no such table {}", table.name)));
                 };
-                let has_unique = meta
+                if let Some(pos) = meta
                     .indexes
                     .iter()
-                    .any(|idx| idx.unique && idx.name == constraint_name);
-                if !has_unique {
+                    .position(|idx| idx.unique && idx.name == constraint_name)
+                {
+                    DropConstraintAction::DropIndex(meta.indexes[pos].name.clone())
+                } else if let Some(pos) = meta
+                    .foreign_keys
+                    .iter()
+                    .position(|fk| fk.name == constraint_name)
+                {
+                    meta.foreign_keys.remove(pos);
+                    if let Some(table_storage) = db_write.tables.get_mut(&table_id) {
+                        table_storage.fk_rev.clear();
+                    }
+                    DropConstraintAction::Handled
+                } else {
+                    DropConstraintAction::NotFound
+                }
+            };
+
+            match action {
+                DropConstraintAction::DropIndex(index_name) => {
+                    db_write
+                        .drop_index(&schema_name, &index_name, *if_exists)
+                        .map_err(map_db_err)?;
+                }
+                DropConstraintAction::Handled => {}
+                DropConstraintAction::NotFound => {
                     if *if_exists {
                         return Ok((
                             Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
@@ -215,10 +275,6 @@ pub(crate) fn build_ddl_executor(
                     ));
                 }
             }
-            let mut db_write = db.write();
-            db_write
-                .drop_index(&schema_name, &constraint_name, *if_exists)
-                .map_err(map_db_err)?;
             drop(db_write);
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),

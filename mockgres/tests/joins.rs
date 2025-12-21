@@ -64,10 +64,7 @@ async fn ambiguous_column_reference_errors() {
         .simple_query("select id from a, b")
         .await
         .expect_err("ambiguous select should fail");
-    assert!(
-        err.to_string().contains("ambiguous"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "ambiguous");
 
     let _ = ctx.shutdown.send(());
 }

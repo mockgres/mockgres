@@ -6,7 +6,7 @@ use pgwire::error::PgWireResult;
 use crate::db::Db;
 use crate::engine::{EvalContext, ExecNode, Expr, Plan, Schema, Value, ValuesExec, fe, fe_code};
 use crate::server::mapping::lookup_show_value;
-use crate::session::{Session, SessionTimeZone};
+use crate::session::{Session, SessionTimeZone, TransactionIsolation};
 
 pub(crate) fn build_set_show_executor(
     db: &Arc<RwLock<Db>>,
@@ -16,7 +16,8 @@ pub(crate) fn build_set_show_executor(
 ) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
     match plan {
         Plan::ShowVariable { name, schema } => {
-            let value = if name == "search_path" {
+            let normalized = name.replace(' ', "_");
+            let value = if normalized == "search_path" {
                 let ids = session.search_path();
                 let parts = {
                     let db_read = db.read();
@@ -26,10 +27,17 @@ pub(crate) fn build_set_show_executor(
                         .collect::<Vec<_>>()
                 };
                 parts.join(", ")
-            } else if name == "timezone" || name == "time zone" {
+            } else if normalized == "timezone" || normalized == "time_zone" {
                 session.time_zone().display_value().to_string()
+            } else if normalized == "transaction_isolation" {
+                let iso = session
+                    .txn_isolation()
+                    .unwrap_or_else(|| session.default_txn_isolation());
+                iso.as_str().to_string()
+            } else if normalized == "default_transaction_isolation" {
+                session.default_txn_isolation().as_str().to_string()
             } else {
-                match lookup_show_value(name) {
+                match lookup_show_value(&normalized) {
                     Some(v) => v,
                     None => return Err(fe_code("0A000", format!("SHOW {} not supported", name))),
                 }
@@ -92,6 +100,46 @@ pub(crate) fn build_set_show_executor(
                     None => SessionTimeZone::Utc,
                 };
                 session.set_time_zone(tz);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
+            "transaction_isolation" => {
+                let iso = match value {
+                    Some(values) => {
+                        if values.len() != 1 {
+                            return Err(fe("SET transaction_isolation requires a single value"));
+                        }
+                        TransactionIsolation::parse(&values[0]).map_err(|e| fe_code("0A000", e))?
+                    }
+                    None => TransactionIsolation::ReadCommitted,
+                };
+                if session.current_tx().is_some() {
+                    session.set_txn_isolation(iso);
+                } else {
+                    session.set_default_txn_isolation(iso);
+                }
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
+            "default_transaction_isolation" => {
+                let iso = match value {
+                    Some(values) => {
+                        if values.len() != 1 {
+                            return Err(fe(
+                                "SET default_transaction_isolation requires a single value",
+                            ));
+                        }
+                        TransactionIsolation::parse(&values[0]).map_err(|e| fe_code("0A000", e))?
+                    }
+                    None => TransactionIsolation::ReadCommitted,
+                };
+                session.set_default_txn_isolation(iso);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                     Some("SET".into()),

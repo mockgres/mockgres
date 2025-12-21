@@ -60,6 +60,7 @@ impl Db {
                     meta: meta.clone(),
                     row_key,
                     row_id,
+                    row: row.clone(),
                     pk_key,
                     fk_keys,
                     unique_keys,
@@ -105,35 +106,29 @@ impl Db {
                 &frame.target.schema,
                 &frame.target.table,
             );
-            if let Some(RowKey::Primary(pk_vals)) = frame.target.pk_key.as_ref() {
-                ensure_no_inbound_refs(
-                    &self.tables,
-                    &frame.target.schema,
-                    &frame.target.table,
-                    frame.target.meta.id,
-                    &inbound,
-                    pk_vals,
-                    visibility,
-                )?;
-                for fk in inbound {
-                    if fk.fk.on_delete == ReferentialAction::Cascade {
-                        let children = self.collect_cascade_children(&fk, pk_vals, visibility)?;
-                        for child in children {
-                            stack.push(CascadeFrame {
-                                target: child,
-                                expanded: false,
-                            });
-                        }
+            ensure_no_inbound_refs(
+                &self.tables,
+                &frame.target.schema,
+                &frame.target.table,
+                frame.target.meta.id,
+                &inbound,
+                &frame.target.row,
+                visibility,
+            )?;
+            for fk in inbound {
+                if fk.fk.on_delete == ReferentialAction::Cascade {
+                    let Some(parent_key) = build_referenced_parent_key(&frame.target.row, &fk.fk)
+                    else {
+                        continue;
+                    };
+                    let children = self.collect_cascade_children(&fk, &parent_key, visibility)?;
+                    for child in children {
+                        stack.push(CascadeFrame {
+                            target: child,
+                            expanded: false,
+                        });
                     }
                 }
-            } else if !inbound.is_empty() {
-                return Err(sql_err(
-                    "42830",
-                    format!(
-                        "referenced table {}.{} must have a primary key",
-                        frame.target.schema, frame.target.table
-                    ),
-                ));
             }
             stack.push(frame);
         }
@@ -175,6 +170,7 @@ impl Db {
                         meta: child_meta.clone(),
                         row_key: RowKey::RowId(*row_id),
                         row_id: *row_id,
+                        row: row.clone(),
                         pk_key,
                         fk_keys,
                         unique_keys,

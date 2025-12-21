@@ -7,6 +7,7 @@ use crate::types::{
 };
 use pgwire::api::Type;
 use pgwire::error::{ErrorInfo, PgWireError};
+use serde_json::Value as JsonValue;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -55,6 +56,7 @@ pub enum DataType {
     Int8,
     Float8,
     Text,
+    Json,
     Bool,
     Date,
     Timestamp,
@@ -70,6 +72,7 @@ impl DataType {
             DataType::Int8 => Type::INT8,
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
+            DataType::Json => Type::JSON,
             DataType::Bool => Type::BOOL,
             DataType::Date => Type::DATE,
             DataType::Timestamp => Type::TIMESTAMP,
@@ -204,6 +207,13 @@ pub fn cast_value_to_type(
     target: &DataType,
     tz: &SessionTimeZone,
 ) -> Result<Value, SqlError> {
+    fn validate_json(input: &str) -> Result<(), SqlError> {
+        serde_json::from_str::<JsonValue>(input).map_err(|e| {
+            SqlError::new("22P02", format!("invalid input syntax for type json: {e}"))
+        })?;
+        Ok(())
+    }
+
     match (target, val) {
         (DataType::Int4, Value::Int64(v)) => {
             if v < i32::MIN as i64 || v > i32::MAX as i64 {
@@ -255,6 +265,32 @@ pub fn cast_value_to_type(
         }
         (DataType::Text, Value::TimestamptzMicros(m)) => {
             let text = format_timestamptz(m, tz).map_err(|e| SqlError::new("22008", e))?;
+            Ok(Value::Text(text))
+        }
+        (DataType::Json, Value::Text(s)) => {
+            validate_json(&s)?;
+            Ok(Value::Text(s))
+        }
+        (DataType::Json, Value::Bytes(b)) => {
+            let s = String::from_utf8(b).map_err(|e| {
+                SqlError::new("22P02", format!("invalid input syntax for type json: {e}"))
+            })?;
+            validate_json(&s)?;
+            Ok(Value::Text(s))
+        }
+        (DataType::Json, Value::Bool(b)) => {
+            let text = if b { "true" } else { "false" }.to_string();
+            Ok(Value::Text(text))
+        }
+        (DataType::Json, Value::Int64(i)) => {
+            let text = i.to_string();
+            validate_json(&text)?;
+            Ok(Value::Text(text))
+        }
+        (DataType::Json, Value::Float64Bits(bits)) => {
+            let f = f64::from_bits(bits);
+            let text = f.to_string();
+            validate_json(&text)?;
             Ok(Value::Text(text))
         }
         (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),

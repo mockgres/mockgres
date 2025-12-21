@@ -1,4 +1,3 @@
-// tests/where_projection_shape.rs
 mod common;
 
 use tokio_postgres::Row;

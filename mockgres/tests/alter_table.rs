@@ -101,25 +101,27 @@ async fn alter_table_drop_column_constraints() {
         .await
         .expect("create shaped");
 
-    let err = ctx
-        .client
+    ctx.client
         .execute("alter table shaped drop column b", &[])
         .await
-        .expect_err("dropping non-last column should fail");
-    assert!(
-        err.to_string().contains("last column"),
-        "unexpected error: {err}"
-    );
+        .expect("drop non-last column");
 
     let err_pk = ctx
         .client
         .execute("alter table shaped drop column id", &[])
         .await
         .expect_err("dropping primary key column should fail");
+    let db_err = err_pk.as_db_error().expect("expected db error");
     assert!(
-        err_pk.to_string().contains("primary key"),
-        "unexpected pk drop error: {err_pk}"
+        db_err.message().contains("primary key"),
+        "unexpected pk drop error: {:?}",
+        db_err.message()
     );
+
+    ctx.client
+        .execute("insert into shaped values (1, 10)", &[])
+        .await
+        .expect("insert after dropping column");
 
     let _ = ctx.shutdown.send(());
 }

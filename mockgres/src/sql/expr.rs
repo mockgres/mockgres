@@ -4,8 +4,8 @@ use crate::engine::{
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
-    AExpr, AExprKind, BoolExprType, CoalesceExpr, ColumnRef, FuncCall, Node, NullTestType,
-    ParamRef, SqlValueFunction, SqlValueFunctionOp,
+    AArrayExpr, AExpr, AExprKind, BoolExprType, CoalesceExpr, ColumnRef, FuncCall, Node,
+    NullTestType, ParamRef, SqlValueFunction, SqlValueFunctionOp,
 };
 use pgwire::error::PgWireResult;
 
@@ -57,6 +57,9 @@ fn parse_bool_expr_internal(
             let kind = AExprKind::try_from(ax.kind).map_err(|_| fe("unknown expression kind"))?;
             if kind == AExprKind::AexprIn {
                 return parse_in_expr(ax, agg_ctx.as_deref_mut());
+            }
+            if kind == AExprKind::AexprOpAny {
+                return parse_any_expr(ax, agg_ctx.as_deref_mut());
             }
             if ax.name.is_empty() {
                 if let Some(inner) = ax.lexpr.as_ref().and_then(|n| n.node.as_ref()) {
@@ -118,10 +121,13 @@ fn parse_bool_expr_internal(
             Value::Bool(b) => Ok(BoolExpr::Literal(b)),
             _ => Err(fe("boolean literal expected")),
         },
-        NodeEnum::ColumnRef(_) => {
-            let col = parse_scalar_expr_internal(node, agg_ctx)?;
+        NodeEnum::ColumnRef(_)
+        | NodeEnum::FuncCall(_)
+        | NodeEnum::CoalesceExpr(_)
+        | NodeEnum::TypeCast(_) => {
+            let expr = parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?;
             Ok(BoolExpr::Comparison {
-                lhs: col,
+                lhs: expr,
                 op: CmpOp::Eq,
                 rhs: ScalarExpr::Literal(Value::Bool(true)),
             })
@@ -273,6 +279,51 @@ fn parse_in_expr(
     }
 }
 
+fn parse_any_expr(
+    ax: &AExpr,
+    mut agg_ctx: Option<&mut AggregateExprCollector>,
+) -> PgWireResult<BoolExpr> {
+    let op = parse_cmp_op(&ax.name)?;
+    if op != CmpOp::Eq {
+        return Err(fe("only = ANY is supported"));
+    }
+    let lexpr = ax
+        .lexpr
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("ANY expression missing lhs"))?;
+    let lhs = parse_scalar_expr_internal(lexpr, agg_ctx.as_deref_mut())?;
+    let rexpr = ax
+        .rexpr
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("ANY expression missing rhs"))?;
+
+    let elements: &[pg_query::protobuf::Node] = match rexpr {
+        NodeEnum::AArrayExpr(AArrayExpr { elements, .. }) => elements.as_slice(),
+        NodeEnum::ArrayExpr(arr) => arr.elements.as_slice(),
+        _ => return Err(fe("ANY expects array expression rhs")),
+    };
+    if elements.is_empty() {
+        return Err(fe("ANY array must have elements"));
+    }
+    let mut comparisons = Vec::with_capacity(elements.len());
+    for elem in elements {
+        let node = elem.node.as_ref().ok_or_else(|| fe("bad ANY element"))?;
+        let rhs = parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?;
+        comparisons.push(BoolExpr::Comparison {
+            lhs: lhs.clone(),
+            op: CmpOp::Eq,
+            rhs,
+        });
+    }
+    if comparisons.len() == 1 {
+        Ok(comparisons.pop().unwrap())
+    } else {
+        Ok(BoolExpr::Or(comparisons))
+    }
+}
+
 fn parse_sql_value_function(svf: &SqlValueFunction) -> PgWireResult<ScalarExpr> {
     let op = SqlValueFunctionOp::try_from(svf.op).map_err(|_| fe("unknown SQL value function"))?;
     let func = match op {
@@ -383,19 +434,17 @@ pub fn parse_arithmetic_expr(
             })
         })
         .ok_or_else(|| fe("missing operator"))?;
-    if ax.lexpr.is_none() {
-        if op == "-" {
-            let rhs = ax
-                .rexpr
-                .as_ref()
-                .and_then(|n| n.node.as_ref())
-                .ok_or_else(|| fe("bad unary minus"))?;
-            let expr = parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut())?;
-            return Ok(ScalarExpr::UnaryOp {
-                op: ScalarUnaryOp::Negate,
-                expr: Box::new(expr),
-            });
-        }
+    if ax.lexpr.is_none() && op == "-" {
+        let rhs = ax
+            .rexpr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad unary minus"))?;
+        let expr = parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut())?;
+        return Ok(ScalarExpr::UnaryOp {
+            op: ScalarUnaryOp::Negate,
+            expr: Box::new(expr),
+        });
     }
     let lexpr = ax
         .lexpr
@@ -496,6 +545,8 @@ fn parse_function_call(
         "ln" => ScalarFunc::Ln,
         "log" => ScalarFunc::Log,
         "greatest" => ScalarFunc::Greatest,
+        "version" => ScalarFunc::Version,
+        "pg_table_is_visible" => ScalarFunc::PgTableIsVisible,
         other => return Err(fe(format!("unsupported function: {other}"))),
     };
     match func {
@@ -534,12 +585,18 @@ fn parse_function_call(
                 return Err(fe("greatest() requires at least two arguments"));
             }
         }
+        ScalarFunc::PgTableIsVisible => {
+            if args.len() != 1 {
+                return Err(fe("pg_table_is_visible(oid) requires one argument"));
+            }
+        }
         ScalarFunc::Now
         | ScalarFunc::CurrentTimestamp
         | ScalarFunc::StatementTimestamp
         | ScalarFunc::TransactionTimestamp
         | ScalarFunc::ClockTimestamp
-        | ScalarFunc::CurrentDate => {
+        | ScalarFunc::CurrentDate
+        | ScalarFunc::Version => {
             if !args.is_empty() {
                 return Err(fe("function takes no arguments"));
             }

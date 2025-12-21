@@ -508,7 +508,8 @@ impl ExecNode for OrderExec {
 }
 
 // compares two values with explicit asc and nulls policy.
-// nulls_first=true => nulls before non-nulls; false => nulls after
+// nulls_first=true => nulls before non-nulls
+// false => nulls after
 fn order_values(
     a: Option<&Value>,
     b: Option<&Value>,
@@ -527,7 +528,8 @@ fn order_values(
 
     // safe unwrap after early returns
     match (a.unwrap(), b.unwrap()) {
-        // sql nulls obey nulls_first; do not flip by asc
+        // sql nulls obey nulls_first
+        // do not flip by asc
         (Value::Null, Value::Null) => Equal,
         (Value::Null, _) => {
             if nulls_first {
@@ -550,7 +552,7 @@ fn order_values(
             if asc { ord } else { ord.reverse() }
         }
 
-        // floats (NaN > all in ascending); desc handled by reversing ord
+        // floats nan > all in ascending desc handled by reversing ord
         (Value::Float64Bits(bx), Value::Float64Bits(by)) => {
             let (x, y) = (f64::from_bits(*bx), f64::from_bits(*by));
             let ord = if x.is_nan() && y.is_nan() {
@@ -558,7 +560,7 @@ fn order_values(
             } else if x.is_nan() {
                 Greater
             }
-            // NaN > all
+            // nan > all
             else if y.is_nan() {
                 Less
             } else if x < y {
@@ -680,7 +682,7 @@ fn eval_numeric_div_by_i64(sum: Value, denom: i64) -> PgWireResult<Value> {
     }
 }
 
-// limit exec: skips `offset` rows, then forwards up to `limit` rows (if provided)
+// skips num offset rows, then forwards up to num limit rows if provided
 pub struct LimitExec {
     schema: Schema,
     child: Box<dyn ExecNode>,
@@ -741,7 +743,6 @@ impl ExecNode for LimitExec {
     }
 }
 
-/// Executes hash-based grouping + aggregate accumulation.
 pub struct HashAggregateExec {
     schema: Schema,
     child: Box<dyn ExecNode>,

@@ -42,6 +42,7 @@ Testing covered pretty much exclusively by integration tests in the `tests` dire
 - Supported SQL surface (SELECT/INSERT/UPDATE/DELETE, joins, ON CONFLICT, etc.).
 - PG wire protocol compatibility expectations.
 - Locking semantics (FOR UPDATE, SKIP LOCKED).
+- Copy-on-write snapshots via `mockgres_freeze()` and per-session `mockgres_reset()`.
 - Type support basics.
 
 ## What's supported
@@ -49,10 +50,36 @@ Testing covered pretty much exclusively by integration tests in the `tests` dire
 - Joins: CROSS/INNER/LEFT with ON predicates, multi-join, subqueries IN (SELECT ...)
 - DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, RETURNING
 - Locking and tx: BEGIN/COMMIT/ROLLBACK (read committed only), SELECT FOR UPDATE SKIP LOCKED
+- Copy-on-write snapshots: global freeze + per-session sandboxes (`mockgres_freeze()`, `mockgres_reset()`)
 - types: int4/int8, float8, text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
 - Constraints/indices: primary key, unique, foreign key (cascade), create/drop index supported but no-op
-- Catalog: schemas, databases (create and drop not supported), table create/drop, ALTER TABLE
+- Catalog: schemas, databases (create and drop not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
 - Wire protocol: simple and extended protocol
+
+## Copy-on-write snapshots
+- Freeze the current database state with `SELECT mockgres_freeze();`. The first call captures a base snapshot; subsequent calls are no-ops and return `true`.
+- After freezing, every new session gets its own copy-on-write sandbox cloned from the frozen base. Changes made in one session stay isolated from others.
+- Reset a pooled/reused connection with `SELECT mockgres_reset();` to discard that session’s sandbox and reclone from the frozen base on next use.
+- Works in both simple and extended protocols, so it is safe to use with connection pools (run `mockgres_reset()` at the start of each test when reusing a pooled client).
+
+Example (psql):
+```
+-- Seed baseline and freeze
+create table items(id int primary key, label text);
+insert into items values (1, 'a');
+select mockgres_freeze(); -- returns t
+
+-- Session A (shared DB) mutates baseline
+insert into items values (2, 'b');
+
+-- Session B (new connection) gets isolated sandbox
+insert into items values (3, 'c');
+select id from items order by id; -- sees 1,3 (not Session A’s 2)
+
+-- Reset Session B sandbox (e.g., between tests)
+select mockgres_reset(); -- returns t
+select id from items order by id; -- back to frozen base: 1
+```
 
 ## Architecture Notes
 tbd

@@ -390,7 +390,7 @@ fn bind_with_search_path(
             from,
             mut from_schema,
             mut returning,
-            mut returning_schema,
+            returning_schema: _,
         } => {
             let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
             if table.schema.is_none() {
@@ -443,7 +443,7 @@ fn bind_with_search_path(
                 )?),
                 None => None,
             };
-            returning_schema = match returning.as_mut() {
+            let returning_schema = match returning.as_mut() {
                 Some(clause) => Some(bind_returning_clause(
                     clause,
                     &combined_schema,
@@ -468,7 +468,7 @@ fn bind_with_search_path(
             mut table,
             filter,
             mut returning,
-            mut returning_schema,
+            returning_schema: _,
         } => {
             let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
             if table.schema.is_none() {
@@ -501,7 +501,7 @@ fn bind_with_search_path(
                 )?),
                 None => None,
             };
-            returning_schema = match returning.as_mut() {
+            let returning_schema = match returning.as_mut() {
                 Some(clause) => Some(bind_returning_clause(
                     clause,
                     &schema,
@@ -581,6 +581,7 @@ fn bind_with_search_path(
                 offset,
             })
         }
+        Plan::CallBuiltin { name, args, schema } => Ok(Plan::CallBuiltin { name, args, schema }),
         Plan::InsertValues {
             mut table,
             columns,
@@ -588,7 +589,7 @@ fn bind_with_search_path(
             override_system_value,
             on_conflict,
             mut returning,
-            mut returning_schema,
+            returning_schema: _,
         } => {
             let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
             if table.schema.is_none() {
@@ -719,7 +720,7 @@ fn bind_with_search_path(
                 }
                 bound_rows.push(bound_row);
             }
-            returning_schema = match returning.as_mut() {
+            let returning_schema = match returning.as_mut() {
                 Some(clause) => Some(bind_returning_clause(
                     clause,
                     &table_schema,

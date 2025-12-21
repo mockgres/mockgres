@@ -35,10 +35,7 @@ async fn drop_table_if_exists_suppresses_missing_error() {
         .execute("drop table doesnt_exist", &[])
         .await
         .expect_err("drop missing table");
-    assert!(
-        err.to_string().contains("no such table"),
-        "unexpected error: {err}"
-    );
+    common::assert_db_error_contains(&err, "no such table");
 
     ctx.client
         .execute("drop table if exists doesnt_exist", &[])

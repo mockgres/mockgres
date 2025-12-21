@@ -559,10 +559,85 @@ fn find_group_expr_index(expr: &ScalarExpr, groups: &[(ScalarExpr, String)]) -> 
     groups.iter().position(|(gexpr, _)| gexpr == expr)
 }
 
+fn try_plan_builtin_select(target: &pg_query::Node) -> PgWireResult<Option<Plan>> {
+    use pg_query::NodeEnum;
+
+    let tgt = target
+        .node
+        .as_ref()
+        .ok_or_else(|| fe("unexpected target"))?;
+    let NodeEnum::ResTarget(rt) = tgt else {
+        return Ok(None);
+    };
+
+    let expr_node = rt
+        .val
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("missing expr"))?;
+
+    let NodeEnum::FuncCall(fc) = expr_node else {
+        return Ok(None);
+    };
+
+    // Extract function name (last component)
+    let func_name = fc
+        .funcname
+        .iter()
+        .filter_map(|n| {
+            n.node.as_ref().and_then(|nn| {
+                if let NodeEnum::String(s) = nn {
+                    Some(s.sval.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+        })
+        .last()
+        .unwrap_or_default();
+
+    // Only handle our two builtins here
+    if func_name != "mockgres_freeze" && func_name != "mockgres_reset" {
+        return Ok(None);
+    }
+
+    // No args allowed for now
+    if !fc.args.is_empty() {
+        return Err(fe(format!("{func_name}() takes no arguments")));
+    }
+
+    // Result schema: single bool column
+    let col_name = if rt.name.is_empty() {
+        func_name.clone()
+    } else {
+        rt.name.clone()
+    };
+
+    let schema = Schema {
+        fields: vec![Field {
+            name: col_name,
+            data_type: DataType::Bool,
+            origin: None,
+        }],
+    };
+
+    Ok(Some(Plan::CallBuiltin {
+        name: func_name,
+        args: Vec::new(),
+        schema,
+    }))
+}
+
 fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
     let tl = sel.target_list;
     if tl.is_empty() {
         return Err(fe("at least one column required"));
+    }
+    // check for builtin single-target SELECTs
+    if tl.len() == 1 {
+        if let Some(plan) = try_plan_builtin_select(&tl[0])? {
+            return Ok(plan);
+        }
     }
     let mut out_exprs = Vec::with_capacity(tl.len());
     for t in tl {
