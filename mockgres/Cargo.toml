@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "An in-memory database that replicates a reasonable subset of Postgres functionality to make unit tests that rely on a database to run."
 repository = "https://github.com/mockgres/mockgres"
+readme = "README.md"
 
 [lib]
 name = "mockgres"
