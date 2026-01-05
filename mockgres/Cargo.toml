@@ -1,6 +1,6 @@
 [package]
 name = "mockgres"
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "MIT"
 description = "An in-memory database that replicates a reasonable subset of Postgres functionality to make unit tests that rely on a database to run."
