@@ -68,6 +68,11 @@ pub struct PrimaryKeyMeta {
 }
 
 #[derive(Clone, Debug)]
+pub struct CheckConstraintMeta {
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct TableMeta {
     pub id: TableId,
     pub schema: SchemaName,
@@ -76,6 +81,7 @@ pub struct TableMeta {
     pub primary_key: Option<PrimaryKeyMeta>,
     pub indexes: Vec<IndexMeta>,
     pub foreign_keys: Vec<ForeignKeyMeta>,
+    pub check_constraints: Vec<CheckConstraintMeta>,
 }
 
 #[derive(Clone, Debug)]

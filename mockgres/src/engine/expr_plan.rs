@@ -344,6 +344,10 @@ pub enum Plan {
         table: ObjName,
         fk: ForeignKeySpec,
     },
+    AlterTableAddConstraintCheck {
+        table: ObjName,
+        name: String,
+    },
     AlterTableDropConstraint {
         table: ObjName,
         name: String,
@@ -493,6 +497,7 @@ impl Plan {
             | Plan::AlterTableDropColumn { .. }
             | Plan::AlterTableAddConstraintUnique { .. }
             | Plan::AlterTableAddConstraintForeignKey { .. }
+            | Plan::AlterTableAddConstraintCheck { .. }
             | Plan::AlterTableDropConstraint { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }

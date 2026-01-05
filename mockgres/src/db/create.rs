@@ -141,6 +141,7 @@ impl Db {
             primary_key: pk_meta,
             indexes: vec![],
             foreign_keys: fk_metas,
+            check_constraints: vec![],
         };
 
         let has_pk = tm.primary_key.is_some();

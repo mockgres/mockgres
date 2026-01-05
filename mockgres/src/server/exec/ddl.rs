@@ -3,7 +3,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use pgwire::error::{PgWireError, PgWireResult};
 
-use crate::catalog::{SchemaId, SchemaName};
+use crate::catalog::{CheckConstraintMeta, SchemaId, SchemaName};
 use crate::db::Db;
 use crate::engine::{
     DbDdlKind, EvalContext, ExecNode, ObjName, Plan, Schema, ValuesExec, fe, fe_code,
@@ -180,6 +180,42 @@ pub(crate) fn build_ddl_executor(
                 None,
             ))
         }
+        Plan::AlterTableAddConstraintCheck { table, name } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            let Some(table_id) = db_write.catalog.table_id(&schema_name, &table.name) else {
+                return Err(fe_code("42P01", format!("no such table {}", table.name)));
+            };
+            let meta = db_write
+                .catalog
+                .get_table_mut_by_id(&table_id)
+                .ok_or_else(|| fe_code("42P01", format!("no such table {}", table.name)))?;
+            let name = name.clone();
+            let name_exists = meta
+                .primary_key
+                .as_ref()
+                .map(|pk| pk.name == name)
+                .unwrap_or(false)
+                || meta.indexes.iter().any(|idx| idx.name == name)
+                || meta.foreign_keys.iter().any(|fk| fk.name == name)
+                || meta.check_constraints.iter().any(|ck| ck.name == name);
+            if name_exists {
+                return Err(fe_code("42710", format!("constraint {} for table {}.{} already exists", name, schema_name, table.name)));
+            }
+            meta.check_constraints.push(CheckConstraintMeta { name });
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
         Plan::AlterTableDropConstraint {
             table,
             name,
@@ -245,6 +281,13 @@ pub(crate) fn build_ddl_executor(
                     if let Some(table_storage) = db_write.tables.get_mut(&table_id) {
                         table_storage.fk_rev.clear();
                     }
+                    DropConstraintAction::Handled
+                } else if let Some(pos) = meta
+                    .check_constraints
+                    .iter()
+                    .position(|ck| ck.name == constraint_name)
+                {
+                    meta.check_constraints.remove(pos);
                     DropConstraintAction::Handled
                 } else {
                     DropConstraintAction::NotFound

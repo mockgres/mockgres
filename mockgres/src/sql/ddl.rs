@@ -264,6 +264,14 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                         .ok_or_else(|| fe("FOREIGN KEY requires definition"))?;
                     Ok(Plan::AlterTableAddConstraintForeignKey { table, fk })
                 }
+                pg_query::protobuf::ConstrType::ConstrCheck => {
+                    let name = if cons.conname.is_empty() {
+                        format!("{}_check", table.name)
+                    } else {
+                        cons.conname.clone()
+                    };
+                    Ok(Plan::AlterTableAddConstraintCheck { table, name })
+                }
                 _ => Err(fe("unsupported ALTER TABLE constraint")),
             }
         }
