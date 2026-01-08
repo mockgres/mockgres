@@ -24,11 +24,13 @@ The first use case is that of a typical CRUD app. The second use case is for a b
 
 ## Quickstart
 - Prereqs: Rust toolchain, `cargo`.
+- `cargo run -p mockgres --bin mockgres -- --host 127.0.0.1 --port 6543`
 - `cargo run -p mockgres --bin mockgres -- 127.0.0.1:6543`
 - `psql -h 127.0.0.1 -p 6543 postgres`
 
 ## Running
-Currently, all you really need to do is specify `MOCKGRES_ADDR`.
+Set the bind address via CLI options or `MOCKGRES_ADDR`.
+The CLI accepts `--host`, `--port`, or a positional `host:port` string.
 You can technically run it by embedding it as a library, all you really need to do is what's specified in `main`.
 
 ## Testing
