@@ -1,7 +1,6 @@
 SHELL := /bin/bash
 
 VERSION_FILE := mockgres/Cargo.toml
-LOCK_FILE := Cargo.lock
 
 .PHONY: publish
 
@@ -19,21 +18,9 @@ publish:
 	fi; \
 	new_version="$$major.$$minor.$$((patch+1))"; \
 	tmp=$$(mktemp); \
-	awk -v v="$$new_version" 'BEGIN{updated=0} \
-		/^version = "/ {print "version = \\"" v "\\""; updated=1; next} \
-		{print} \
-		END{if(!updated) exit 1}' $(VERSION_FILE) > "$$tmp"; \
+	awk -v v="$$new_version" 'BEGIN{updated=0} /^version = "/ {print "version = \\"" v "\\""; updated=1; next} {print} END{if(!updated) exit 1}' $(VERSION_FILE) > "$$tmp"; \
 	mv "$$tmp" $(VERSION_FILE); \
-	if [ -f $(LOCK_FILE) ]; then \
-		tmp=$$(mktemp); \
-		awk -v v="$$new_version" '\
-			/^\\[\\[package\\]\\]/ {in_pkg=0} \
-			/^name = "/ {split($$0, a, "\\""); if (a[2] == "mockgres") in_pkg=1} \
-			/^version = "/ && in_pkg {sub(/\\"[^\\"]+\\"/, "\\"" v "\\"")} \
-			{print}' $(LOCK_FILE) > "$$tmp"; \
-		mv "$$tmp" $(LOCK_FILE); \
-	fi; \
-	git add $(VERSION_FILE) $(LOCK_FILE); \
+	git add $(VERSION_FILE); \
 	git commit -m "release $$new_version"; \
 	git tag "$$new_version"; \
 	git push; \
