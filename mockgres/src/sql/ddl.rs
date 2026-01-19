@@ -6,8 +6,8 @@ use crate::engine::{
 use pg_query::protobuf::{
     AlterDatabaseSetStmt, AlterDatabaseStmt, AlterTableStmt, AlterTableType, Constraint,
     CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt, DropdbStmt, IndexStmt,
-    ObjectType, RangeVar, RenameStmt, TransactionStmt, VariableSetKind, VariableSetStmt,
-    VariableShowStmt,
+    ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt, VariableSetKind,
+    VariableSetStmt, VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -395,6 +395,25 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
         }
         _ => Err(fe("only DROP INDEX, DROP TABLE, or DROP SCHEMA supported")),
     }
+}
+
+pub(super) fn plan_truncate(stmt: TruncateStmt) -> PgWireResult<Plan> {
+    if stmt.relations.is_empty() {
+        return Err(fe("TRUNCATE requires at least one relation"));
+    }
+    if stmt.relations.len() != 1 {
+        return Err(fe("TRUNCATE supports exactly one table"));
+    }
+    let node = stmt
+        .relations
+        .first()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("bad TRUNCATE relation"))?;
+    let pg_query::NodeEnum::RangeVar(rv) = node else {
+        return Err(fe("TRUNCATE expects a table name"));
+    };
+    let table = range_var_to_obj_name(rv);
+    Ok(Plan::TruncateTable { table })
 }
 
 pub(super) fn plan_show(show: VariableShowStmt) -> PgWireResult<Plan> {

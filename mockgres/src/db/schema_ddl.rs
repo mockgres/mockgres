@@ -110,6 +110,7 @@ impl Db {
             }
         };
         self.remove_pg_class_row(schema_id, name);
+        self.remove_information_schema_table_row(schema, name);
         match self.catalog.remove_table(schema_id, name) {
             Some(meta) => {
                 if self.tables.remove(&meta.id).is_none() {
@@ -122,5 +123,30 @@ impl Db {
             }
             None => Ok(()),
         }
+    }
+
+    pub fn truncate_table(&mut self, schema: &str, name: &str) -> anyhow::Result<()> {
+        let _schema_id = self
+            .catalog
+            .schema_id(schema)
+            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
+        let table_id = self
+            .catalog
+            .table_id(schema, name)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{name}")))?;
+        let Some(table) = self.tables.get_mut(&table_id) else {
+            return Err(sql_err(
+                "XX000",
+                format!("missing storage for table id {}", table_id),
+            ));
+        };
+        table.rows_by_key.clear();
+        if let Some(pk_map) = table.pk_map.as_mut() {
+            pk_map.clear();
+        }
+        table.fk_rev.clear();
+        table.unique_maps.clear();
+        table.next_rowid = 1;
+        Ok(())
     }
 }

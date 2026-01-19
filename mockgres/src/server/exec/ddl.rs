@@ -386,6 +386,27 @@ pub(crate) fn build_ddl_executor(
                 None,
             ))
         }
+        Plan::TruncateTable { table } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => {
+                        return Err(fe_code("42P01", format!("no such table {}", table.name)));
+                    }
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .truncate_table(&schema_name, &table.name)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("TRUNCATE".into()),
+                None,
+            ))
+        }
         Plan::DropTable { tables, if_exists } => {
             let mut db_write = db.write();
             for table in tables {

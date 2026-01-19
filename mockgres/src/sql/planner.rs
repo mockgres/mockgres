@@ -39,6 +39,7 @@ impl Planner {
             Some(NodeEnum::InsertStmt(ins)) => insert::plan_insert(*ins),
             Some(NodeEnum::UpdateStmt(upd)) => update::plan_update(*upd),
             Some(NodeEnum::DeleteStmt(del)) => delete::plan_delete(*del),
+            Some(NodeEnum::TruncateStmt(trunc)) => ddl::plan_truncate(trunc),
             _ => Err(fe("unsupported statement type")),
         }
     }

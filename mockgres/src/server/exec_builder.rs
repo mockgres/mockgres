@@ -56,6 +56,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
         Plan::DropTable { .. } => "DROP TABLE",
+        Plan::TruncateTable { .. } => "TRUNCATE",
         Plan::CreateSchema { .. } => "CREATE SCHEMA",
         Plan::DropSchema { .. } => "DROP SCHEMA",
         Plan::AlterSchemaRename { .. } => "ALTER SCHEMA",
@@ -119,6 +120,7 @@ pub fn build_executor(
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
+        | Plan::TruncateTable { .. }
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }

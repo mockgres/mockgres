@@ -102,6 +102,8 @@ pub enum ScalarFunc {
     ExtractEpoch,
     Version,
     PgTableIsVisible,
+    PgAdvisoryLock,
+    PgAdvisoryUnlock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -359,6 +361,9 @@ pub enum Plan {
         tables: Vec<ObjName>,
         if_exists: bool,
     },
+    TruncateTable {
+        table: ObjName,
+    },
     CreateSchema {
         name: SchemaName,
         if_not_exists: bool,
@@ -497,6 +502,7 @@ impl Plan {
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
             | Plan::DropTable { .. }
+            | Plan::TruncateTable { .. }
             | Plan::CreateSchema { .. }
             | Plan::DropSchema { .. }
             | Plan::AlterSchemaRename { .. }

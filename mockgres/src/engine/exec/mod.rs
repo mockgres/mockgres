@@ -888,6 +888,9 @@ impl HashAggregateExec {
         }
         self.child.close().await?;
 
+        if map.is_empty() && self.group_exprs.is_empty() {
+            map.insert(Vec::new(), vec![AggState::new(); self.agg_calls.len()]);
+        }
         let mut groups = Vec::with_capacity(map.len());
         for (group_key, states) in map {
             let mut out = group_key;

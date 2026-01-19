@@ -1,4 +1,5 @@
-use crate::session::{Session, SessionTimeZone, now_utc_micros};
+use crate::advisory_locks::AdvisoryLockRegistry;
+use crate::session::{Session, SessionId, SessionTimeZone, now_utc_micros};
 use crate::types::{
     date_days_to_postgres, format_bytea, format_date, format_timestamp, format_timestamptz,
     timestamp_micros_to_date_days, timestamp_to_postgres_micros,
@@ -45,6 +46,8 @@ impl StatementTimeContext {
 pub struct EvalContext {
     pub time_zone: SessionTimeZone,
     pub statement_time: Option<StatementTimeContext>,
+    pub session_id: Option<SessionId>,
+    pub advisory_locks: Option<Arc<AdvisoryLockRegistry>>,
 }
 
 impl EvalContext {
@@ -52,6 +55,8 @@ impl EvalContext {
         Self {
             time_zone,
             statement_time: None,
+            session_id: None,
+            advisory_locks: None,
         }
     }
 
@@ -61,6 +66,8 @@ impl EvalContext {
         Self {
             time_zone: tz,
             statement_time: Some(statement_time),
+            session_id: None,
+            advisory_locks: None,
         }
     }
 
@@ -71,6 +78,8 @@ impl EvalContext {
         Self {
             time_zone,
             statement_time: Some(statement_time),
+            session_id: None,
+            advisory_locks: None,
         }
     }
 
@@ -82,7 +91,19 @@ impl EvalContext {
         Self {
             time_zone,
             statement_time,
+            session_id: None,
+            advisory_locks: None,
         }
+    }
+
+    pub fn with_advisory_locks(
+        mut self,
+        session_id: SessionId,
+        advisory_locks: Arc<AdvisoryLockRegistry>,
+    ) -> Self {
+        self.session_id = Some(session_id);
+        self.advisory_locks = Some(advisory_locks);
+        self
     }
 }
 
@@ -92,6 +113,8 @@ impl Default for EvalContext {
         Self {
             time_zone: tz.clone(),
             statement_time: Some(StatementTimeContext::new(now_utc_micros(), tz)),
+            session_id: None,
+            advisory_locks: None,
         }
     }
 }
@@ -406,6 +429,37 @@ fn eval_function(
             Some(Value::Null) | None => Ok(Value::Null),
             other => Err(fe(format!("extract(epoch ...) unsupported for {other:?}"))),
         },
+        ScalarFunc::PgAdvisoryLock => {
+            if args.len() != 1 {
+                return Err(fe("pg_advisory_lock expects exactly one argument"));
+            }
+            let Some(key) = value_to_i64(args.into_iter().next().unwrap())? else {
+                return Ok(Value::Null);
+            };
+            let Some(session_id) = ctx.session_id else {
+                return Err(fe("pg_advisory_lock requires a session"));
+            };
+            let Some(registry) = ctx.advisory_locks.as_ref() else {
+                return Err(fe("advisory lock registry unavailable"));
+            };
+            tokio::task::block_in_place(|| registry.lock(key, session_id));
+            Ok(Value::Null)
+        }
+        ScalarFunc::PgAdvisoryUnlock => {
+            if args.len() != 1 {
+                return Err(fe("pg_advisory_unlock expects exactly one argument"));
+            }
+            let Some(key) = value_to_i64(args.into_iter().next().unwrap())? else {
+                return Ok(Value::Null);
+            };
+            let Some(session_id) = ctx.session_id else {
+                return Err(fe("pg_advisory_unlock requires a session"));
+            };
+            let Some(registry) = ctx.advisory_locks.as_ref() else {
+                return Err(fe("advisory lock registry unavailable"));
+            };
+            Ok(Value::Bool(registry.unlock(key, session_id)))
+        }
     }
 }
 
@@ -461,6 +515,29 @@ fn value_to_numeric(v: Value) -> PgWireResult<NumericValue> {
         Value::Int64(i) => Ok(NumericValue::Int(i)),
         Value::Float64Bits(bits) => Ok(NumericValue::Float(f64::from_bits(bits))),
         other => Err(fe(format!("numeric value expected, got {:?}", other))),
+    }
+}
+
+fn value_to_i64(v: Value) -> PgWireResult<Option<i64>> {
+    match v {
+        Value::Null => Ok(None),
+        Value::Int64(i) => Ok(Some(i)),
+        Value::Float64Bits(bits) => {
+            let f = f64::from_bits(bits);
+            if f.fract() != 0.0 {
+                return Err(fe("pg_advisory_lock requires integer input"));
+            }
+            Ok(Some(f as i64))
+        }
+        Value::Text(s) => {
+            let parsed = s
+                .parse::<i64>()
+                .map_err(|_| fe("pg_advisory_lock requires bigint input"))?;
+            Ok(Some(parsed))
+        }
+        other => Err(fe(format!(
+            "pg_advisory_lock requires bigint input, got {other:?}"
+        ))),
     }
 }
 
@@ -637,6 +714,9 @@ pub async fn to_pgwire_stream(
                             let dt = &schema.field(i).data_type;
                             let res = match (v, dt) {
                                 (Value::Null, DataType::Interval) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Void) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
                                 (Value::Null, DataType::Int4) => {

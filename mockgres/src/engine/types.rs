@@ -63,6 +63,7 @@ pub enum DataType {
     Timestamptz,
     Bytea,
     Interval,
+    Void,
 }
 
 impl DataType {
@@ -79,6 +80,7 @@ impl DataType {
             DataType::Timestamptz => Type::TIMESTAMPTZ,
             DataType::Bytea => Type::BYTEA,
             DataType::Interval => Type::INTERVAL,
+            DataType::Void => Type::VOID,
         }
     }
 }

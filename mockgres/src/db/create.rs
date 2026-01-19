@@ -17,6 +17,7 @@ impl Db {
     pub(super) fn init_builtin_catalog(&mut self) {
         let public_id = self.catalog.ensure_schema("public");
         let pg_catalog_id = self.catalog.ensure_schema("pg_catalog");
+        let info_schema_id = self.catalog.ensure_schema("information_schema");
         let ns_table = self
             .create_table(
                 "pg_catalog",
@@ -53,9 +54,24 @@ impl Db {
             .expect("create pg_catalog.pg_class");
         self.insert_pg_namespace_row(public_id, "public");
         self.insert_pg_namespace_row(pg_catalog_id, "pg_catalog");
+        self.insert_pg_namespace_row(info_schema_id, "information_schema");
         self.insert_pg_class_row(ns_table, "pg_namespace", pg_catalog_id, "r");
         self.insert_pg_class_row(pg_class_table, "pg_class", pg_catalog_id, "r");
         init_pg_type(self);
+        let _ = self
+            .create_table(
+                "information_schema",
+                "tables",
+                vec![
+                    ("table_schema".to_string(), DataType::Text, false, None, None),
+                    ("table_name".to_string(), DataType::Text, false, None, None),
+                    ("table_type".to_string(), DataType::Text, false, None, None),
+                ],
+                None,
+                Vec::new(),
+                &[],
+            )
+            .expect("create information_schema.tables");
     }
 
     pub(super) fn alloc_table_id(&mut self, schema_id: SchemaId) -> TableId {
@@ -150,6 +166,7 @@ impl Db {
         {
             self.insert_pg_class_row(id, name, schema_id, "r");
         }
+        self.insert_information_schema_table_row(schema, name, "BASE TABLE");
         Ok(id)
     }
 
@@ -298,6 +315,37 @@ impl Db {
         );
     }
 
+    pub(crate) fn insert_information_schema_table_row(
+        &mut self,
+        schema: &str,
+        name: &str,
+        table_type: &str,
+    ) {
+        if self
+            .catalog
+            .get_table("information_schema", "tables")
+            .is_none()
+        {
+            return;
+        }
+        let ctx = EvalContext::new(SessionTimeZone::Utc);
+        let rows = vec![vec![
+            super::CellInput::Value(Value::Text(schema.to_string())),
+            super::CellInput::Value(Value::Text(name.to_string())),
+            super::CellInput::Value(Value::Text(table_type.to_string())),
+        ]];
+        let _ = self.insert_full_rows(
+            "information_schema",
+            "tables",
+            rows,
+            false,
+            SYSTEM_TXID,
+            &[],
+            &ctx,
+            None,
+        );
+    }
+
     pub(crate) fn remove_pg_class_row(&mut self, schema_id: SchemaId, relname: &str) {
         let Some(table_id) = self.catalog.table_id("pg_catalog", "pg_class") else {
             return;
@@ -308,6 +356,26 @@ impl Db {
                 if let Some(row) = versions.last()
                     && matches!(row.data.get(1), Some(Value::Text(n)) if n == relname)
                     && matches!(row.data.get(2), Some(Value::Int64(ns)) if *ns == schema_id as i64)
+                {
+                    to_remove.push(k.clone());
+                }
+            }
+            for k in to_remove {
+                table.rows_by_key.remove(&k);
+            }
+        }
+    }
+
+    pub(crate) fn remove_information_schema_table_row(&mut self, schema: &str, name: &str) {
+        let Some(table_id) = self.catalog.table_id("information_schema", "tables") else {
+            return;
+        };
+        if let Some(table) = self.tables.get_mut(&table_id) {
+            let mut to_remove = Vec::new();
+            for (k, versions) in table.rows_by_key.iter() {
+                if let Some(row) = versions.last()
+                    && matches!(row.data.get(0), Some(Value::Text(s)) if s == schema)
+                    && matches!(row.data.get(1), Some(Value::Text(n)) if n == name)
                 {
                     to_remove.push(k.clone());
                 }

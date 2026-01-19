@@ -272,7 +272,7 @@ fn bind_scalar_expr_inner(
             ty: ty.clone(),
         },
         ScalarExpr::Func { func, args } => {
-            let bound_args = args
+            let mut bound_args = args
                 .iter()
                 .map(|a| {
                     bind_scalar_expr_inner(
@@ -287,6 +287,11 @@ fn bind_scalar_expr_inner(
                     )
                 })
                 .collect::<PgWireResult<Vec<_>>>()?;
+            if matches!(func, ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock) {
+                for arg in &mut bound_args {
+                    apply_param_hint(arg, Some(&DataType::Int8));
+                }
+            }
             if let Some(result) = bind_time_scalar_func(*func, &bound_args, time_ctx) {
                 return result;
             }
@@ -530,6 +535,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
                 .iter()
                 .filter_map(|a| scalar_expr_type(a, schema))
                 .next(),
+            ScalarFunc::PgAdvisoryLock => Some(DataType::Void),
+            ScalarFunc::PgAdvisoryUnlock => Some(DataType::Bool),
         },
         _ => None,
     }

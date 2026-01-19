@@ -7,7 +7,7 @@ use crate::engine::{
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
     AArrayExpr, AExpr, AExprKind, BoolExprType, CoalesceExpr, ColumnRef, FuncCall, Node,
-    NullTestType, ParamRef, SqlValueFunction, SqlValueFunctionOp,
+    NullTestType, ParamRef, ResTarget, SelectStmt, SqlValueFunction, SqlValueFunctionOp,
 };
 use pgwire::error::PgWireResult;
 
@@ -153,6 +153,17 @@ fn parse_scalar_expr_internal(
         NodeEnum::FuncCall(fc) => parse_function_call(fc, agg_ctx.as_deref_mut()),
         NodeEnum::CoalesceExpr(ce) => parse_coalesce_expr(ce, agg_ctx.as_deref_mut()),
         NodeEnum::SqlvalueFunction(svf) => parse_sql_value_function(svf),
+        NodeEnum::SubLink(sl) => {
+            let subselect = sl
+                .subselect
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("subquery missing SELECT"))?;
+            let NodeEnum::SelectStmt(sel) = subselect else {
+                return Err(fe("only SELECT supported in subquery"));
+            };
+            parse_scalar_subselect(sel, agg_ctx.as_deref_mut())
+        }
         NodeEnum::TypeCast(tc) => {
             let inner = tc
                 .arg
@@ -200,6 +211,40 @@ fn parse_scalar_expr_internal(
             }
         }
     }
+}
+
+fn parse_scalar_subselect(
+    sel: &SelectStmt,
+    agg_ctx: Option<&mut AggregateExprCollector>,
+) -> PgWireResult<ScalarExpr> {
+    if !sel.from_clause.is_empty()
+        || sel.where_clause.is_some()
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || !sel.sort_clause.is_empty()
+        || sel.limit_count.is_some()
+        || sel.limit_offset.is_some()
+        || !sel.locking_clause.is_empty()
+    {
+        return Err(fe("unsupported scalar subquery"));
+    }
+    if sel.target_list.len() != 1 {
+        return Err(fe("scalar subquery must select exactly one column"));
+    }
+    let target = sel.target_list.first().unwrap();
+    let target_node = target
+        .node
+        .as_ref()
+        .ok_or_else(|| fe("missing subquery target"))?;
+    let NodeEnum::ResTarget(rt) = target_node else {
+        return Err(fe("unsupported subquery target"));
+    };
+    let ResTarget { val, .. } = rt.as_ref();
+    let expr_node = val
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("missing subquery expression"))?;
+    parse_scalar_expr_internal(expr_node, agg_ctx)
 }
 
 fn parse_coalesce_expr(
@@ -549,6 +594,8 @@ fn parse_function_call(
         "greatest" => ScalarFunc::Greatest,
         "version" => ScalarFunc::Version,
         "pg_table_is_visible" => ScalarFunc::PgTableIsVisible,
+        "pg_advisory_lock" => ScalarFunc::PgAdvisoryLock,
+        "pg_advisory_unlock" => ScalarFunc::PgAdvisoryUnlock,
         other => return Err(fe(format!("unsupported function: {other}"))),
     };
     match func {
@@ -590,6 +637,11 @@ fn parse_function_call(
         ScalarFunc::PgTableIsVisible => {
             if args.len() != 1 {
                 return Err(fe("pg_table_is_visible(oid) requires one argument"));
+            }
+        }
+        ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock => {
+            if args.len() != 1 {
+                return Err(fe("function expects exactly one argument"));
             }
         }
         ScalarFunc::Now

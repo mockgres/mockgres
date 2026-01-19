@@ -1,10 +1,10 @@
+use std::any::Any;
 use std::fmt::Debug;
 use std::io;
 use std::sync::Arc;
 
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::RwLock;
-use pgwire::api::portal::Format;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireServerHandlers,
     auth::{StartupHandler, noop::NoopStartupHandler},
@@ -24,6 +24,7 @@ use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, sleep};
 
+use crate::advisory_locks::AdvisoryLockRegistry;
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
 use crate::engine::exec::ValuesExec;
@@ -46,6 +47,7 @@ pub struct Mockgres {
     pub txn_manager: Arc<TransactionManager>,
     config: ServerConfig,
     base_snapshot: Arc<RwLock<Option<Arc<RwLock<Db>>>>>,
+    advisory_locks: Arc<AdvisoryLockRegistry>,
 }
 
 impl Mockgres {
@@ -60,6 +62,7 @@ impl Mockgres {
             txn_manager: Arc::new(TransactionManager::new()),
             config,
             base_snapshot: Arc::new(RwLock::new(None)),
+            advisory_locks: Arc::new(AdvisoryLockRegistry::new()),
         }
     }
 
@@ -151,7 +154,8 @@ impl SimpleQueryHandler for Mockgres {
                         }
                         let row = vec![Value::Bool(true)];
                         let exec = ValuesExec::from_values(schema.clone(), vec![row]);
-                        let eval_ctx = EvalContext::for_statement(&session);
+                        let eval_ctx = EvalContext::for_statement(&session)
+                            .with_advisory_locks(session.id(), self.advisory_locks.clone());
                         let (fields, rows) =
                             to_pgwire_stream(Box::new(exec), FieldFormat::Text, eval_ctx).await?;
                         let mut qr = QueryResponse::new(fields, rows);
@@ -162,7 +166,8 @@ impl SimpleQueryHandler for Mockgres {
                         session.set_db_override(None);
                         let row = vec![Value::Bool(true)];
                         let exec = ValuesExec::from_values(schema.clone(), vec![row]);
-                        let eval_ctx = EvalContext::for_statement(&session);
+                        let eval_ctx = EvalContext::for_statement(&session)
+                            .with_advisory_locks(session.id(), self.advisory_locks.clone());
                         let (fields, rows) =
                             to_pgwire_stream(Box::new(exec), FieldFormat::Text, eval_ctx).await?;
                         let mut qr = QueryResponse::new(fields, rows);
@@ -174,7 +179,8 @@ impl SimpleQueryHandler for Mockgres {
                 let params: Arc<Vec<Value>> = Arc::new(Vec::new());
                 let _stmt_guard = StatementEpochGuard::new(session.clone(), active_db.clone());
                 let snapshot_xid = self.capture_statement_snapshot(&session);
-                let eval_ctx = EvalContext::for_statement(&session);
+                let eval_ctx = EvalContext::for_statement(&session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
                 // bind (names -> positions) using catalog
                 let bound = {
                     let db_read = active_db.read();
@@ -268,10 +274,7 @@ impl ExtendedQueryHandler for Mockgres {
         if matches!(portal.statement.statement, Plan::Empty) {
             return Ok(Response::EmptyQuery);
         }
-        let fmt = match portal.result_column_format {
-            Format::UnifiedBinary => FieldFormat::Binary,
-            _ => FieldFormat::Text,
-        };
+        let fmt = FieldFormat::Text;
 
         let session = self.session_for_client(client)?;
         if let Plan::CallBuiltin { name, schema, .. } = &portal.statement.statement {
@@ -289,7 +292,8 @@ impl ExtendedQueryHandler for Mockgres {
 
                 let row = vec![Value::Bool(true)];
                 let exec = ValuesExec::from_values(schema.clone(), vec![row]);
-                let eval_ctx = EvalContext::for_statement(&session);
+                let eval_ctx = EvalContext::for_statement(&session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
                 let (fields, rows) = to_pgwire_stream(Box::new(exec), fmt, eval_ctx).await?;
                 let mut qr = QueryResponse::new(fields, rows);
                 qr.set_command_tag("SELECT");
@@ -301,7 +305,8 @@ impl ExtendedQueryHandler for Mockgres {
 
                 let row = vec![Value::Bool(true)];
                 let exec = ValuesExec::from_values(schema.clone(), vec![row]);
-                let eval_ctx = EvalContext::for_statement(&session);
+                let eval_ctx = EvalContext::for_statement(&session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
                 let (fields, rows) = to_pgwire_stream(Box::new(exec), fmt, eval_ctx).await?;
                 let mut qr = QueryResponse::new(fields, rows);
                 qr.set_command_tag("SELECT");
@@ -311,7 +316,8 @@ impl ExtendedQueryHandler for Mockgres {
         let active_db = self.db_for_session(&session);
         let _stmt_guard = StatementEpochGuard::new(session.clone(), active_db.clone());
         let snapshot_xid = self.capture_statement_snapshot(&session);
-        let eval_ctx = EvalContext::for_statement(&session);
+        let eval_ctx = EvalContext::for_statement(&session)
+            .with_advisory_locks(session.id(), self.advisory_locks.clone());
         let bound = {
             let db = active_db.read();
             bind(&db, &session, portal.statement.statement.clone())?
@@ -446,6 +452,11 @@ impl Mockgres {
         session
     }
 
+    fn cleanup_session(&self, session_id: i32) {
+        self.advisory_locks.release_session(session_id);
+        self.session_manager.remove(session_id);
+    }
+
     fn capture_statement_snapshot(&self, session: &Arc<Session>) -> TxId {
         let snapshot = self.txn_manager.snapshot_xid();
         session.set_statement_xid(snapshot);
@@ -501,7 +512,7 @@ pub async fn process_socket_with_terminate<H>(
     handlers: H,
 ) -> Result<(), io::Error>
 where
-    H: PgWireServerHandlers,
+    H: PgWireServerHandlers + Any,
 {
     let startup_timeout = sleep(Duration::from_millis(STARTUP_TIMEOUT_MILLIS));
     tokio::pin!(startup_timeout);
@@ -566,6 +577,15 @@ where
                 }
             }
             _ => break,
+        }
+    }
+
+    let (pid, _) = socket.pid_and_secret_key();
+    if pid != 0 {
+        if let Some(mockgres) = (&handlers as &dyn Any).downcast_ref::<Mockgres>() {
+            mockgres.cleanup_session(pid);
+        } else if let Some(mockgres) = (&handlers as &dyn Any).downcast_ref::<Arc<Mockgres>>() {
+            mockgres.cleanup_session(pid);
         }
     }
 

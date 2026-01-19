@@ -15,6 +15,7 @@ pub fn map_pg_type_to_datatype(t: &Type) -> Option<DataType> {
         Type::TIMESTAMPTZ => Some(DataType::Timestamptz),
         Type::BYTEA => Some(DataType::Bytea),
         Type::INTERVAL => Some(DataType::Interval),
+        Type::VOID => Some(DataType::Void),
         _ => None,
     }
 }
@@ -32,6 +33,7 @@ pub fn map_datatype_to_pg_type(dt: &DataType) -> Type {
         DataType::Timestamptz => Type::TIMESTAMPTZ,
         DataType::Bytea => Type::BYTEA,
         DataType::Interval => Type::INTERVAL,
+        DataType::Void => Type::VOID,
     }
 }
 

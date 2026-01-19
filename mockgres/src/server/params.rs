@@ -166,6 +166,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
+        | Plan::TruncateTable { .. }
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }
@@ -353,6 +354,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
+        | Plan::TruncateTable { .. }
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }
@@ -499,6 +501,7 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
                 parse_interval_literal(s).map_err(|e| fe(format!("bad interval param: {e}")))?;
             Ok(Value::IntervalMicros(micros))
         }
+        DataType::Void => Ok(Value::Null),
     }
 }
 
@@ -570,5 +573,6 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgW
                 parse_interval_literal(s).map_err(|e| fe(format!("bad interval param: {e}")))?;
             Ok(Value::IntervalMicros(micros))
         }
+        DataType::Void => Ok(Value::Null),
     }
 }

@@ -84,6 +84,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "bytea" => DataType::Bytea,
             "interval" => DataType::Interval,
             "regtype" => DataType::Text,
+            "void" => DataType::Void,
             other => return Err(fe(format!("unsupported type: {other}"))),
         }
     };
