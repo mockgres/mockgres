@@ -18,7 +18,7 @@ publish:
 	fi; \
 	new_version="$$major.$$minor.$$((patch+1))"; \
 	tmp=$$(mktemp); \
-	awk -v v="$$new_version" 'BEGIN{updated=0} /^version = "/ {print "version = \\"" v "\\""; updated=1; next} {print} END{if(!updated) exit 1}' $(VERSION_FILE) > "$$tmp"; \
+	awk -v v="$$new_version" 'BEGIN{updated=0} /^version = "/ {printf "version = %c%s%c\n", 34, v, 34; updated=1; next} {print} END{if(!updated) exit 1}' $(VERSION_FILE) > "$$tmp"; \
 	mv "$$tmp" $(VERSION_FILE); \
 	git add $(VERSION_FILE); \
 	git commit -m "release $$new_version"; \
