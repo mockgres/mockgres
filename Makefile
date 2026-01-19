@@ -21,9 +21,10 @@ publish:
 	tmp=$$(mktemp); \
 	awk -v v="$$new_version" 'BEGIN{updated=0} /^version = "/ {printf "version = %c%s%c\n", 34, v, 34; updated=1; next} {print} END{if(!updated) exit 1}' $(VERSION_FILE) > "$$tmp"; \
 	mv "$$tmp" $(VERSION_FILE); \
+	cargo check -p mockgres; \
 	git add $(VERSION_FILE) $(LOCK_FILE); \
 	git commit -m "release $$new_version"; \
 	git tag "$$new_version"; \
 	git push; \
 	git push --tags; \
-	cargo publish -p mockgres
+	cargo publish -p mockgres --locked
