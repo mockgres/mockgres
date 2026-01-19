@@ -8,12 +8,14 @@ use crate::engine::{EvalContext, ExecNode, Expr, Plan, Schema, Value, ValuesExec
 use crate::server::mapping::lookup_show_value;
 use crate::session::{Session, SessionTimeZone, TransactionIsolation};
 
+type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
+
 pub(crate) fn build_set_show_executor(
     db: &Arc<RwLock<Db>>,
     session: &Arc<Session>,
     plan: &Plan,
     _ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     match plan {
         Plan::ShowVariable { name, schema } => {
             let normalized = name.replace(' ', "_");
@@ -62,13 +64,12 @@ pub(crate) fn build_set_show_executor(
                             }
                             let mut resolved = Vec::with_capacity(values.len());
                             for schema_name in values {
-                                let id =
-                                    db_read.catalog.schema_id(&schema_name).ok_or_else(|| {
-                                        fe_code(
-                                            "3F000",
-                                            format!("schema \"{}\" does not exist", schema_name),
-                                        )
-                                    })?;
+                                let id = db_read.catalog.schema_id(schema_name).ok_or_else(|| {
+                                    fe_code(
+                                        "3F000",
+                                        format!("schema \"{}\" does not exist", schema_name),
+                                    )
+                                })?;
                                 resolved.push(id);
                             }
                             resolved

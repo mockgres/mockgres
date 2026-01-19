@@ -6,6 +6,8 @@ use pg_query::protobuf::{AConst, ColumnDef, TypeName};
 use pg_query::{Node, NodeEnum};
 use pgwire::error::PgWireResult;
 
+type ColumnDefSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+
 pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
     if c.val.is_none() {
         return Ok(Value::Null);
@@ -88,15 +90,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
     Ok(dt)
 }
 
-pub(super) fn parse_column_def(
-    cd: &ColumnDef,
-) -> PgWireResult<(
-    String,
-    DataType,
-    bool,
-    Option<ScalarExpr>,
-    Option<IdentitySpec>,
-)> {
+pub(super) fn parse_column_def(cd: &ColumnDef) -> PgWireResult<ColumnDefSpec> {
     let dt = map_type(cd)?;
     let default_node = cd
         .raw_default

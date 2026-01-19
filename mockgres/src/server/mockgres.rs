@@ -133,6 +133,9 @@ impl SimpleQueryHandler for Mockgres {
     {
         match Planner::plan_sql(query) {
             Ok(plan) => {
+                if matches!(plan, Plan::Empty) {
+                    return Ok(vec![Response::EmptyQuery]);
+                }
                 let session = self.session_for_client(client)?;
                 if let Plan::CallBuiltin { name, schema, .. } = &plan {
                     if name == "mockgres_freeze" {
@@ -210,7 +213,7 @@ impl ExtendedQueryHandler for Mockgres {
     type QueryParser = pgwire_parser::PgQueryParserAdapter;
 
     fn query_parser(&self) -> Arc<Self::QueryParser> {
-        Arc::new(pgwire_parser::PgQueryParserAdapter::default())
+        Arc::new(pgwire_parser::PgQueryParserAdapter)
     }
 
     async fn do_describe_statement<C>(
@@ -262,6 +265,9 @@ impl ExtendedQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if matches!(portal.statement.statement, Plan::Empty) {
+            return Ok(Response::EmptyQuery);
+        }
         let fmt = match portal.result_column_format {
             Format::UnifiedBinary => FieldFormat::Binary,
             _ => FieldFormat::Text,
@@ -375,11 +381,9 @@ impl StatementEpochGuard {
 
 impl Drop for StatementEpochGuard {
     fn drop(&mut self) {
-        if self.active {
-            if let Some(epoch) = self.session.exit_statement() {
-                let db_read = self.db.read();
-                db_read.release_locks(LockOwner::new(self.session.id(), epoch));
-            }
+        if self.active && let Some(epoch) = self.session.exit_statement() {
+            let db_read = self.db.read();
+            db_read.release_locks(LockOwner::new(self.session.id(), epoch));
         }
     }
 }
@@ -428,10 +432,8 @@ impl Mockgres {
         C: ClientInfo,
     {
         let (pid, _) = client.pid_and_secret_key();
-        if pid != 0 {
-            if let Some(existing) = self.session_manager.get(pid) {
-                return existing;
-            }
+        if pid != 0 && let Some(existing) = self.session_manager.get(pid) {
+            return existing;
         }
         let session = self.session_manager.create_session();
         {

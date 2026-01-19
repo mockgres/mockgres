@@ -29,13 +29,11 @@ pub(crate) fn coerce_value_for_column(
         if !col.nullable {
             return Err(sql_err("23502", format!("column {} is not null", col.name)));
         }
-        if let Some(pk) = &meta.primary_key {
-            if pk.columns.contains(&idx) {
-                return Err(sql_err(
-                    "23502",
-                    format!("primary key column {} cannot be null", col.name),
-                ));
-            }
+        if let Some(pk) = &meta.primary_key && pk.columns.contains(&idx) {
+            return Err(sql_err(
+                "23502",
+                format!("primary key column {} cannot be null", col.name),
+            ));
         }
         return Ok(Value::Null);
     }

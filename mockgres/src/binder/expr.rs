@@ -181,6 +181,7 @@ pub(crate) fn bind_bool_expr_allow_excluded(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_scalar_expr_inner(
     expr: &ScalarExpr,
     schema: &Schema,
@@ -516,7 +517,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             | ScalarFunc::ClockTimestamp => Some(DataType::Timestamptz),
             ScalarFunc::CurrentDate => Some(DataType::Date),
             ScalarFunc::Abs => args
-                .get(0)
+                .first()
                 .and_then(|a| scalar_expr_type(a, schema))
                 .or(Some(DataType::Int8)),
             ScalarFunc::Ln | ScalarFunc::Log => Some(DataType::Float8),
@@ -535,9 +536,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
 }
 
 pub(crate) fn apply_param_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
-    if let (ScalarExpr::Param { ty, .. }, Some(dt)) = (expr, hint) {
-        if ty.is_none() {
-            *ty = Some(dt.clone());
-        }
+    if let (ScalarExpr::Param { ty, .. }, Some(dt)) = (expr, hint) && ty.is_none() {
+        *ty = Some(dt.clone());
     }
 }

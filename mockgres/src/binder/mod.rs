@@ -38,6 +38,7 @@ fn bind_with_search_path(
     p: Plan,
 ) -> PgWireResult<Plan> {
     match p {
+        Plan::Empty => Ok(Plan::Empty),
         Plan::UnboundSeqScan {
             mut table,
             alias,
@@ -801,6 +802,7 @@ fn map_catalog_err(err: Error) -> PgWireError {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_update_sets(
     sets: Vec<UpdateSet>,
     schema: &Schema,

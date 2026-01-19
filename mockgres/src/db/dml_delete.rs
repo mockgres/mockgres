@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use super::*;
 
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub fn delete_rows(
         &mut self,
         schema: &str,
@@ -219,14 +220,12 @@ impl Db {
                         table_id: target.meta.id,
                         key: target.row_key.clone(),
                     });
-                    if let Some(pk_key) = target.pk_key.as_ref() {
-                        if let Some(pk_map) = table_entry.pk_map.as_mut() {
-                            if let Some(existing) = pk_map.get(pk_key) {
-                                if *existing == target.row_id {
-                                    pk_map.remove(pk_key);
-                                }
-                            }
-                        }
+                    if let Some(pk_key) = target.pk_key.as_ref()
+                        && let Some(pk_map) = table_entry.pk_map.as_mut()
+                        && let Some(existing) = pk_map.get(pk_key)
+                        && *existing == target.row_id
+                    {
+                        pk_map.remove(pk_key);
                     }
                     remove_fk_rev_entries(
                         table_entry,

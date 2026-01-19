@@ -18,6 +18,8 @@ pub(crate) mod subquery;
 use crate::server::exec_builder::{assert_supported_aggs, build_executor, schema_or_public};
 use subquery::materialize_in_subqueries;
 
+type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
+
 pub fn build_read_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,
@@ -26,7 +28,7 @@ pub fn build_read_executor(
     plan: &Plan,
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     match plan {
         Plan::Values { rows, schema } => {
             let cnt = rows.len();

@@ -1,3 +1,5 @@
+#![allow(clippy::needless_option_as_deref)]
+
 use crate::engine::{
     AggCall, AggFunc, BoolExpr, CmpOp, ColumnRefName, ScalarBinaryOp, ScalarExpr, ScalarFunc,
     ScalarUnaryOp, Value, fe,
@@ -489,7 +491,7 @@ fn parse_function_call(
                 }
             })
         })
-        .last()
+        .next_back()
         .ok_or_else(|| fe("bad function name"))?;
     if is_aggregate_func_name(&name) {
         if let Some(ctx) = agg_ctx.as_deref_mut() {

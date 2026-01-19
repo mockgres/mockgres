@@ -98,10 +98,8 @@ impl LockRegistry {
         let mut state = self.inner.lock();
         if let Some(keys) = state.owned.remove(&owner) {
             for key in keys {
-                if let Some(existing) = state.holders.get(&key) {
-                    if *existing == owner {
-                        state.holders.remove(&key);
-                    }
+                if let Some(existing) = state.holders.get(&key) && *existing == owner {
+                    state.holders.remove(&key);
                 }
             }
         }

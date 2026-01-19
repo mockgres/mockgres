@@ -31,7 +31,7 @@ struct PgTypeRow {
 }
 
 impl PgTypeRow {
-    fn to_cells(&self) -> Vec<CellInput> {
+    fn to_cells(self) -> Vec<CellInput> {
         vec![
             CellInput::Value(Value::Int64(self.oid as i64)),
             CellInput::Value(Value::Text(self.typname.to_string())),
@@ -882,7 +882,7 @@ pub(super) fn init_pg_type(db: &mut Db) {
         .expect("create pg_catalog.pg_type");
 
     let ctx = EvalContext::new(SessionTimeZone::Utc);
-    let rows: Vec<Vec<CellInput>> = BUILTIN_TYPES.iter().map(PgTypeRow::to_cells).collect();
+    let rows: Vec<Vec<CellInput>> = BUILTIN_TYPES.iter().map(|row| row.to_cells()).collect();
     db.insert_full_rows(
         "pg_catalog",
         "pg_type",

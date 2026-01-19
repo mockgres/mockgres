@@ -30,6 +30,8 @@ pub(crate) use visibility::{
     row_key_to_row_id, select_visible_version, select_visible_version_idx, visible_row_clone,
 };
 
+type BoundScanResult = anyhow::Result<(Vec<Row>, Vec<(usize, String)>, Vec<RowId>)>;
+
 #[derive(Clone, Debug)]
 pub enum CellInput {
     Value(Value),
@@ -402,23 +404,20 @@ impl Db {
         let mut removed = false;
         let mut removed_table_id = None;
         for tid in table_ids {
-            if let Some(table_meta) = self.catalog.get_table_mut_by_id(&tid) {
-                if let Some(pos) = table_meta
+            if let Some(table_meta) = self.catalog.get_table_mut_by_id(&tid)
+                && let Some(pos) = table_meta
                     .indexes
                     .iter()
                     .position(|idx| idx.name == index_name)
-                {
-                    table_meta.indexes.remove(pos);
-                    removed = true;
-                    removed_table_id = Some(tid);
-                    break;
-                }
+            {
+                table_meta.indexes.remove(pos);
+                removed = true;
+                removed_table_id = Some(tid);
+                break;
             }
         }
-        if let Some(tid) = removed_table_id {
-            if let Some(table) = self.tables.get_mut(&tid) {
-                table.unique_maps.remove(index_name);
-            }
+        if let Some(tid) = removed_table_id && let Some(table) = self.tables.get_mut(&tid) {
+            table.unique_maps.remove(index_name);
         }
         if removed || if_exists {
             Ok(())
@@ -442,10 +441,10 @@ impl Db {
         name: &str,
     ) -> anyhow::Result<&TableMeta> {
         for schema_id in search_path {
-            if let Some(schema_name) = self.catalog.schema_name(*schema_id) {
-                if let Some(table) = self.catalog.get_table(schema_name.as_str(), name) {
-                    return Ok(table);
-                }
+            if let Some(schema_name) = self.catalog.schema_name(*schema_id)
+                && let Some(table) = self.catalog.get_table(schema_name.as_str(), name)
+            {
+                return Ok(table);
             }
         }
         Err(sql_err("42P01", format!("no such table {name}")))
@@ -457,7 +456,7 @@ impl Db {
         name: &str,
         positions: &[usize],
         visibility: &VisibilityContext,
-    ) -> anyhow::Result<(Vec<Row>, Vec<(usize, String)>, Vec<RowId>)> {
+    ) -> BoundScanResult {
         let tm = self.resolve_table(schema, name)?;
         let table = self
             .tables
@@ -532,12 +531,10 @@ impl Db {
                     positions.push(idx);
                 }
 
-                if let Some(pk) = meta.primary_key.as_ref() {
-                    if pk.columns == positions {
-                        return Ok(ResolvedOnConflictTarget::Constraint {
-                            index_name: pk.name.clone(),
-                        });
-                    }
+                if let Some(pk) = meta.primary_key.as_ref() && pk.columns == positions {
+                    return Ok(ResolvedOnConflictTarget::Constraint {
+                        index_name: pk.name.clone(),
+                    });
                 }
 
                 let idx_meta = meta
@@ -557,12 +554,10 @@ impl Db {
             }
 
             Constraint(name) => {
-                if let Some(pk) = &meta.primary_key {
-                    if pk.name == *name {
-                        return Ok(ResolvedOnConflictTarget::Constraint {
-                            index_name: pk.name.clone(),
-                        });
-                    }
+                if let Some(pk) = &meta.primary_key && pk.name == *name {
+                    return Ok(ResolvedOnConflictTarget::Constraint {
+                        index_name: pk.name.clone(),
+                    });
                 }
                 if let Some(idx) = meta
                     .indexes

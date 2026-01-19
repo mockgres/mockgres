@@ -152,7 +152,8 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::Alias { input, .. } => collect_param_hints_from_plan(input, out),
-        Plan::SeqScan { .. }
+        Plan::Empty
+        | Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }
@@ -338,7 +339,8 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             }
         }
         Plan::Alias { input, .. } => collect_param_indexes(input, out),
-        Plan::SeqScan { .. }
+        Plan::Empty
+        | Plan::SeqScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }

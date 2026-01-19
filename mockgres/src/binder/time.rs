@@ -33,7 +33,7 @@ pub(crate) fn bind_time_scalar_func(
     args: &[ScalarExpr],
     time_ctx: BindTimeContext,
 ) -> Option<PgWireResult<ScalarExpr>> {
-    let result = match func {
+    match func {
         ScalarFunc::Now | ScalarFunc::CurrentTimestamp => {
             Some(bind_current_timestamp(args, time_ctx))
         }
@@ -42,8 +42,7 @@ pub(crate) fn bind_time_scalar_func(
         ScalarFunc::ClockTimestamp => Some(bind_clock_timestamp(args)),
         ScalarFunc::CurrentDate => Some(bind_current_date(args, time_ctx)),
         _ => None,
-    };
-    result
+    }
 }
 
 fn bind_current_timestamp(

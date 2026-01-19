@@ -16,21 +16,24 @@ use super::expr::{
     parse_bool_expr_with_aggregates, parse_column_ref, parse_scalar_expr,
 };
 
+type ProjectionItems = Vec<(ScalarExpr, String)>;
+type ParsedSelectList = (Selection, Option<ProjectionItems>);
+
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     if sel.from_clause.is_empty() {
         return plan_literal_select(sel);
     }
     let mut count_star = false;
     let mut count_alias = "count".to_string();
-    if sel.target_list.len() == 1 {
-        if let Some(alias) = detect_count_star(sel.target_list.first().unwrap()) {
-            count_star = true;
-            count_alias = alias;
-        }
+    if sel.target_list.len() == 1
+        && let Some(alias) = detect_count_star(sel.target_list.first().unwrap())
+    {
+        count_star = true;
+        count_alias = alias;
     }
     let has_other_aggs = target_list_contains_aggregates(&sel.target_list);
     let from_count = sel.from_clause.len();
-    let has_join = sel.from_clause.iter().any(|node| from_item_is_join(node));
+    let has_join = sel.from_clause.iter().any(from_item_is_join);
     let multi_from = from_count > 1 || has_join;
     let lock_request = parse_locking_clause(&mut sel.locking_clause, multi_from)?;
 
@@ -60,12 +63,12 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     };
 
     let mut project_prefix_len: Option<usize> = None;
-    if !multi_from {
-        if let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
-            let mut needed = Vec::new();
-            collect_columns_from_bool_expr(expr, &mut needed);
-            ensure_columns_present(cols, needed, &mut project_prefix_len);
-        }
+    if !multi_from
+        && let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr)
+    {
+        let mut needed = Vec::new();
+        collect_columns_from_bool_expr(expr, &mut needed);
+        ensure_columns_present(cols, needed, &mut project_prefix_len);
     }
 
     let mut order_keys: Option<Vec<SortKey>> = None;
@@ -74,12 +77,10 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         if let Some(items) = &projection_items {
             rewrite_order_keys_for_projection(&mut keys, items);
         }
-        if !multi_from {
-            if let Selection::Columns(cols) = &mut selection {
-                let mut needed = Vec::new();
-                collect_columns_from_order_keys(&keys, &mut needed);
-                ensure_columns_present(cols, needed, &mut project_prefix_len);
-            }
+        if !multi_from && let Selection::Columns(cols) = &mut selection {
+            let mut needed = Vec::new();
+            collect_columns_from_order_keys(&keys, &mut needed);
+            ensure_columns_present(cols, needed, &mut project_prefix_len);
         }
         order_keys = Some(keys);
     }
@@ -593,7 +594,7 @@ fn try_plan_builtin_select(target: &pg_query::Node) -> PgWireResult<Option<Plan>
                 }
             })
         })
-        .last()
+        .next_back()
         .unwrap_or_default();
 
     // Only handle our two builtins here
@@ -634,10 +635,8 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
         return Err(fe("at least one column required"));
     }
     // check for builtin single-target SELECTs
-    if tl.len() == 1 {
-        if let Some(plan) = try_plan_builtin_select(&tl[0])? {
-            return Ok(plan);
-        }
+    if tl.len() == 1 && let Some(plan) = try_plan_builtin_select(&tl[0])? {
+        return Ok(plan);
     }
     let mut out_exprs = Vec::with_capacity(tl.len());
     for t in tl {
@@ -671,22 +670,20 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
 
 fn parse_select_list(
     target_list: &mut Vec<pg_query::Node>,
-) -> PgWireResult<(Selection, Option<Vec<(ScalarExpr, String)>>)> {
+) -> PgWireResult<ParsedSelectList> {
     if target_list.len() == 1 {
         let t = &target_list[0];
         let node = t.node.as_ref().ok_or_else(|| fe("missing target node"))?;
-        if let NodeEnum::ResTarget(rt) = node {
-            if let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref()) {
-                if cr
-                    .fields
-                    .get(0)
-                    .and_then(|f| f.node.as_ref())
-                    .map(|n| matches!(n, NodeEnum::AStar(_)))
-                    .unwrap_or(false)
-                {
-                    return Ok((Selection::Star, None));
-                }
-            }
+        if let NodeEnum::ResTarget(rt) = node
+            && let Some(NodeEnum::ColumnRef(cr)) =
+                rt.val.as_ref().and_then(|n| n.node.as_ref())
+            && cr
+                .fields
+                .first()
+                .and_then(|f| f.node.as_ref())
+                .is_some_and(|n| matches!(n, NodeEnum::AStar(_)))
+        {
+            return Ok((Selection::Star, None));
         }
     }
 
@@ -983,7 +980,7 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
 fn infer_agg_type(agg: &AggCall) -> DataType {
     match agg.func {
         AggFunc::Count => DataType::Int8,
-        AggFunc::Sum => match agg.expr.as_ref().map(|e| infer_expr_type(e)) {
+        AggFunc::Sum => match agg.expr.as_ref().map(infer_expr_type) {
             Some(DataType::Float8) => DataType::Float8,
             _ => DataType::Int8,
         },
@@ -991,7 +988,7 @@ fn infer_agg_type(agg: &AggCall) -> DataType {
         AggFunc::Min | AggFunc::Max => agg
             .expr
             .as_ref()
-            .map(|e| infer_expr_type(e))
+            .map(infer_expr_type)
             .unwrap_or(DataType::Text),
     }
 }

@@ -2,7 +2,10 @@ use std::collections::HashSet;
 
 use super::*;
 
+type UpdateResult = anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)>;
+
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub fn update_rows(
         &mut self,
         schema: &str,
@@ -15,7 +18,7 @@ impl Db {
         txid: TxId,
         lock_owner: LockOwner,
         ctx: &EvalContext,
-    ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<RowPointer>)> {
+    ) -> UpdateResult {
         let meta = self
             .catalog
             .get_table(schema, name)

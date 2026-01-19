@@ -16,6 +16,8 @@ use super::exec::set_show::build_set_show_executor;
 use super::exec::tx::{begin_transaction, commit_transaction, rollback_transaction};
 use super::exec::write_dml::{build_delete_executor, build_insert_executor, build_update_executor};
 
+type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
+
 pub(crate) fn schema_or_public(schema: &Option<SchemaName>) -> &str {
     schema.as_ref().map(|s| s.as_str()).unwrap_or("public")
 }
@@ -30,6 +32,7 @@ pub(crate) fn assert_supported_aggs(aggs: &[(AggCall, String)]) {
 
 pub fn command_tag(plan: &Plan) -> &'static str {
     match plan {
+        Plan::Empty => "EMPTY",
         Plan::Values { .. }
         | Plan::SeqScan { .. }
         | Plan::Projection { .. }
@@ -84,8 +87,9 @@ pub fn build_executor(
     p: &Plan,
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     match p {
+        Plan::Empty => Err(fe("empty query")),
         Plan::Values { .. }
         | Plan::Projection { .. }
         | Plan::Aggregate { .. }
@@ -96,9 +100,15 @@ pub fn build_executor(
         | Plan::Order { .. }
         | Plan::Limit { .. }
         | Plan::Join { .. }
-        | Plan::Alias { .. } => {
-            return build_read_executor(db, txn_manager, session, snapshot_xid, p, params, ctx);
-        }
+        | Plan::Alias { .. } => build_read_executor(
+            db,
+            txn_manager,
+            session,
+            snapshot_xid,
+            p,
+            params,
+            ctx,
+        ),
         Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
@@ -115,9 +125,7 @@ pub fn build_executor(
         | Plan::UnsupportedDbDDL { .. }
         | Plan::CreateDatabase { .. }
         | Plan::DropDatabase { .. }
-        | Plan::AlterDatabase { .. } => {
-            return build_ddl_executor(db, session, p, ctx);
-        }
+        | Plan::AlterDatabase { .. } => build_ddl_executor(db, session, p, ctx),
 
         Plan::InsertValues {
             table,
@@ -182,7 +190,7 @@ pub fn build_executor(
             ctx,
         ),
         Plan::ShowVariable { .. } | Plan::SetVariable { .. } => {
-            return build_set_show_executor(db, session, p, ctx);
+            build_set_show_executor(db, session, p, ctx)
         }
 
         Plan::BeginTransaction => {

@@ -17,7 +17,10 @@ enum InsertOrUpdateOp {
     },
 }
 
+type InsertResult = anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<Row>, Vec<RowPointer>)>;
+
 impl Db {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_full_rows(
         &mut self,
         schema: &str,
@@ -28,7 +31,7 @@ impl Db {
         params: &[Value],
         ctx: &EvalContext,
         on_conflict: Option<ResolvedOnConflictKind>,
-    ) -> anyhow::Result<(usize, Vec<Row>, Vec<RowPointer>, Vec<Row>, Vec<RowPointer>)> {
+    ) -> InsertResult {
         let meta = self
             .catalog
             .get_table(schema, name)
@@ -131,30 +134,29 @@ impl Db {
             };
 
             let mut conflict: Option<InsertConflict> = None;
-            if let Some(pk_key) = pk_key.as_ref() {
-                if let Some(existing_rowid) = self.tables[&table_id]
+            if let Some(pk_key) = pk_key.as_ref()
+                && let Some(existing_rowid) = self.tables[&table_id]
                     .pk_map
                     .as_ref()
                     .and_then(|map| map.get(pk_key))
-                {
-                    let constraint = meta
-                        .primary_key
-                        .as_ref()
-                        .expect("pk metadata exists when pk_key is present");
-                    conflict = Some(InsertConflict::PrimaryKey {
-                        name: constraint.name.clone(),
-                        row_id: *existing_rowid,
-                    });
-                }
+            {
+                let constraint = meta
+                    .primary_key
+                    .as_ref()
+                    .expect("pk metadata exists when pk_key is present");
+                conflict = Some(InsertConflict::PrimaryKey {
+                    name: constraint.name.clone(),
+                    row_id: *existing_rowid,
+                });
             }
-            if conflict.is_none() {
-                if let Some(existing) = find_unique_violation(
+            if conflict.is_none()
+                && let Some(existing) = find_unique_violation(
                     &self.tables[&table_id].unique_maps,
                     &pending_insert.unique_keys,
                     None,
-                ) {
-                    conflict = Some(InsertConflict::UniqueIndex(existing));
-                }
+                )
+            {
+                conflict = Some(InsertConflict::UniqueIndex(existing));
             }
 
             if let Some(conflict) = conflict {
@@ -383,8 +385,7 @@ impl Db {
                         if let ConflictDirective::DoUpdate {
                             sets, where_clause, ..
                         } = &conflict_directive
-                        {
-                            if apply_conflict_update(
+                            && apply_conflict_update(
                                 existing_rowid,
                                 pending_insert,
                                 sets,
@@ -392,9 +393,9 @@ impl Db {
                                 &mut table,
                                 &mut updated_rows,
                                 &mut updated_ptrs,
-                            )? {
-                                count += 1;
-                            }
+                            )?
+                        {
+                            count += 1;
                         }
                     }
                 }
@@ -507,17 +508,17 @@ fn detect_conflict(
     table: &Table,
     pending: &PendingInsert,
 ) -> Option<InsertConflict> {
-    if let Some(pk_key) = pending.pk_key.as_ref() {
-        if let Some(existing) = table.pk_map.as_ref().and_then(|pk_map| pk_map.get(pk_key)) {
-            let constraint = meta
-                .primary_key
-                .as_ref()
-                .expect("pk metadata exists when pk_key is present");
-            return Some(InsertConflict::PrimaryKey {
-                name: constraint.name.clone(),
-                row_id: *existing,
-            });
-        }
+    if let Some(pk_key) = pending.pk_key.as_ref()
+        && let Some(existing) = table.pk_map.as_ref().and_then(|pk_map| pk_map.get(pk_key))
+    {
+        let constraint = meta
+            .primary_key
+            .as_ref()
+            .expect("pk metadata exists when pk_key is present");
+        return Some(InsertConflict::PrimaryKey {
+            name: constraint.name.clone(),
+            row_id: *existing,
+        });
     }
     if let Some(conflict) = find_unique_violation(&table.unique_maps, &pending.unique_keys, None) {
         return Some(InsertConflict::UniqueIndex(conflict));

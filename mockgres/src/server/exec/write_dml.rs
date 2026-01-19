@@ -21,6 +21,9 @@ use futures::executor::block_on;
 
 use super::tx::{finish_writer_tx, writer_txid};
 
+type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_insert_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,
@@ -34,7 +37,7 @@ pub(crate) fn build_insert_executor(
     returning_schema: &Option<Schema>,
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     let schema_name = schema_or_public(&table.schema);
     let table_meta = {
         let db = db.read();
@@ -75,7 +78,7 @@ pub(crate) fn build_insert_executor(
                 .iter()
                 .position(|c| c.name == *col)
                 .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
-            if indexes.iter().any(|i| *i == pos) {
+            if indexes.contains(&pos) {
                 return Err(fe_code("42701", format!("column {col} specified twice")));
             }
             indexes.push(pos);
@@ -183,6 +186,7 @@ pub(crate) fn build_insert_executor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_update_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,
@@ -197,7 +201,7 @@ pub(crate) fn build_update_executor(
     returning_schema: &Option<Schema>,
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     let assignments = sets
         .iter()
         .map(|set| match set {
@@ -298,6 +302,7 @@ pub(crate) fn build_update_executor(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_delete_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,
@@ -309,7 +314,7 @@ pub(crate) fn build_delete_executor(
     returning_schema: &Option<Schema>,
     params: Arc<Vec<Value>>,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     let materialized_filter = if let Some(f) = filter {
         Some(materialize_in_subqueries(
             f,

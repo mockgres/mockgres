@@ -175,12 +175,9 @@ impl Catalog {
             .schemas
             .get_mut(&schema_id)
             .expect("schema must exist before inserting table");
-        entry
-            .objects
-            .insert(name.to_string(), meta.id)
-            .map(|existing| {
-                panic!("table {name} already exists with id {:?}", existing);
-            });
+        if let Some(existing) = entry.objects.insert(name.to_string(), meta.id) {
+            panic!("table {name} already exists with id {:?}", existing);
+        }
         self.tables_by_id.insert(meta.id, meta);
     }
 

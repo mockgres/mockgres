@@ -34,14 +34,12 @@ impl Db {
                 if !removed_rows.is_empty() {
                     let row_id = row_key_to_row_id(&ptr.key)?;
                     for row in removed_rows {
-                        if let Some(pk_key) = build_primary_key_row_key(&meta, &row)? {
-                            if let Some(pk_map) = table.pk_map.as_mut() {
-                                if let Some(existing) = pk_map.get(&pk_key) {
-                                    if *existing == row_id {
-                                        pk_map.remove(&pk_key);
-                                    }
-                                }
-                            }
+                        if let Some(pk_key) = build_primary_key_row_key(&meta, &row)?
+                            && let Some(pk_map) = table.pk_map.as_mut()
+                            && let Some(existing) = pk_map.get(&pk_key)
+                            && *existing == row_id
+                        {
+                            pk_map.remove(&pk_key);
                         }
                         let fk_keys = meta
                             .foreign_keys
@@ -82,10 +80,10 @@ impl Db {
                 if !restored_rows.is_empty() {
                     let row_id = row_key_to_row_id(&ptr.key)?;
                     for row in restored_rows {
-                        if let Some(pk_key) = build_primary_key_row_key(&meta, &row)? {
-                            if let Some(pk_map) = table.pk_map.as_mut() {
-                                pk_map.insert(pk_key, row_id);
-                            }
+                        if let Some(pk_key) = build_primary_key_row_key(&meta, &row)?
+                            && let Some(pk_map) = table.pk_map.as_mut()
+                        {
+                            pk_map.insert(pk_key, row_id);
                         }
                         let fk_keys = meta
                             .foreign_keys

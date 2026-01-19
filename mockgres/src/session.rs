@@ -26,8 +26,9 @@ pub struct TxnChanges {
     pub updated_old: Vec<RowPointer>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum SessionTimeZone {
+    #[default]
     Utc,
     FixedOffset { seconds: i32, display: String },
 }
@@ -42,8 +43,7 @@ impl TransactionIsolation {
         let normalized = input
             .trim()
             .to_ascii_lowercase()
-            .replace('_', " ")
-            .replace('-', " ");
+            .replace(['_', '-'], " ");
         match normalized.as_str() {
             "read committed" => Ok(TransactionIsolation::ReadCommitted),
             other => Err(format!("isolation level {other} not supported")),
@@ -54,12 +54,6 @@ impl TransactionIsolation {
         match self {
             TransactionIsolation::ReadCommitted => "read committed",
         }
-    }
-}
-
-impl Default for SessionTimeZone {
-    fn default() -> Self {
-        SessionTimeZone::Utc
     }
 }
 
@@ -99,7 +93,7 @@ impl SessionTimeZone {
             Some(_) => return Err("invalid time zone minute".to_string()),
             None => 0,
         };
-        if minutes < 0 || minutes >= 60 {
+        if !(0..60).contains(&minutes) {
             return Err("time zone minute out of range".to_string());
         }
         if hours == 15 && minutes > 0 {

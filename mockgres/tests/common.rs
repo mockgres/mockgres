@@ -12,6 +12,7 @@ pub struct TestCtx {
     conn_str: String,
     pub _bg: JoinHandle<()>,
     pub _server: JoinHandle<()>,
+    #[allow(dead_code)]
     pub shutdown: tokio::sync::oneshot::Sender<()>,
     #[allow(dead_code)]
     extra_connections: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -111,6 +112,7 @@ pub async fn simple_first_cell(client: &Client, sql: &str) -> String {
     row.get(0).expect("one column").to_string()
 }
 
+#[allow(dead_code)]
 pub fn assert_db_error_contains(err: &tokio_postgres::Error, needle: &str) {
     let db_err = err.as_db_error().expect("expected db error");
     assert!(

@@ -19,7 +19,7 @@ impl Planner {
             return Err(fe("multiple statements not supported"));
         }
         let Some(stmt) = stmts.into_iter().next() else {
-            return Err(fe("empty query"));
+            return Ok(Plan::Empty);
         };
         match stmt.stmt.and_then(|n| n.node) {
             Some(NodeEnum::TransactionStmt(tx)) => ddl::plan_transaction_stmt(&tx),

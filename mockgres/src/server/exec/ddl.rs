@@ -11,12 +11,14 @@ use crate::engine::{
 use crate::server::errors::map_db_err;
 use crate::session::Session;
 
+type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
+
 pub(crate) fn build_ddl_executor(
     db: &Arc<RwLock<Db>>,
     session: &Arc<Session>,
     plan: &Plan,
     ctx: &EvalContext,
-) -> PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)> {
+) -> ExecResult {
     match plan {
         Plan::CreateTable {
             table,
@@ -42,7 +44,7 @@ pub(crate) fn build_ddl_executor(
                 )
                 .map_err(map_db_err)?;
             if !uniques.is_empty() {
-                for u in &*uniques {
+                for u in uniques {
                     let idx_name = u
                         .name
                         .clone()
@@ -480,10 +482,10 @@ fn resolve_table_schema(
     }
     let search_path = session.search_path();
     for schema_id in search_path {
-        if let Some(entry) = db.catalog.schemas.get(&schema_id) {
-            if entry.objects.contains_key(&table.name) {
-                return Ok(Some(entry.name.as_str().to_string()));
-            }
+        if let Some(entry) = db.catalog.schemas.get(&schema_id)
+            && entry.objects.contains_key(&table.name)
+        {
+            return Ok(Some(entry.name.as_str().to_string()));
         }
     }
     Ok(None)
@@ -536,10 +538,10 @@ fn resolve_index_schema(
     }
     let search_path = session.search_path();
     for schema_id in search_path {
-        if schema_contains_index(db, schema_id, &index.name) {
-            if let Some(entry) = db.catalog.schemas.get(&schema_id) {
-                return Ok(Some(entry.name.as_str().to_string()));
-            }
+        if schema_contains_index(db, schema_id, &index.name)
+            && let Some(entry) = db.catalog.schemas.get(&schema_id)
+        {
+            return Ok(Some(entry.name.as_str().to_string()));
         }
     }
     Ok(None)
@@ -550,10 +552,10 @@ fn schema_contains_index(db: &Db, schema_id: SchemaId, index_name: &str) -> bool
         return false;
     };
     for table_id in entry.objects.values() {
-        if let Some(meta) = db.catalog.tables_by_id.get(table_id) {
-            if meta.indexes.iter().any(|idx| idx.name == index_name) {
-                return true;
-            }
+        if let Some(meta) = db.catalog.tables_by_id.get(table_id)
+            && meta.indexes.iter().any(|idx| idx.name == index_name)
+        {
+            return true;
         }
     }
     false

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::catalog::{Catalog, ForeignKeyMeta, PrimaryKeyMeta, TableId, TableMeta};
 use crate::engine::{ReferentialAction, Value};
@@ -120,15 +120,14 @@ pub(crate) fn find_unique_violation(
         let Some(values) = maybe_values else {
             continue;
         };
-        if let Some(map) = unique_maps.get(index_name) {
-            if let Some(existing) = map.get(values) {
-                if row_id.map_or(true, |rid| *existing != rid) {
-                    return Some(ConflictInfo {
-                        index_name: index_name.clone(),
-                        existing_rowid: *existing,
-                    });
-                }
-            }
+        if let Some(map) = unique_maps.get(index_name)
+            && let Some(existing) = map.get(values)
+            && row_id != Some(*existing)
+        {
+            return Some(ConflictInfo {
+                index_name: index_name.clone(),
+                existing_rowid: *existing,
+            });
         }
     }
     None
@@ -169,18 +168,17 @@ pub(crate) fn check_unique_updates(
         if !changed {
             continue;
         }
-        if let Some(map) = unique_maps.get(index_name) {
-            if let Some(existing) = map.get(new_values) {
-                if *existing != row_id {
-                    return Err(sql_err(
-                        "23505",
-                        format!(
-                            "duplicate key value violates unique constraint {}",
-                            index_name
-                        ),
-                    ));
-                }
-            }
+        if let Some(map) = unique_maps.get(index_name)
+            && let Some(existing) = map.get(new_values)
+            && *existing != row_id
+        {
+            return Err(sql_err(
+                "23505",
+                format!(
+                    "duplicate key value violates unique constraint {}",
+                    index_name
+                ),
+            ));
         }
     }
     Ok(())
@@ -196,7 +194,7 @@ pub(crate) fn insert_unique_entries_owned(
             table
                 .unique_maps
                 .entry(index_name)
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(values, row_id);
         }
     }
@@ -221,7 +219,7 @@ pub(crate) fn apply_unique_updates(
             table
                 .unique_maps
                 .entry(index_name)
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(values, row_id);
         }
     }
@@ -247,10 +245,8 @@ pub(crate) fn remove_unique_entry(
 ) {
     let mut remove_entry = false;
     if let Some(map) = table.unique_maps.get_mut(index_name) {
-        if let Some(existing) = map.get(values) {
-            if *existing == row_id {
-                map.remove(values);
-            }
+        if let Some(existing) = map.get(values) && *existing == row_id {
+            map.remove(values);
         }
         if map.is_empty() {
             remove_entry = true;
@@ -351,23 +347,21 @@ pub(crate) fn update_pk_map_for_row(
         .pk_map
         .as_mut()
         .expect("pk_map missing for table with primary key");
-    if let Some(existing) = pk_map.get(new_key) {
-        if *existing != row_id {
-            return Err(sql_err(
-                "23505",
-                format!(
-                    "duplicate key value violates unique constraint {}",
-                    pk_meta.name
-                ),
-            ));
-        }
+    if let Some(existing) = pk_map.get(new_key) && *existing != row_id {
+        return Err(sql_err(
+            "23505",
+            format!(
+                "duplicate key value violates unique constraint {}",
+                pk_meta.name
+            ),
+        ));
     }
-    if let Some(old) = old_key {
-        if let Some(existing) = pk_map.get(old) {
-            if *existing == row_id && old != new_key {
-                pk_map.remove(old);
-            }
-        }
+    if let Some(old) = old_key
+        && let Some(existing) = pk_map.get(old)
+        && *existing == row_id
+        && old != new_key
+    {
+        pk_map.remove(old);
     }
     pk_map.insert(new_key.clone(), row_id);
     Ok(())
@@ -443,19 +437,18 @@ pub(crate) fn ensure_no_inbound_refs(
             }
         };
         let map_key = (parent_id, key_values);
-        if let Some(rows) = child.fk_rev.get(&map_key) {
-            if rows
+        if let Some(rows) = child.fk_rev.get(&map_key)
+            && rows
                 .iter()
                 .any(|row_id| visible_row_clone(child, *row_id, visibility).is_some())
-            {
-                return Err(sql_err(
-                    "23503",
-                    format!(
-                        "operation on {}.{} violates foreign key {} on {}.{}",
-                        schema, table, fk.fk.name, fk.schema, fk.table
-                    ),
-                ));
-            }
+        {
+            return Err(sql_err(
+                "23503",
+                format!(
+                    "operation on {}.{} violates foreign key {} on {}.{}",
+                    schema, table, fk.fk.name, fk.schema, fk.table
+                ),
+            ));
         }
     }
     Ok(())
@@ -470,11 +463,7 @@ pub(crate) fn add_fk_rev_entries(
     for (fk, key) in meta.foreign_keys.iter().zip(keys.iter()) {
         if let Some(values) = key {
             let map_key = (fk.referenced_table, values.clone());
-            table
-                .fk_rev
-                .entry(map_key)
-                .or_insert_with(HashSet::new)
-                .insert(row_id);
+            table.fk_rev.entry(map_key).or_default().insert(row_id);
         }
     }
 }

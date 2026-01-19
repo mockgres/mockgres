@@ -94,7 +94,7 @@ impl ExecNode for CountExec {
             return Ok(None);
         }
         let mut count: i64 = 0;
-        while let Some(_) = self.input.next().await? {
+        while self.input.next().await?.is_some() {
             count += 1;
         }
         self.produced = true;
@@ -465,8 +465,8 @@ impl OrderExec {
                         order_values(av, bv, spec.asc, spec.nulls_first)
                     }
                     OrderKeyKind::Expr(idx) => {
-                        let av = exprs_a.get(idx).map(|v| v);
-                        let bv = exprs_b.get(idx).map(|v| v);
+                        let av = exprs_a.get(idx);
+                        let bv = exprs_b.get(idx);
                         order_values(av, bv, spec.asc, spec.nulls_first)
                     }
                 };
@@ -561,9 +561,7 @@ fn order_values(
                 Greater
             }
             // nan > all
-            else if y.is_nan() {
-                Less
-            } else if x < y {
+            else if y.is_nan() || x < y {
                 Less
             } else if x > y {
                 Greater
@@ -644,10 +642,10 @@ fn compare_rows(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
             (Value::Null, _) => return Ordering::Less,
             (_, Value::Null) => return Ordering::Greater,
             _ => {
-                if let Some(ord) = super::eval::compare_values(av, bv) {
-                    if ord != Ordering::Equal {
-                        return ord;
-                    }
+                if let Some(ord) = super::eval::compare_values(av, bv)
+                    && ord != Ordering::Equal
+                {
+                    return ord;
                 }
             }
         }
@@ -720,10 +718,8 @@ impl ExecNode for LimitExec {
                 None => return Ok(None),
             }
         }
-        if let Some(rem) = &mut self.remaining {
-            if *rem == 0 {
-                return Ok(None);
-            }
+        if let Some(rem) = &mut self.remaining && *rem == 0 {
+            return Ok(None);
         }
         match self.child.next().await? {
             Some(r) => {

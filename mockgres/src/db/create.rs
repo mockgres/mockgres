@@ -11,6 +11,8 @@ use crate::txn::SYSTEM_TXID;
 use super::pg_type::init_pg_type;
 use super::{Db, sql_err};
 
+type ColumnSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+
 impl Db {
     pub(super) fn init_builtin_catalog(&mut self) {
         let public_id = self.catalog.ensure_schema("public");
@@ -66,13 +68,7 @@ impl Db {
         &mut self,
         schema: &str,
         name: &str,
-        cols: Vec<(
-            String,
-            DataType,
-            bool,
-            Option<ScalarExpr>,
-            Option<IdentitySpec>,
-        )>,
+        cols: Vec<ColumnSpec>,
         pk_spec: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
         search_path: &[SchemaId],
@@ -309,12 +305,11 @@ impl Db {
         if let Some(table) = self.tables.get_mut(&table_id) {
             let mut to_remove = Vec::new();
             for (k, versions) in table.rows_by_key.iter() {
-                if let Some(row) = versions.last() {
-                    if matches!(row.data.get(1), Some(Value::Text(n)) if n == relname)
-                        && matches!(row.data.get(2), Some(Value::Int64(ns)) if *ns == schema_id as i64)
-                    {
-                        to_remove.push(k.clone());
-                    }
+                if let Some(row) = versions.last()
+                    && matches!(row.data.get(1), Some(Value::Text(n)) if n == relname)
+                    && matches!(row.data.get(2), Some(Value::Int64(ns)) if *ns == schema_id as i64)
+                {
+                    to_remove.push(k.clone());
                 }
             }
             for k in to_remove {
@@ -330,11 +325,10 @@ impl Db {
         if let Some(table) = self.tables.get_mut(&table_id) {
             let mut to_remove = Vec::new();
             for (k, versions) in table.rows_by_key.iter() {
-                if let Some(row) = versions.last() {
-                    if matches!(row.data.get(0), Some(Value::Int64(ns)) if *ns == schema_id as i64)
-                    {
-                        to_remove.push(k.clone());
-                    }
+                if let Some(row) = versions.last()
+                    && matches!(row.data.first(), Some(Value::Int64(ns)) if *ns == schema_id as i64)
+                {
+                    to_remove.push(k.clone());
                 }
             }
             for k in to_remove {
@@ -391,6 +385,7 @@ impl Db {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_foreign_keys(
         &self,
         table_schema: &str,
@@ -447,10 +442,8 @@ impl Db {
                                 .unwrap_or(false)
                         })
                     };
-                    if let Some(pk) = meta.primary_key.as_ref() {
-                        if names_match(&pk.columns) {
-                            return Ok(pk.columns.clone());
-                        }
+                    if let Some(pk) = meta.primary_key.as_ref() && names_match(&pk.columns) {
+                        return Ok(pk.columns.clone());
                     }
                     for idx in meta.indexes.iter().filter(|i| i.unique) {
                         if names_match(&idx.columns) {
@@ -544,7 +537,7 @@ impl Db {
                     table_schema,
                     table_name,
                     referenced_schema.as_str(),
-                    &referenced_table_name,
+                    referenced_table_name,
                 )?;
 
                 for (local_idx, pk_idx) in ordered_local.iter().zip(parent_unique.iter()) {
@@ -643,6 +636,7 @@ impl Db {
         Ok(metas)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn align_local_to_parent_pk(
         &self,
         local_indexes: &[ColId],

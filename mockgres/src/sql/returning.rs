@@ -23,17 +23,15 @@ pub(crate) fn parse_returning_clause(
                 }
             })
             .ok_or_else(|| fe("bad RETURNING target"))?;
-        if let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref()) {
-            if cr
+        if let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref())
+            && cr
                 .fields
-                .get(0)
+                .first()
                 .and_then(|f| f.node.as_ref())
-                .map(|n| matches!(n, NodeEnum::AStar(_)))
-                .unwrap_or(false)
-            {
-                exprs.push(ReturningExpr::Star);
-                continue;
-            }
+                .is_some_and(|n| matches!(n, NodeEnum::AStar(_)))
+        {
+            exprs.push(ReturningExpr::Star);
+            continue;
         }
         let expr_node = rt
             .val

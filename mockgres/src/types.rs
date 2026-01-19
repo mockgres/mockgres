@@ -223,7 +223,7 @@ pub fn postgres_micros_to_timestamp(micros: i64) -> i64 {
 }
 
 fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>, String> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err("bytea hex string must have even length".into());
     }
     let mut out = Vec::with_capacity(hex.len() / 2);

@@ -93,10 +93,8 @@ impl<'a> VisibilityContext<'a> {
         }
 
         if let Some(xmax) = version.xmax {
-            if let Some(current) = self.current_tx {
-                if xmax == current {
-                    return false;
-                }
+            if let Some(current) = self.current_tx && xmax == current {
+                return false;
             }
             if self.txn_manager.is_committed(xmax) && xmax <= self.snapshot_xid {
                 return false;

@@ -198,15 +198,13 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
     match op {
         ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul => {
             let (l_val, r_val, use_float) = coerce_numeric_pair(left, right)?;
-            if !use_float {
-                if let (NumericValue::Int(a), NumericValue::Int(b)) = (&l_val, &r_val) {
-                    return Ok(match op {
-                        ScalarBinaryOp::Add => Value::Int64(*a + *b),
-                        ScalarBinaryOp::Sub => Value::Int64(*a - *b),
-                        ScalarBinaryOp::Mul => Value::Int64(*a * *b),
-                        _ => unreachable!(),
-                    });
-                }
+            if !use_float && let (NumericValue::Int(a), NumericValue::Int(b)) = (&l_val, &r_val) {
+                return Ok(match op {
+                    ScalarBinaryOp::Add => Value::Int64(*a + *b),
+                    ScalarBinaryOp::Sub => Value::Int64(*a - *b),
+                    ScalarBinaryOp::Mul => Value::Int64(*a * *b),
+                    _ => unreachable!(),
+                });
             }
             let lf = l_val
                 .to_f64()
@@ -525,10 +523,7 @@ pub fn eval_bool_expr(
             }
             if saw_null { None } else { Some(false) }
         }
-        BoolExpr::Not(inner) => match eval_bool_expr(row, inner, params, ctx)? {
-            Some(v) => Some(!v),
-            None => None,
-        },
+        BoolExpr::Not(inner) => eval_bool_expr(row, inner, params, ctx)?.map(|v| !v),
         BoolExpr::IsNull { expr, negated } => {
             let v = eval_scalar_expr(row, expr, params, ctx)?;
             match v {
@@ -570,9 +565,7 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
                 Ordering::Equal
             } else if a.is_nan() {
                 Ordering::Greater
-            } else if b.is_nan() {
-                Ordering::Less
-            } else if a < b {
+            } else if b.is_nan() || a < b {
                 Ordering::Less
             } else if a > b {
                 Ordering::Greater
@@ -582,9 +575,7 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
         }
         (Value::Int64(a), Value::Float64Bits(bb)) => {
             let (a, b) = (*a as f64, f64::from_bits(*bb));
-            if b.is_nan() {
-                Ordering::Less
-            } else if a < b {
+            if b.is_nan() || a < b {
                 Ordering::Less
             } else if a > b {
                 Ordering::Greater

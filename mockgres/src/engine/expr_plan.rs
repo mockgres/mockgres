@@ -234,8 +234,11 @@ pub struct ForeignKeySpec {
     pub on_delete: ReferentialAction,
 }
 
+type ColumnSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+
 #[derive(Clone, Debug)]
 pub enum Plan {
+    Empty,
     Values {
         rows: Vec<Vec<Expr>>,
         schema: Schema,
@@ -308,26 +311,14 @@ pub enum Plan {
     },
     CreateTable {
         table: ObjName,
-        cols: Vec<(
-            String,
-            DataType,
-            bool,
-            Option<ScalarExpr>,
-            Option<IdentitySpec>,
-        )>,
+        cols: Vec<ColumnSpec>,
         pk: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
         uniques: Vec<UniqueSpec>,
     },
     AlterTableAddColumn {
         table: ObjName,
-        column: (
-            String,
-            DataType,
-            bool,
-            Option<ScalarExpr>,
-            Option<IdentitySpec>,
-        ),
+        column: ColumnSpec,
         if_not_exists: bool,
     },
     AlterTableDropColumn {
@@ -464,6 +455,10 @@ pub enum SortKey {
 impl Plan {
     pub fn schema(&self) -> &Schema {
         match self {
+            Plan::Empty => {
+                static EMPTY: Schema = Schema { fields: vec![] };
+                &EMPTY
+            }
             Plan::Values { schema, .. }
             | Plan::Aggregate { schema, .. }
             | Plan::SeqScan { schema, .. }
