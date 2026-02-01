@@ -12,7 +12,7 @@ use pgwire::api::{
     query::{ExtendedQueryHandler, SimpleQueryHandler},
     results::{
         DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse,
-        Response,
+        Response, Tag,
     },
     PgWireConnectionState,
     store::PortalStore,
@@ -34,11 +34,31 @@ use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
 
 use super::ServerConfig;
-use super::describe::plan_fields;
+use super::describe::plan_fields_with_format;
 use super::exec_builder::{build_executor, command_tag};
 use super::params::{build_params_for_portal, plan_parameter_types};
 
 const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
+
+fn query_command_tag(plan: &Plan) -> String {
+    match plan {
+        Plan::InsertValues { .. } => "INSERT 0".to_string(),
+        Plan::Update { .. } => "UPDATE".to_string(),
+        Plan::Delete { .. } => "DELETE".to_string(),
+        _ => command_tag(plan).to_string(),
+    }
+}
+
+fn execution_tag(plan: &Plan, row_count: Option<usize>) -> Tag {
+    let mut tag = Tag::new(command_tag(plan));
+    if matches!(plan, Plan::InsertValues { .. }) {
+        tag = tag.with_oid(0);
+    }
+    if let Some(rows) = row_count {
+        tag = tag.with_rows(rows);
+    }
+    tag
+}
 
 #[derive(Clone)]
 pub struct Mockgres {
@@ -186,7 +206,7 @@ impl SimpleQueryHandler for Mockgres {
                     let db_read = active_db.read();
                     bind(&db_read, &session, plan.clone())?
                 };
-                let (exec, tag, row_count) = build_executor(
+                let (exec, _tag, row_count) = build_executor(
                     &active_db,
                     &self.txn_manager,
                     &session,
@@ -195,17 +215,24 @@ impl SimpleQueryHandler for Mockgres {
                     params,
                     &eval_ctx,
                 )?;
+                if matches!(bound, Plan::BeginTransaction) {
+                    return Ok(vec![Response::TransactionStart(Tag::new("BEGIN"))]);
+                }
+                if matches!(bound, Plan::CommitTransaction) {
+                    return Ok(vec![Response::TransactionEnd(Tag::new("COMMIT"))]);
+                }
+                if matches!(bound, Plan::RollbackTransaction) {
+                    return Ok(vec![Response::TransactionEnd(Tag::new("ROLLBACK"))]);
+                }
+
+                if exec.schema().fields.is_empty() {
+                    return Ok(vec![Response::Execution(execution_tag(&bound, row_count))]);
+                }
+
                 let (fields, rows) =
                     to_pgwire_stream(exec, FieldFormat::Text, eval_ctx.clone()).await?;
                 let mut qr = QueryResponse::new(fields, rows);
-                let tag_text = if let Some(t) = tag {
-                    t
-                } else if let Some(n) = row_count {
-                    format!("{} {}", command_tag(&bound), n)
-                } else {
-                    command_tag(&bound).to_string()
-                };
-                qr.set_command_tag(&tag_text);
+                qr.set_command_tag(&query_command_tag(&bound));
                 Ok(vec![Response::Query(qr)])
             }
             Err(e) => Err(e),
@@ -240,7 +267,7 @@ impl ExtendedQueryHandler for Mockgres {
             bind(&db, &session, target.statement.clone())?
         };
         let params = plan_parameter_types(&bound);
-        let fields = plan_fields(&bound);
+        let fields = plan_fields_with_format(&bound, FieldFormat::Text);
         Ok(DescribeStatementResponse::new(params, fields))
     }
 
@@ -256,7 +283,11 @@ impl ExtendedQueryHandler for Mockgres {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = self.session_for_client(client)?;
-        let fields = self.describe_plan(&session, &portal.statement.statement)?;
+        let fmt = match portal.result_column_format {
+            pgwire::api::portal::Format::UnifiedBinary => FieldFormat::Binary,
+            _ => FieldFormat::Text,
+        };
+        let fields = self.describe_plan(&session, &portal.statement.statement, fmt)?;
         Ok(DescribePortalResponse::new(fields))
     }
     async fn do_query<C>(
@@ -274,7 +305,10 @@ impl ExtendedQueryHandler for Mockgres {
         if matches!(portal.statement.statement, Plan::Empty) {
             return Ok(Response::EmptyQuery);
         }
-        let fmt = FieldFormat::Text;
+        let fmt = match portal.result_column_format {
+            pgwire::api::portal::Format::UnifiedBinary => FieldFormat::Binary,
+            _ => FieldFormat::Text,
+        };
 
         let session = self.session_for_client(client)?;
         if let Plan::CallBuiltin { name, schema, .. } = &portal.statement.statement {
@@ -324,7 +358,7 @@ impl ExtendedQueryHandler for Mockgres {
         };
 
         let params = build_params_for_portal(&bound, portal, &eval_ctx.time_zone)?;
-        let (exec, tag, row_count) = build_executor(
+        let (exec, _tag, row_count) = build_executor(
             &active_db,
             &self.txn_manager,
             &session,
@@ -333,16 +367,23 @@ impl ExtendedQueryHandler for Mockgres {
             params.clone(),
             &eval_ctx,
         )?;
+        if matches!(bound, Plan::BeginTransaction) {
+            return Ok(Response::TransactionStart(Tag::new("BEGIN")));
+        }
+        if matches!(bound, Plan::CommitTransaction) {
+            return Ok(Response::TransactionEnd(Tag::new("COMMIT")));
+        }
+        if matches!(bound, Plan::RollbackTransaction) {
+            return Ok(Response::TransactionEnd(Tag::new("ROLLBACK")));
+        }
+
+        if exec.schema().fields.is_empty() {
+            return Ok(Response::Execution(execution_tag(&bound, row_count)));
+        }
+
         let (fields, rows) = to_pgwire_stream(exec, fmt, eval_ctx.clone()).await?;
         let mut qr = QueryResponse::new(fields, rows);
-        let tag_text = if let Some(t) = tag {
-            t
-        } else if let Some(n) = row_count {
-            format!("{} {}", command_tag(&bound), n)
-        } else {
-            command_tag(&bound).to_string()
-        };
-        qr.set_command_tag(&tag_text);
+        qr.set_command_tag(&query_command_tag(&bound));
         Ok(Response::Query(qr))
     }
 }
@@ -395,11 +436,16 @@ impl Drop for StatementEpochGuard {
 }
 
 impl Mockgres {
-    fn describe_plan(&self, session: &Session, plan: &Plan) -> PgWireResult<Vec<FieldInfo>> {
+    fn describe_plan(
+        &self,
+        session: &Session,
+        plan: &Plan,
+        format: FieldFormat,
+    ) -> PgWireResult<Vec<FieldInfo>> {
         let active_db = self.db_for_session(session);
         let db = active_db.read();
         let bound = bind(&db, session, plan.clone())?;
-        Ok(plan_fields(&bound))
+        Ok(plan_fields_with_format(&bound, format))
     }
 
     fn db_for_session(&self, session: &Session) -> Arc<RwLock<Db>> {

@@ -16,9 +16,7 @@ use super::tokens::{
 };
 
 pub(super) fn plan_transaction_stmt(stmt: &TransactionStmt) -> PgWireResult<Plan> {
-    if !stmt.options.is_empty() {
-        return Err(fe_code("0A000", "transaction options not supported"));
-    }
+    // Ignore transaction options (isolation level, read/write, deferrable) for compatibility.
     if stmt.chain {
         return Err(fe_code("0A000", "transaction chain not supported"));
     }
