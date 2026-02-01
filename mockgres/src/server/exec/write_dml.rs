@@ -291,13 +291,13 @@ pub(crate) fn build_update_executor(
         Ok((
             Box::new(ValuesExec::from_values(schema, rows)),
             Some(tag),
-            None,
+            Some(count),
         ))
     } else {
         Ok((
             Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
             Some(tag),
-            None,
+            Some(count),
         ))
     }
 }
@@ -369,13 +369,13 @@ pub(crate) fn build_delete_executor(
         Ok((
             Box::new(ValuesExec::from_values(schema, rows)),
             Some(tag),
-            None,
+            Some(count),
         ))
     } else {
         Ok((
             Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
             Some(tag),
-            None,
+            Some(count),
         ))
     }
 }
