@@ -15,6 +15,7 @@ use super::expr::{
     collect_columns_from_scalar_expr, derive_expr_name, is_aggregate_func_name, parse_bool_expr,
     parse_bool_expr_with_aggregates, parse_column_ref, parse_scalar_expr,
 };
+use super::tokens::parse_type_name;
 
 type ProjectionItems = Vec<(ScalarExpr, String)>;
 type ParsedSelectList = (Selection, Option<ProjectionItems>);
@@ -953,7 +954,33 @@ fn parse_nonnegative_count(node: &NodeEnum, label: &str) -> PgWireResult<CountEx
                 ty: Some(DataType::Int8),
             }))
         }
+        NodeEnum::TypeCast(tc) => {
+            let inner = tc
+                .arg
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .ok_or_else(|| fe("bad type cast"))?;
+            let cast_type = tc
+                .type_name
+                .as_ref()
+                .ok_or_else(|| fe("missing cast target"))?;
+            let dt = parse_type_name(cast_type)?;
+            if !matches!(dt, DataType::Int4 | DataType::Int8) {
+                return Err(fe(format!("{label} must be integer")));
+            }
+            let count = parse_nonnegative_count(inner, label)?;
+            Ok(apply_count_expr_param_type(count, dt))
+        }
         _ => Err(fe(format!("unsupported {label} expression"))),
+    }
+}
+
+fn apply_count_expr_param_type(expr: CountExpr, dt: DataType) -> CountExpr {
+    match expr {
+        CountExpr::Expr(ScalarExpr::Param { idx, .. }) => {
+            CountExpr::Expr(ScalarExpr::Param { idx, ty: Some(dt) })
+        }
+        other => other,
     }
 }
 

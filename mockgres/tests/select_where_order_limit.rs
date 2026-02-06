@@ -139,6 +139,19 @@ async fn limit_and_offset_accept_bind_parameters() {
         "unexpected error: {msg}"
     );
 
+    let casted_page: Vec<i32> = ctx
+        .client
+        .query(
+            "select i from paged order by i limit $1::integer offset $2::integer",
+            &[&2_i32, &1_i32],
+        )
+        .await
+        .expect("limit/offset with casted binds")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(casted_page, vec![2, 3]);
+
     let _ = ctx.shutdown.send(());
 }
 
