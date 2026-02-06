@@ -288,10 +288,7 @@ async fn join_with_for_update_not_supported() {
         .query("select parents.id from parents, children for update", &[])
         .await
         .expect_err("joins with FOR UPDATE should be rejected");
-    common::assert_db_error_contains(
-        &err,
-        "FOR UPDATE is only supported for single-table SELECT",
-    );
+    common::assert_db_error_contains(&err, "FOR UPDATE is only supported for single-table SELECT");
 
     let _ = ctx.shutdown.send(());
 }

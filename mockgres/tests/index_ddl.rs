@@ -63,13 +63,15 @@ async fn create_and_drop_index_noop() {
     let _ = ctx.shutdown.send(());
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn partial_unique_index_with_predicate_is_accepted() {
     let ctx = common::start().await;
 
     ctx.client
-        .execute("create table partial_idx(id int primary key, group_instance_id text)", &[])
+        .execute(
+            "create table partial_idx(id int primary key, group_instance_id text)",
+            &[],
+        )
         .await
         .expect("create table");
 

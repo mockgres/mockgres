@@ -1,6 +1,6 @@
+mod advisory_locks;
 mod binder;
 mod catalog;
-mod advisory_locks;
 mod db;
 mod engine;
 mod server;

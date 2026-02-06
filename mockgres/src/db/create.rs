@@ -11,7 +11,13 @@ use crate::txn::SYSTEM_TXID;
 use super::pg_type::init_pg_type;
 use super::{Db, sql_err};
 
-type ColumnSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+type ColumnSpec = (
+    String,
+    DataType,
+    bool,
+    Option<ScalarExpr>,
+    Option<IdentitySpec>,
+);
 
 impl Db {
     pub(super) fn init_builtin_catalog(&mut self) {
@@ -63,7 +69,13 @@ impl Db {
                 "information_schema",
                 "tables",
                 vec![
-                    ("table_schema".to_string(), DataType::Text, false, None, None),
+                    (
+                        "table_schema".to_string(),
+                        DataType::Text,
+                        false,
+                        None,
+                        None,
+                    ),
                     ("table_name".to_string(), DataType::Text, false, None, None),
                     ("table_type".to_string(), DataType::Text, false, None, None),
                 ],
@@ -510,7 +522,9 @@ impl Db {
                                 .unwrap_or(false)
                         })
                     };
-                    if let Some(pk) = meta.primary_key.as_ref() && names_match(&pk.columns) {
+                    if let Some(pk) = meta.primary_key.as_ref()
+                        && names_match(&pk.columns)
+                    {
                         return Ok(pk.columns.clone());
                     }
                     for idx in meta.indexes.iter().filter(|i| i.unique) {

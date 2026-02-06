@@ -64,12 +64,13 @@ pub(crate) fn build_set_show_executor(
                             }
                             let mut resolved = Vec::with_capacity(values.len());
                             for schema_name in values {
-                                let id = db_read.catalog.schema_id(schema_name).ok_or_else(|| {
-                                    fe_code(
-                                        "3F000",
-                                        format!("schema \"{}\" does not exist", schema_name),
-                                    )
-                                })?;
+                                let id =
+                                    db_read.catalog.schema_id(schema_name).ok_or_else(|| {
+                                        fe_code(
+                                            "3F000",
+                                            format!("schema \"{}\" does not exist", schema_name),
+                                        )
+                                    })?;
                                 resolved.push(id);
                             }
                             resolved

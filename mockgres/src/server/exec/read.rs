@@ -5,9 +5,9 @@ use pgwire::error::PgWireResult;
 
 use crate::db::{Db, LockOwner};
 use crate::engine::{
-    CountExec, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinType, LimitExec,
-    NestedLoopJoinExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, Value,
-    ValuesExec, fe,
+    CountExec, CountExpr, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinType,
+    LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec,
+    Value, ValuesExec, eval_scalar_expr, fe,
 };
 use crate::server::errors::map_db_err;
 use crate::session::Session;
@@ -256,8 +256,11 @@ pub fn build_read_executor(
             limit,
             offset,
         } => {
-            let limit_val = *limit;
-            let offset_val = *offset;
+            let limit_val = limit
+                .as_ref()
+                .map(|expr| resolve_count_expr(expr, "limit", &params, ctx))
+                .transpose()?;
+            let offset_val = resolve_count_expr(offset, "offset", &params, ctx)?;
             let (child, _tag, cnt) = build_executor(
                 db,
                 txn_manager,
@@ -328,5 +331,28 @@ pub fn build_read_executor(
             ))
         }
         _ => Err(fe("unsupported plan for read executor")),
+    }
+}
+
+fn resolve_count_expr(
+    expr: &CountExpr,
+    label: &str,
+    params: &[Value],
+    ctx: &EvalContext,
+) -> PgWireResult<usize> {
+    let value = match expr {
+        CountExpr::Value(v) => Value::Int64(*v as i64),
+        CountExpr::Expr(e) => eval_scalar_expr(&[], e, params, ctx)?,
+    };
+
+    match value {
+        Value::Int64(v) => {
+            if v < 0 {
+                Err(fe(format!("{label} must be non-negative")))
+            } else {
+                Ok(v as usize)
+            }
+        }
+        _ => Err(fe(format!("{label} must be integer"))),
     }
 }

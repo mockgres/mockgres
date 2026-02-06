@@ -30,7 +30,10 @@ pub struct TxnChanges {
 pub enum SessionTimeZone {
     #[default]
     Utc,
-    FixedOffset { seconds: i32, display: String },
+    FixedOffset {
+        seconds: i32,
+        display: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,10 +43,7 @@ pub enum TransactionIsolation {
 
 impl TransactionIsolation {
     pub fn parse(input: &str) -> Result<Self, String> {
-        let normalized = input
-            .trim()
-            .to_ascii_lowercase()
-            .replace(['_', '-'], " ");
+        let normalized = input.trim().to_ascii_lowercase().replace(['_', '-'], " ");
         match normalized.as_str() {
             "read committed" => Ok(TransactionIsolation::ReadCommitted),
             other => Err(format!("isolation level {other} not supported")),

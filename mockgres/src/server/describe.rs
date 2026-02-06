@@ -10,14 +10,6 @@ pub fn plan_fields_with_format(plan: &Plan, format: FieldFormat) -> Vec<FieldInf
     plan.schema()
         .fields
         .iter()
-        .map(|f| {
-            FieldInfo::new(
-                f.name.clone(),
-                None,
-                None,
-                f.data_type.to_pg(),
-                format,
-            )
-        })
+        .map(|f| FieldInfo::new(f.name.clone(), None, None, f.data_type.to_pg(), format))
         .collect()
 }

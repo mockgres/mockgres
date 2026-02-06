@@ -101,15 +101,9 @@ pub fn build_executor(
         | Plan::Order { .. }
         | Plan::Limit { .. }
         | Plan::Join { .. }
-        | Plan::Alias { .. } => build_read_executor(
-            db,
-            txn_manager,
-            session,
-            snapshot_xid,
-            p,
-            params,
-            ctx,
-        ),
+        | Plan::Alias { .. } => {
+            build_read_executor(db, txn_manager, session, snapshot_xid, p, params, ctx)
+        }
         Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }

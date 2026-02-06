@@ -245,7 +245,9 @@ pub(crate) fn remove_unique_entry(
 ) {
     let mut remove_entry = false;
     if let Some(map) = table.unique_maps.get_mut(index_name) {
-        if let Some(existing) = map.get(values) && *existing == row_id {
+        if let Some(existing) = map.get(values)
+            && *existing == row_id
+        {
             map.remove(values);
         }
         if map.is_empty() {
@@ -347,7 +349,9 @@ pub(crate) fn update_pk_map_for_row(
         .pk_map
         .as_mut()
         .expect("pk_map missing for table with primary key");
-    if let Some(existing) = pk_map.get(new_key) && *existing != row_id {
+    if let Some(existing) = pk_map.get(new_key)
+        && *existing != row_id
+    {
         return Err(sql_err(
             "23505",
             format!(

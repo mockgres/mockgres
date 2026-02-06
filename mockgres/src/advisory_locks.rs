@@ -32,9 +32,13 @@ impl AdvisoryLockRegistry {
         loop {
             match guard.locks.get_mut(&key) {
                 None => {
-                    guard
-                        .locks
-                        .insert(key, LockEntry { session_id, count: 1 });
+                    guard.locks.insert(
+                        key,
+                        LockEntry {
+                            session_id,
+                            count: 1,
+                        },
+                    );
                     guard
                         .held_by_session
                         .entry(session_id)

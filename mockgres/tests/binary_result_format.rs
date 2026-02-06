@@ -5,15 +5,12 @@ use std::io;
 use bytes::BytesMut;
 use fallible_iterator::FallibleIterator;
 use postgres_protocol::IsNull;
-use postgres_protocol::message::backend::{Message, RowDescriptionBody, DataRowBody};
+use postgres_protocol::message::backend::{DataRowBody, Message, RowDescriptionBody};
 use postgres_protocol::message::frontend as fe;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-async fn read_message(
-    stream: &mut TcpStream,
-    buf: &mut BytesMut,
-) -> io::Result<Message> {
+async fn read_message(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Result<Message> {
     loop {
         if let Some(msg) = postgres_protocol::message::backend::Message::parse(buf)? {
             return Ok(msg);
@@ -42,7 +39,10 @@ async fn drain_until_ready(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Re
                 }
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("server error: {}", msg.unwrap_or_else(|| "unknown".to_string())),
+                    format!(
+                        "server error: {}",
+                        msg.unwrap_or_else(|| "unknown".to_string())
+                    ),
                 ));
             }
             _ => {}
@@ -52,20 +52,15 @@ async fn drain_until_ready(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Re
 
 #[tokio::test(flavor = "multi_thread")]
 async fn extended_query_respects_binary_result_format() {
-    let (addr, _server, shutdown) = common::spawn_server(std::sync::Arc::new(
-        mockgres::Mockgres::default(),
-    ))
-    .await;
+    let (addr, _server, shutdown) =
+        common::spawn_server(std::sync::Arc::new(mockgres::Mockgres::default())).await;
 
     let mut stream = TcpStream::connect(addr).await.expect("connect");
     let mut read_buf = BytesMut::new();
     let mut out = BytesMut::new();
 
-    fe::startup_message(
-        [("user", "postgres"), ("database", "postgres")],
-        &mut out,
-    )
-    .expect("startup");
+    fe::startup_message([("user", "postgres"), ("database", "postgres")], &mut out)
+        .expect("startup");
     stream.write_all(&out).await.expect("write startup");
     stream.flush().await.expect("flush startup");
     out.clear();
@@ -117,7 +112,10 @@ async fn extended_query_respects_binary_result_format() {
                         msg = Some(String::from_utf8_lossy(field.value_bytes()).to_string());
                     }
                 }
-                panic!("server error: {}", msg.unwrap_or_else(|| "unknown".to_string()));
+                panic!(
+                    "server error: {}",
+                    msg.unwrap_or_else(|| "unknown".to_string())
+                );
             }
             _ => {}
         }

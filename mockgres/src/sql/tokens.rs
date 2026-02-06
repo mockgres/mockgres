@@ -6,7 +6,13 @@ use pg_query::protobuf::{AConst, ColumnDef, TypeName};
 use pg_query::{Node, NodeEnum};
 use pgwire::error::PgWireResult;
 
-type ColumnDefSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+type ColumnDefSpec = (
+    String,
+    DataType,
+    bool,
+    Option<ScalarExpr>,
+    Option<IdentitySpec>,
+);
 
 pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
     if c.val.is_none() {

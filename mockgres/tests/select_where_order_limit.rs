@@ -89,6 +89,60 @@ async fn limit_and_offset_clauses_page_results() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn limit_and_offset_accept_bind_parameters() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute("create table paged(i int primary key)", &[])
+        .await
+        .expect("create paged");
+    ctx.client
+        .execute("insert into paged values (1),(2),(3),(4),(5)", &[])
+        .await
+        .expect("seed paged");
+
+    let page: Vec<i32> = ctx
+        .client
+        .query(
+            "select i from paged order by i limit $1 offset $2",
+            &[&2_i64, &1_i64],
+        )
+        .await
+        .expect("limit/offset with binds")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(page, vec![2, 3]);
+
+    let offset_only: Vec<i32> = ctx
+        .client
+        .query("select i from paged order by i offset $1", &[&3_i64])
+        .await
+        .expect("offset with bind")
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(offset_only, vec![4, 5]);
+
+    let err = ctx
+        .client
+        .query("select i from paged order by i limit $1", &[&(-1_i64)])
+        .await
+        .expect_err("negative limit should fail");
+    let msg = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_string();
+    assert!(
+        msg.contains("limit must be non-negative"),
+        "unexpected error: {msg}"
+    );
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn where_boolean_and_null_ops() {
     let ctx = common::start().await;
 

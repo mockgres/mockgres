@@ -287,7 +287,10 @@ fn bind_scalar_expr_inner(
                     )
                 })
                 .collect::<PgWireResult<Vec<_>>>()?;
-            if matches!(func, ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock) {
+            if matches!(
+                func,
+                ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock
+            ) {
                 for arg in &mut bound_args {
                     apply_param_hint(arg, Some(&DataType::Int8));
                 }
@@ -543,7 +546,9 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
 }
 
 pub(crate) fn apply_param_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
-    if let (ScalarExpr::Param { ty, .. }, Some(dt)) = (expr, hint) && ty.is_none() {
+    if let (ScalarExpr::Param { ty, .. }, Some(dt)) = (expr, hint)
+        && ty.is_none()
+    {
         *ty = Some(dt.clone());
     }
 }

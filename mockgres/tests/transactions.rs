@@ -70,7 +70,10 @@ async fn commit_persists_and_errors_on_misuse() {
         .expect("expected db error")
         .message()
         .to_lowercase();
-    assert!(msg.contains("no transaction"), "unexpected commit error: {msg:?}");
+    assert!(
+        msg.contains("no transaction"),
+        "unexpected commit error: {msg:?}"
+    );
 
     ctx.client.execute("begin", &[]).await.expect("begin 2");
     let err = ctx

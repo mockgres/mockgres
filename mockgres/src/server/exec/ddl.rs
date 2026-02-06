@@ -208,7 +208,13 @@ pub(crate) fn build_ddl_executor(
                 || meta.foreign_keys.iter().any(|fk| fk.name == name)
                 || meta.check_constraints.iter().any(|ck| ck.name == name);
             if name_exists {
-                return Err(fe_code("42710", format!("constraint {} for table {}.{} already exists", name, schema_name, table.name)));
+                return Err(fe_code(
+                    "42710",
+                    format!(
+                        "constraint {} for table {}.{} already exists",
+                        name, schema_name, table.name
+                    ),
+                ));
             }
             meta.check_constraints.push(CheckConstraintMeta { name });
             drop(db_write);

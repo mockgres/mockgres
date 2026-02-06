@@ -8,8 +8,8 @@ use pgwire::error::PgWireResult;
 
 use crate::engine::types::parse_interval_literal;
 use crate::engine::{
-    BoolExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr, UpdateSet,
-    Value, fe,
+    BoolExpr, CountExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr,
+    UpdateSet, Value, fe,
 };
 use crate::session::SessionTimeZone;
 use crate::types::{
@@ -68,8 +68,19 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             collect_param_hints_from_plan(input, out);
             collect_param_hints_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::LockRows { input, .. } => {
+        Plan::Order { input, .. } | Plan::LockRows { input, .. } => {
             collect_param_hints_from_plan(input, out)
+        }
+        Plan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
+            collect_param_hints_from_plan(input, out);
+            if let Some(expr) = limit {
+                collect_param_hints_from_count_expr(expr, out);
+            }
+            collect_param_hints_from_count_expr(offset, out);
         }
         Plan::Projection { input, exprs, .. } => {
             collect_param_hints_from_plan(input, out);
@@ -232,6 +243,12 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
     }
 }
 
+fn collect_param_hints_from_count_expr(expr: &CountExpr, out: &mut HashMap<usize, DataType>) {
+    if let CountExpr::Expr(scalar) = expr {
+        collect_param_hints_from_scalar(scalar, out);
+    }
+}
+
 fn collect_param_hints_from_update_sets(sets: &[UpdateSet], out: &mut HashMap<usize, DataType>) {
     for set in sets {
         match set {
@@ -259,8 +276,19 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             collect_param_indexes(input, out);
             collect_param_indexes_from_bool(expr, out);
         }
-        Plan::Order { input, .. } | Plan::Limit { input, .. } | Plan::LockRows { input, .. } => {
+        Plan::Order { input, .. } | Plan::LockRows { input, .. } => {
             collect_param_indexes(input, out)
+        }
+        Plan::Limit {
+            input,
+            limit,
+            offset,
+        } => {
+            collect_param_indexes(input, out);
+            if let Some(expr) = limit {
+                collect_param_indexes_from_count_expr(expr, out);
+            }
+            collect_param_indexes_from_count_expr(offset, out);
         }
         Plan::Projection { input, exprs, .. } => {
             collect_param_indexes(input, out);
@@ -415,6 +443,12 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
         | ScalarExpr::ColumnIdx(..)
         | ScalarExpr::ExcludedIdx(..)
         | ScalarExpr::Literal(_) => {}
+    }
+}
+
+fn collect_param_indexes_from_count_expr(expr: &CountExpr, out: &mut BTreeSet<usize>) {
+    if let CountExpr::Expr(scalar) = expr {
+        collect_param_indexes_from_scalar(scalar, out);
     }
 }
 

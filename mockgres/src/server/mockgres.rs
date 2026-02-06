@@ -6,7 +6,8 @@ use std::sync::Arc;
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::RwLock;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireServerHandlers,
+    ClientInfo, ClientPortalStore, ErrorHandler, NoopHandler, PgWireConnectionState,
+    PgWireServerHandlers,
     auth::{StartupHandler, noop::NoopStartupHandler},
     cancel::CancelHandler,
     query::{ExtendedQueryHandler, SimpleQueryHandler},
@@ -14,7 +15,6 @@ use pgwire::api::{
         DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo, QueryResponse,
         Response, Tag,
     },
-    PgWireConnectionState,
     store::PortalStore,
 };
 use pgwire::error::{PgWireError, PgWireResult};
@@ -428,7 +428,9 @@ impl StatementEpochGuard {
 
 impl Drop for StatementEpochGuard {
     fn drop(&mut self) {
-        if self.active && let Some(epoch) = self.session.exit_statement() {
+        if self.active
+            && let Some(epoch) = self.session.exit_statement()
+        {
             let db_read = self.db.read();
             db_read.release_locks(LockOwner::new(self.session.id(), epoch));
         }
@@ -484,7 +486,9 @@ impl Mockgres {
         C: ClientInfo,
     {
         let (pid, _) = client.pid_and_secret_key();
-        if pid != 0 && let Some(existing) = self.session_manager.get(pid) {
+        if pid != 0
+            && let Some(existing) = self.session_manager.get(pid)
+        {
             return existing;
         }
         let session = self.session_manager.create_session();
@@ -510,11 +514,11 @@ impl Mockgres {
         snapshot
     }
 }
-    pub mod pgwire_parser {
+pub mod pgwire_parser {
     use async_trait::async_trait;
-    use pgwire::api::{ClientInfo, Type};
     use pgwire::api::portal::Format;
     use pgwire::api::results::FieldInfo;
+    use pgwire::api::{ClientInfo, Type};
     use pgwire::error::PgWireResult;
 
     use crate::engine::Plan;

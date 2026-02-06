@@ -126,7 +126,6 @@ async fn alter_table_drop_column_constraints() {
     let _ = ctx.shutdown.send(());
 }
 
-
 #[tokio::test(flavor = "multi_thread")]
 async fn alter_table_add_and_drop_check_constraint() {
     let ctx = common::start().await;
@@ -137,12 +136,18 @@ async fn alter_table_add_and_drop_check_constraint() {
         .expect("create checks");
 
     ctx.client
-        .execute("alter table checks add constraint ck_checks_id_nonneg check (id >= 0)", &[])
+        .execute(
+            "alter table checks add constraint ck_checks_id_nonneg check (id >= 0)",
+            &[],
+        )
         .await
         .expect("add check constraint");
 
     ctx.client
-        .execute("alter table checks drop constraint ck_checks_id_nonneg", &[])
+        .execute(
+            "alter table checks drop constraint ck_checks_id_nonneg",
+            &[],
+        )
         .await
         .expect("drop check constraint");
 

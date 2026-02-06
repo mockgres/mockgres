@@ -416,7 +416,9 @@ impl Db {
                 break;
             }
         }
-        if let Some(tid) = removed_table_id && let Some(table) = self.tables.get_mut(&tid) {
+        if let Some(tid) = removed_table_id
+            && let Some(table) = self.tables.get_mut(&tid)
+        {
             table.unique_maps.remove(index_name);
         }
         if removed || if_exists {
@@ -531,7 +533,9 @@ impl Db {
                     positions.push(idx);
                 }
 
-                if let Some(pk) = meta.primary_key.as_ref() && pk.columns == positions {
+                if let Some(pk) = meta.primary_key.as_ref()
+                    && pk.columns == positions
+                {
                     return Ok(ResolvedOnConflictTarget::Constraint {
                         index_name: pk.name.clone(),
                     });
@@ -554,7 +558,9 @@ impl Db {
             }
 
             Constraint(name) => {
-                if let Some(pk) = &meta.primary_key && pk.name == *name {
+                if let Some(pk) = &meta.primary_key
+                    && pk.name == *name
+                {
                     return Ok(ResolvedOnConflictTarget::Constraint {
                         index_name: pk.name.clone(),
                     });

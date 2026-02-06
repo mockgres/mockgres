@@ -236,7 +236,13 @@ pub struct ForeignKeySpec {
     pub on_delete: ReferentialAction,
 }
 
-type ColumnSpec = (String, DataType, bool, Option<ScalarExpr>, Option<IdentitySpec>);
+type ColumnSpec = (
+    String,
+    DataType,
+    bool,
+    Option<ScalarExpr>,
+    Option<IdentitySpec>,
+);
 
 #[derive(Clone, Debug)]
 pub enum Plan {
@@ -267,8 +273,8 @@ pub enum Plan {
     },
     Limit {
         input: Box<Plan>,
-        limit: Option<usize>,
-        offset: usize,
+        limit: Option<CountExpr>,
+        offset: CountExpr,
     },
     UnboundJoin {
         left: Box<Plan>,
@@ -455,6 +461,12 @@ pub enum SortKey {
         asc: bool,
         nulls_first: Option<bool>,
     },
+}
+
+#[derive(Clone, Debug)]
+pub enum CountExpr {
+    Value(usize),
+    Expr(ScalarExpr),
 }
 
 impl Plan {

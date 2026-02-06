@@ -121,10 +121,7 @@ async fn insert_nan_requires_explicit_literal() {
         .await
         .expect_err("bare identifier nan should fail");
     assert_eq!(err.code(), Some(&SqlState::INTERNAL_ERROR));
-    common::assert_db_error_contains(
-        &err,
-        "INSERT expressions cannot reference columns",
-    );
+    common::assert_db_error_contains(&err, "INSERT expressions cannot reference columns");
 
     let _ = ctx.shutdown.send(());
 }

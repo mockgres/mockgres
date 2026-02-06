@@ -165,7 +165,10 @@ async fn show_and_set_transaction_isolation() {
         .expect("expected db error")
         .message()
         .to_ascii_lowercase();
-    assert!(message.contains("not supported"), "unexpected error: {message:?}");
+    assert!(
+        message.contains("not supported"),
+        "unexpected error: {message:?}"
+    );
 
     ctx.client.execute("begin", &[]).await.expect("begin");
     ctx.client

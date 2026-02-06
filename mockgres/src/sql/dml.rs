@@ -1,9 +1,9 @@
 use crate::catalog::{SchemaName, TableId};
 #[allow(unused_imports)]
 use crate::engine::{
-    AggCall, AggFunc, AliasSpec, BoolExpr, DataType, Field, JoinType, LockMode, LockRequest,
-    LockSpec, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema, Selection,
-    SortKey, Value, fe, fe_code,
+    AggCall, AggFunc, AliasSpec, BoolExpr, CountExpr, DataType, Field, JoinType, LockMode,
+    LockRequest, LockSpec, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema,
+    Selection, SortKey, Value, fe, fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
@@ -63,9 +63,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     };
 
     let mut project_prefix_len: Option<usize> = None;
-    if !multi_from
-        && let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr)
-    {
+    if !multi_from && let (Selection::Columns(cols), Some(expr)) = (&mut selection, &where_expr) {
         let mut needed = Vec::new();
         collect_columns_from_bool_expr(expr, &mut needed);
         ensure_columns_present(cols, needed, &mut project_prefix_len);
@@ -166,11 +164,11 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     if let Some(limit_node) = sel.limit_count.as_ref().and_then(|n| n.node.as_ref()) {
         limit_value = Some(parse_limit_count(limit_node)?);
     }
-    let mut offset_value = 0usize;
+    let mut offset_value = CountExpr::Value(0);
     if let Some(offset_node) = sel.limit_offset.as_ref().and_then(|n| n.node.as_ref()) {
         offset_value = parse_offset_count(offset_node)?;
     }
-    if limit_value.is_some() || offset_value != 0 {
+    if limit_value.is_some() || !matches!(offset_value, CountExpr::Value(0)) {
         plan = Plan::Limit {
             input: Box::new(plan),
             limit: limit_value,
@@ -635,7 +633,9 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
         return Err(fe("at least one column required"));
     }
     // check for builtin single-target SELECTs
-    if tl.len() == 1 && let Some(plan) = try_plan_builtin_select(&tl[0])? {
+    if tl.len() == 1
+        && let Some(plan) = try_plan_builtin_select(&tl[0])?
+    {
         return Ok(plan);
     }
     let mut out_exprs = Vec::with_capacity(tl.len());
@@ -668,15 +668,12 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
     })
 }
 
-fn parse_select_list(
-    target_list: &mut Vec<pg_query::Node>,
-) -> PgWireResult<ParsedSelectList> {
+fn parse_select_list(target_list: &mut Vec<pg_query::Node>) -> PgWireResult<ParsedSelectList> {
     if target_list.len() == 1 {
         let t = &target_list[0];
         let node = t.node.as_ref().ok_or_else(|| fe("missing target node"))?;
         if let NodeEnum::ResTarget(rt) = node
-            && let Some(NodeEnum::ColumnRef(cr)) =
-                rt.val.as_ref().and_then(|n| n.node.as_ref())
+            && let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref())
             && cr
                 .fields
                 .first()
@@ -927,25 +924,34 @@ fn ensure_columns_present(
     }
 }
 
-fn parse_limit_count(node: &NodeEnum) -> PgWireResult<usize> {
+fn parse_limit_count(node: &NodeEnum) -> PgWireResult<CountExpr> {
     parse_nonnegative_count(node, "limit")
 }
 
-fn parse_offset_count(node: &NodeEnum) -> PgWireResult<usize> {
+fn parse_offset_count(node: &NodeEnum) -> PgWireResult<CountExpr> {
     parse_nonnegative_count(node, "offset")
 }
 
-fn parse_nonnegative_count(node: &NodeEnum, label: &str) -> PgWireResult<usize> {
+fn parse_nonnegative_count(node: &NodeEnum, label: &str) -> PgWireResult<CountExpr> {
     match node {
         NodeEnum::AConst(c) => {
             if let Some(Val::Ival(iv)) = c.val.as_ref() {
                 if iv.ival < 0 {
                     return Err(fe(format!("{label} must be non-negative")));
                 }
-                Ok(iv.ival as usize)
+                Ok(CountExpr::Value(iv.ival as usize))
             } else {
                 Err(fe(format!("{label} must be integer")))
             }
+        }
+        NodeEnum::ParamRef(pr) => {
+            if pr.number <= 0 {
+                return Err(fe("parameter numbers start at 1"));
+            }
+            Ok(CountExpr::Expr(ScalarExpr::Param {
+                idx: (pr.number as usize) - 1,
+                ty: Some(DataType::Int8),
+            }))
         }
         _ => Err(fe(format!("unsupported {label} expression"))),
     }

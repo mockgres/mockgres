@@ -718,7 +718,9 @@ impl ExecNode for LimitExec {
                 None => return Ok(None),
             }
         }
-        if let Some(rem) = &mut self.remaining && *rem == 0 {
+        if let Some(rem) = &mut self.remaining
+            && *rem == 0
+        {
             return Ok(None);
         }
         match self.child.next().await? {
