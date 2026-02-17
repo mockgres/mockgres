@@ -18,6 +18,7 @@ use crate::types::{
 };
 
 use super::mapping::{map_datatype_to_pg_type, map_pg_type_to_datatype};
+use super::statement_plan::StatementPlan;
 
 pub fn plan_parameter_types(plan: &Plan) -> Vec<Type> {
     let mut indexes = BTreeSet::new();
@@ -38,9 +39,32 @@ pub fn plan_parameter_types(plan: &Plan) -> Vec<Type> {
         .collect()
 }
 
-pub fn build_params_for_portal(
+pub fn statement_plan_parameter_types(statement: &StatementPlan) -> Vec<Type> {
+    match statement {
+        StatementPlan::Single(plan) => plan_parameter_types(plan),
+        StatementPlan::Batch(plans) => {
+            let mut indexes = BTreeSet::new();
+            let mut hints = HashMap::new();
+            for plan in plans {
+                collect_param_indexes(plan, &mut indexes);
+                collect_param_hints_from_plan(plan, &mut hints);
+            }
+            indexes
+                .into_iter()
+                .map(|idx| {
+                    hints
+                        .get(&idx)
+                        .map(map_datatype_to_pg_type)
+                        .unwrap_or(Type::UNKNOWN)
+                })
+                .collect()
+        }
+    }
+}
+
+pub fn build_params_for_portal<S>(
     plan: &Plan,
-    portal: &pgwire::api::portal::Portal<Plan>,
+    portal: &pgwire::api::portal::Portal<S>,
     tz: &SessionTimeZone,
 ) -> PgWireResult<Arc<Vec<Value>>> {
     let mut hints = HashMap::new();

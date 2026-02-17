@@ -325,6 +325,42 @@ async fn repeat_select_returns_same_rows_for_owner() {
     let _ = ctx.shutdown.send(());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_locks_are_released_after_batch_failure() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute("create table batch_lock_fail(id int primary key)", &[])
+        .await
+        .expect("create table");
+    ctx.client
+        .execute("insert into batch_lock_fail values (1)", &[])
+        .await
+        .expect("seed row");
+    let client_b = ctx.new_client().await;
+
+    let _ = ctx
+        .client
+        .simple_query(
+            "select id from batch_lock_fail for update skip locked; \
+             insert into batch_lock_fail values ('bad')",
+        )
+        .await
+        .expect_err("second statement should fail");
+
+    let rows_b = fetch_ids(
+        &client_b,
+        "select id from batch_lock_fail for update skip locked",
+    )
+    .await;
+    assert_eq!(
+        rows_b,
+        vec![1],
+        "lock from first statement should be released even when a later batch statement fails"
+    );
+
+    let _ = ctx.shutdown.send(());
+}
+
 async fn fetch_ids(client: &tokio_postgres::Client, sql: &str) -> Vec<i32> {
     client
         .query(sql, &[])

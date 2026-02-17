@@ -7,6 +7,7 @@ mod insert;
 pub mod mapping;
 mod mockgres;
 mod params;
+mod statement_plan;
 
 pub use config::ServerConfig;
 pub use mockgres::Mockgres;

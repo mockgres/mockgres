@@ -1,5 +1,5 @@
 use crate::engine::{Plan, fe};
-use pg_query::{NodeEnum, parse};
+use pg_query::{NodeEnum, parse, protobuf::Token, scan};
 use pgwire::error::PgWireResult;
 
 use super::{ddl, delete, dml, insert, update};
@@ -7,41 +7,84 @@ use super::{ddl, delete, dml, insert, update};
 pub struct Planner;
 
 impl Planner {
+    #[allow(dead_code)]
     pub fn plan_sql(sql: &str) -> PgWireResult<Plan> {
-        let parsed = parse(sql).map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
-        let stmts: Vec<_> = parsed
-            .protobuf
-            .stmts
-            .into_iter()
-            .filter(|s| s.stmt.is_some())
-            .collect();
-        if stmts.len() > 1 {
-            return Err(fe("multiple statements not supported"));
-        }
-        let Some(stmt) = stmts.into_iter().next() else {
+        let plans = Self::plan_sql_batch(sql)?;
+        let mut non_empty = plans.into_iter().filter(|p| !matches!(p, Plan::Empty));
+        let Some(first) = non_empty.next() else {
             return Ok(Plan::Empty);
         };
-        match stmt.stmt.and_then(|n| n.node) {
-            Some(NodeEnum::TransactionStmt(tx)) => ddl::plan_transaction_stmt(&tx),
-            Some(NodeEnum::SelectStmt(sel)) => dml::plan_select(*sel),
-            Some(NodeEnum::CreateStmt(cs)) => ddl::plan_create_table(cs),
-            Some(NodeEnum::CreateSchemaStmt(cs)) => ddl::plan_create_schema(cs),
-            Some(NodeEnum::CreatedbStmt(db)) => ddl::plan_create_database(db),
-            Some(NodeEnum::AlterTableStmt(at)) => ddl::plan_alter_table(at),
-            Some(NodeEnum::IndexStmt(idx)) => ddl::plan_create_index(*idx),
-            Some(NodeEnum::DropStmt(drop)) => ddl::plan_drop_stmt(drop),
-            Some(NodeEnum::DropdbStmt(db)) => ddl::plan_drop_database(db),
-            Some(NodeEnum::RenameStmt(rename)) => ddl::plan_rename_schema(*rename),
-            Some(NodeEnum::VariableShowStmt(show)) => ddl::plan_show(show),
-            Some(NodeEnum::VariableSetStmt(set)) => ddl::plan_set(set),
-            Some(NodeEnum::AlterDatabaseStmt(db)) => ddl::plan_alter_database(db),
-            Some(NodeEnum::AlterDatabaseSetStmt(db)) => ddl::plan_alter_database_set(db),
-            Some(NodeEnum::InsertStmt(ins)) => insert::plan_insert(*ins),
-            Some(NodeEnum::UpdateStmt(upd)) => update::plan_update(*upd),
-            Some(NodeEnum::DeleteStmt(del)) => delete::plan_delete(*del),
-            Some(NodeEnum::TruncateStmt(trunc)) => ddl::plan_truncate(trunc),
-            _ => Err(fe("unsupported statement type")),
+        if non_empty.next().is_some() {
+            return Err(fe(
+                "cannot insert multiple commands into a prepared statement",
+            ));
         }
+        Ok(first)
+    }
+
+    pub fn plan_sql_batch(sql: &str) -> PgWireResult<Vec<Plan>> {
+        let mut plans = Vec::new();
+        for segment in split_sql_segments(sql)? {
+            if segment.trim().is_empty() {
+                plans.push(Plan::Empty);
+                continue;
+            }
+            let parsed =
+                parse(segment).map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
+            let mut nodes = parsed
+                .protobuf
+                .stmts
+                .into_iter()
+                .filter_map(|stmt| stmt.stmt.and_then(|node| node.node));
+            match (nodes.next(), nodes.next()) {
+                (None, _) => plans.push(Plan::Empty),
+                (Some(node), None) => plans.push(plan_stmt_node(node)?),
+                (Some(_), Some(_)) => return Err(fe("multiple statements not supported")),
+            }
+        }
+        if plans.is_empty() {
+            plans.push(Plan::Empty);
+        }
+        Ok(plans)
+    }
+}
+
+fn split_sql_segments(sql: &str) -> PgWireResult<Vec<&str>> {
+    let scanned = scan(sql).map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for token in scanned.tokens {
+        if token.token == Token::Ascii59 as i32 {
+            let end = token.start as usize;
+            out.push(&sql[start..end]);
+            start = token.end as usize;
+        }
+    }
+    out.push(&sql[start..]);
+    Ok(out)
+}
+
+fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
+    match node {
+        NodeEnum::TransactionStmt(tx) => ddl::plan_transaction_stmt(&tx),
+        NodeEnum::SelectStmt(sel) => dml::plan_select(*sel),
+        NodeEnum::CreateStmt(cs) => ddl::plan_create_table(cs),
+        NodeEnum::CreateSchemaStmt(cs) => ddl::plan_create_schema(cs),
+        NodeEnum::CreatedbStmt(db) => ddl::plan_create_database(db),
+        NodeEnum::AlterTableStmt(at) => ddl::plan_alter_table(at),
+        NodeEnum::IndexStmt(idx) => ddl::plan_create_index(*idx),
+        NodeEnum::DropStmt(drop) => ddl::plan_drop_stmt(drop),
+        NodeEnum::DropdbStmt(db) => ddl::plan_drop_database(db),
+        NodeEnum::RenameStmt(rename) => ddl::plan_rename_schema(*rename),
+        NodeEnum::VariableShowStmt(show) => ddl::plan_show(show),
+        NodeEnum::VariableSetStmt(set) => ddl::plan_set(set),
+        NodeEnum::AlterDatabaseStmt(db) => ddl::plan_alter_database(db),
+        NodeEnum::AlterDatabaseSetStmt(db) => ddl::plan_alter_database_set(db),
+        NodeEnum::InsertStmt(ins) => insert::plan_insert(*ins),
+        NodeEnum::UpdateStmt(upd) => update::plan_update(*upd),
+        NodeEnum::DeleteStmt(del) => delete::plan_delete(*del),
+        NodeEnum::TruncateStmt(trunc) => ddl::plan_truncate(trunc),
+        _ => Err(fe("unsupported statement type")),
     }
 }
 
@@ -296,5 +339,53 @@ mod tests {
             },
             other => panic!("unexpected plan: {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_sql_batch_single_statement() {
+        let plans = Planner::plan_sql_batch("select 1").expect("plan batch");
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(plans[0], Plan::Projection { .. }));
+    }
+
+    #[test]
+    fn plan_sql_rejects_multiple_non_empty_statements() {
+        let err = Planner::plan_sql("select 1; select 2").expect_err("expected planner error");
+        assert!(
+            err.to_string()
+                .contains("cannot insert multiple commands into a prepared statement"),
+            "unexpected planner error: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_sql_batch_multiple_statements() {
+        let plans = Planner::plan_sql_batch("select 1; select 2").expect("plan batch");
+        assert_eq!(plans.len(), 2);
+        assert!(matches!(plans[0], Plan::Projection { .. }));
+        assert!(matches!(plans[1], Plan::Projection { .. }));
+    }
+
+    #[test]
+    fn plan_sql_batch_empty_query_segments() {
+        let semicolon_only = Planner::plan_sql_batch(";").expect("plan batch");
+        assert_eq!(semicolon_only.len(), 2);
+        assert!(matches!(semicolon_only[0], Plan::Empty));
+        assert!(matches!(semicolon_only[1], Plan::Empty));
+
+        let whitespace_only = Planner::plan_sql_batch("   ").expect("plan batch");
+        assert_eq!(whitespace_only.len(), 1);
+        assert!(matches!(whitespace_only[0], Plan::Empty));
+    }
+
+    #[test]
+    fn plan_sql_batch_mixed_empty_and_non_empty_segments() {
+        let plans = Planner::plan_sql_batch(" ; select 1;; select 2; ").expect("plan batch");
+        assert_eq!(plans.len(), 5);
+        assert!(matches!(plans[0], Plan::Empty));
+        assert!(matches!(plans[1], Plan::Projection { .. }));
+        assert!(matches!(plans[2], Plan::Empty));
+        assert!(matches!(plans[3], Plan::Projection { .. }));
+        assert!(matches!(plans[4], Plan::Empty));
     }
 }

@@ -8,6 +8,9 @@
 - [Running](#running)
 - [Testing](#testing)
 - [Features](#features)
+- [Protocol Support Matrix](#protocol-support-matrix)
+- [Multi-Statement Behavior Contract](#multi-statement-behavior-contract)
+- [Troubleshooting Multi-Statement Clients](#troubleshooting-multi-statement-clients)
 - [Limitations](#limitations)
 - [Architecture Notes](#architecture-notes)
 - [Roadmap](#roadmap)
@@ -57,6 +60,41 @@ Testing covered pretty much exclusively by integration tests in the `tests` dire
 - Constraints/indices: primary key, unique, foreign key (cascade), create/drop index supported but no-op
 - Catalog: schemas, databases (create and drop not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
 - Wire protocol: simple and extended protocol
+
+## Protocol Support Matrix
+
+| Protocol path | Single statement | Multi-statement SQL (`;`) | Notes |
+|---|---|---|---|
+| Simple query (`Query` message / `simple_query`) | Supported | Supported | Executes in statement order and emits per-statement messages/tags. |
+| Extended parse/bind/execute (`Parse` + `Bind` + `Execute`) | Supported | Not supported | Like PostgreSQL, prepared/parsed statements must contain one command. |
+
+Known differences from PostgreSQL:
+- Multi-statement execution support is provided only through the simple query protocol, not extended parse/bind/execute.
+
+## Multi-Statement Behavior Contract
+- Ordering: statements are planned and executed strictly left-to-right in one SQL string.
+- Error short-circuit: execution stops at the first failing statement; later statements are not run.
+- Simple protocol transaction semantics:
+  - When already inside an explicit transaction (`BEGIN`), normal explicit transaction behavior applies.
+  - For multi-statement simple-query messages outside an explicit transaction, Mockgres uses one implicit transaction for the message.
+  - On any error in that implicit transaction, all earlier statements from that message are rolled back.
+- Extended protocol parse contract:
+  - Multiple non-empty statements in one prepared/parsed SQL string are rejected with a PostgreSQL-style parse error.
+- Result framing:
+  - Query statements emit row descriptions/data rows per statement.
+  - Non-query statements emit command-complete tags per statement.
+  - Empty statements (`;;` or trailing `;`) are treated as empty-query segments and do not emit command tags.
+
+## Troubleshooting Multi-Statement Clients
+- `batch_execute`/`simple_query` style APIs:
+  - If a batch fails, verify whether your client sent simple or extended protocol before assuming rollback behavior.
+  - In simple protocol multi-statement mode, a failure rolls back the whole message when not in an explicit transaction.
+- Prepared statements and parse/execute flows:
+  - Extended protocol parse/prepare accepts a single non-empty statement per SQL string.
+  - Multi-statement SQL in prepared statements should return `cannot insert multiple commands into a prepared statement`.
+- Protocol differences to debug quickly:
+  - If command tags look incomplete, check for an early error that short-circuited the batch.
+  - If row shape changes across statements, consume results as a stream of per-statement responses.
 
 ## Copy-on-write snapshots
 - Freeze the current database state with `SELECT mockgres_freeze();`. The first call captures a base snapshot; subsequent calls are no-ops and return `true`.
