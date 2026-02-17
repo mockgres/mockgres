@@ -57,6 +57,7 @@ pub enum DataType {
     Float8,
     Text,
     Json,
+    Jsonb,
     Bool,
     Date,
     Timestamp,
@@ -74,6 +75,7 @@ impl DataType {
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
             DataType::Json => Type::JSON,
+            DataType::Jsonb => Type::JSONB,
             DataType::Bool => Type::BOOL,
             DataType::Date => Type::DATE,
             DataType::Timestamp => Type::TIMESTAMP,
@@ -209,9 +211,12 @@ pub fn cast_value_to_type(
     target: &DataType,
     tz: &SessionTimeZone,
 ) -> Result<Value, SqlError> {
-    fn validate_json(input: &str) -> Result<(), SqlError> {
+    fn validate_json(input: &str, type_name: &str) -> Result<(), SqlError> {
         serde_json::from_str::<JsonValue>(input).map_err(|e| {
-            SqlError::new("22P02", format!("invalid input syntax for type json: {e}"))
+            SqlError::new(
+                "22P02",
+                format!("invalid input syntax for type {type_name}: {e}"),
+            )
         })?;
         Ok(())
     }
@@ -270,14 +275,14 @@ pub fn cast_value_to_type(
             Ok(Value::Text(text))
         }
         (DataType::Json, Value::Text(s)) => {
-            validate_json(&s)?;
+            validate_json(&s, "json")?;
             Ok(Value::Text(s))
         }
         (DataType::Json, Value::Bytes(b)) => {
             let s = String::from_utf8(b).map_err(|e| {
                 SqlError::new("22P02", format!("invalid input syntax for type json: {e}"))
             })?;
-            validate_json(&s)?;
+            validate_json(&s, "json")?;
             Ok(Value::Text(s))
         }
         (DataType::Json, Value::Bool(b)) => {
@@ -286,13 +291,39 @@ pub fn cast_value_to_type(
         }
         (DataType::Json, Value::Int64(i)) => {
             let text = i.to_string();
-            validate_json(&text)?;
+            validate_json(&text, "json")?;
             Ok(Value::Text(text))
         }
         (DataType::Json, Value::Float64Bits(bits)) => {
             let f = f64::from_bits(bits);
             let text = f.to_string();
-            validate_json(&text)?;
+            validate_json(&text, "json")?;
+            Ok(Value::Text(text))
+        }
+        (DataType::Jsonb, Value::Text(s)) => {
+            validate_json(&s, "jsonb")?;
+            Ok(Value::Text(s))
+        }
+        (DataType::Jsonb, Value::Bytes(b)) => {
+            let s = String::from_utf8(b).map_err(|e| {
+                SqlError::new("22P02", format!("invalid input syntax for type jsonb: {e}"))
+            })?;
+            validate_json(&s, "jsonb")?;
+            Ok(Value::Text(s))
+        }
+        (DataType::Jsonb, Value::Bool(b)) => {
+            let text = if b { "true" } else { "false" }.to_string();
+            Ok(Value::Text(text))
+        }
+        (DataType::Jsonb, Value::Int64(i)) => {
+            let text = i.to_string();
+            validate_json(&text, "jsonb")?;
+            Ok(Value::Text(text))
+        }
+        (DataType::Jsonb, Value::Float64Bits(bits)) => {
+            let f = f64::from_bits(bits);
+            let text = f.to_string();
+            validate_json(&text, "jsonb")?;
             Ok(Value::Text(text))
         }
         (DataType::Bool, Value::Bool(b)) => Ok(Value::Bool(b)),

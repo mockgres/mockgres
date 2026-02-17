@@ -530,6 +530,7 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
         }
         DataType::Text => Ok(Value::Text(s.to_string())),
         DataType::Json => Ok(Value::Text(s.to_string())),
+        DataType::Jsonb => Ok(Value::Text(s.to_string())),
         DataType::Bool => {
             let lowered = s.to_ascii_lowercase();
             match lowered.as_str() {
@@ -595,6 +596,11 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgW
             Ok(Value::Text(s.to_string()))
         }
         DataType::Json => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
+            Ok(Value::Text(s.to_string()))
+        }
+        DataType::Jsonb => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))

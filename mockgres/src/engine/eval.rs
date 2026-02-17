@@ -10,6 +10,8 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::types::format::FormatOptions;
+use postgres_types::Json;
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use super::exec::ExecNode;
@@ -734,6 +736,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Json) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Jsonb) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
                                 (Value::Null, DataType::Bool) => {
                                     enc.encode_field(&Option::<bool>::None)
                                 }
@@ -760,7 +765,30 @@ pub async fn to_pgwire_stream(
                                     enc.encode_field(&f)
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
-                                (Value::Text(s), DataType::Json) => enc.encode_field(&s),
+                                (Value::Text(s), DataType::Json) => {
+                                    let parsed: JsonValue = match serde_json::from_str(&s) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            return Some((
+                                                Err(fe(format!("invalid json output value: {e}"))),
+                                                (node, fields, schema),
+                                            ));
+                                        }
+                                    };
+                                    enc.encode_field(&Json(parsed))
+                                }
+                                (Value::Text(s), DataType::Jsonb) => {
+                                    let parsed: JsonValue = match serde_json::from_str(&s) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            return Some((
+                                                Err(fe(format!("invalid jsonb output value: {e}"))),
+                                                (node, fields, schema),
+                                            ));
+                                        }
+                                    };
+                                    enc.encode_field(&Json(parsed))
+                                }
                                 (Value::Bool(b), DataType::Bool) => enc.encode_field(&b),
                                 (Value::Date(days), DataType::Date) => {
                                     if fmt == FieldFormat::Binary {

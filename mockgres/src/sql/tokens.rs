@@ -82,6 +82,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
             "json" => DataType::Json,
+            "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
             "oid" => DataType::Int8,
             "date" => DataType::Date,

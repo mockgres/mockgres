@@ -839,6 +839,7 @@ dependencies = [
  "pg_query",
  "pgwire",
  "postgres-protocol",
+ "postgres-types",
  "rand 0.8.5",
  "serde_json",
  "time",
