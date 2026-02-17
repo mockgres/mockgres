@@ -2,7 +2,17 @@ use std::{net::SocketAddr, sync::Arc};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = parse_args()?;
+    let args = match parse_args()? {
+        CliCommand::Run(args) => args,
+        CliCommand::Help => {
+            print_help();
+            return Ok(());
+        }
+        CliCommand::Version => {
+            print_version();
+            return Ok(());
+        }
+    };
     let addr = resolve_addr(args)?;
 
     println!("mockgres listening on {addr}");
@@ -20,9 +30,27 @@ struct CliArgs {
     port: Option<u16>,
 }
 
-fn parse_args() -> anyhow::Result<CliArgs> {
+enum CliCommand {
+    Run(CliArgs),
+    Help,
+    Version,
+}
+
+fn parse_args() -> anyhow::Result<CliCommand> {
+    parse_args_from(std::env::args().skip(1))
+}
+
+fn parse_args_from(args: impl IntoIterator<Item = String>) -> anyhow::Result<CliCommand> {
+    let raw: Vec<String> = args.into_iter().collect();
+    if raw.iter().any(|arg| arg == "--help" || arg == "-h") {
+        return Ok(CliCommand::Help);
+    }
+    if raw.iter().any(|arg| arg == "--version" || arg == "-V") {
+        return Ok(CliCommand::Version);
+    }
+
     let mut parsed = CliArgs::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = raw.into_iter();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -57,7 +85,7 @@ fn parse_args() -> anyhow::Result<CliArgs> {
         ));
     }
 
-    Ok(parsed)
+    Ok(CliCommand::Run(parsed))
 }
 
 fn next_arg_value(
@@ -84,4 +112,76 @@ fn resolve_addr(args: CliArgs) -> anyhow::Result<SocketAddr> {
     addr_str
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid listen address: {addr_str}"))
+}
+
+fn print_help() {
+    println!(
+        "\
+mockgres {}
+
+Usage:
+  mockgres [--addr <host:port>]
+  mockgres [--host <host>] [--port <port>]
+  mockgres <host:port>
+
+Options:
+  --addr <host:port>  Listen address (same as positional host:port)
+  --host <host>       Listen host (default: 127.0.0.1)
+  --port <port>       Listen port (default: 6543)
+  -h, --help          Show this help and exit
+  -V, --version       Show version and exit
+
+Environment:
+  MOCKGRES_ADDR       Listen address when no CLI address options are provided",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_version() {
+    println!("mockgres {}", env!("CARGO_PKG_VERSION"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CliCommand, parse_args_from, resolve_addr};
+
+    #[test]
+    fn parse_help_flags() {
+        assert!(matches!(
+            parse_args_from(vec!["--help".to_string()]).expect("parse args"),
+            CliCommand::Help
+        ));
+        assert!(matches!(
+            parse_args_from(vec!["-h".to_string()]).expect("parse args"),
+            CliCommand::Help
+        ));
+    }
+
+    #[test]
+    fn parse_version_flags() {
+        assert!(matches!(
+            parse_args_from(vec!["--version".to_string()]).expect("parse args"),
+            CliCommand::Version
+        ));
+        assert!(matches!(
+            parse_args_from(vec!["-V".to_string()]).expect("parse args"),
+            CliCommand::Version
+        ));
+    }
+
+    #[test]
+    fn parse_and_resolve_host_and_port() {
+        let cmd = parse_args_from(vec![
+            "--host".to_string(),
+            "127.0.0.1".to_string(),
+            "--port".to_string(),
+            "6543".to_string(),
+        ])
+        .expect("parse args");
+        let CliCommand::Run(args) = cmd else {
+            panic!("expected run command");
+        };
+        let addr = resolve_addr(args).expect("resolve addr");
+        assert_eq!(addr.to_string(), "127.0.0.1:6543");
+    }
 }
