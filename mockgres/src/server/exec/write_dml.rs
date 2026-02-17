@@ -187,6 +187,183 @@ pub(crate) fn build_insert_executor(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn build_insert_select_executor(
+    db: &Arc<RwLock<Db>>,
+    txn_manager: &Arc<TransactionManager>,
+    session: &Arc<Session>,
+    snapshot_xid: TxId,
+    table: &ObjName,
+    columns: &Option<Vec<String>>,
+    select: &Plan,
+    override_system_value: bool,
+    on_conflict: &Option<OnConflictAction>,
+    returning: &Option<ReturningClause>,
+    returning_schema: &Option<Schema>,
+    params: Arc<Vec<Value>>,
+    ctx: &EvalContext,
+) -> ExecResult {
+    let schema_name = schema_or_public(&table.schema);
+    let table_meta = {
+        let db = db.read();
+        db.resolve_table(schema_name, &table.name)
+            .map_err(map_db_err)?
+            .clone()
+    };
+    let resolved_conflict: Option<ResolvedOnConflictKind> = match on_conflict {
+        None => None,
+        Some(OnConflictAction::DoNothing { target }) => {
+            let db_read = db.read();
+            Some(ResolvedOnConflictKind::DoNothing(
+                db_read
+                    .resolve_on_conflict_target(&table_meta, target)
+                    .map_err(map_db_err)?,
+            ))
+        }
+        Some(OnConflictAction::DoUpdate {
+            target,
+            sets,
+            where_clause,
+        }) => {
+            let db_read = db.read();
+            Some(ResolvedOnConflictKind::DoUpdate {
+                target: db_read
+                    .resolve_on_conflict_target(&table_meta, target)
+                    .map_err(map_db_err)?,
+                sets: sets.clone(),
+                where_clause: where_clause.clone(),
+            })
+        }
+    };
+    let column_map = if let Some(cols) = columns {
+        let mut indexes = Vec::with_capacity(cols.len());
+        for col in cols {
+            let pos = table_meta
+                .columns
+                .iter()
+                .position(|c| c.name == *col)
+                .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
+            if indexes.contains(&pos) {
+                return Err(fe_code("42701", format!("column {col} specified twice")));
+            }
+            indexes.push(pos);
+        }
+        Some(indexes)
+    } else {
+        None
+    };
+
+    let (mut select_exec, _, _) = crate::server::exec_builder::build_executor(
+        db,
+        txn_manager,
+        session,
+        snapshot_xid,
+        select,
+        params.clone(),
+        ctx,
+    )?;
+    block_on(select_exec.open())?;
+    let mut selected_rows = Vec::new();
+    while let Some(row) = block_on(select_exec.next())? {
+        selected_rows.push(row);
+    }
+    block_on(select_exec.close())?;
+
+    let expected_len = column_map
+        .as_ref()
+        .map_or(table_meta.columns.len(), Vec::len);
+    let mut realized = Vec::with_capacity(selected_rows.len());
+    for row in selected_rows {
+        if row.len() != expected_len {
+            let msg = if columns.is_some() {
+                format!(
+                    "INSERT has {} target columns but {} expressions",
+                    expected_len,
+                    row.len()
+                )
+            } else {
+                format!(
+                    "INSERT expects {} expressions, got {}",
+                    expected_len,
+                    row.len()
+                )
+            };
+            return Err(fe_code("21P01", msg));
+        }
+        let mut full = vec![CellInput::Default; table_meta.columns.len()];
+        match &column_map {
+            Some(cols) => {
+                for (idx, value) in row.into_iter().enumerate() {
+                    full[cols[idx]] = CellInput::Value(value);
+                }
+            }
+            None => {
+                for (idx, value) in row.into_iter().enumerate() {
+                    full[idx] = CellInput::Value(value);
+                }
+            }
+        }
+        realized.push(full);
+    }
+
+    let (txid, autocommit) = writer_txid(session, txn_manager);
+    let (inserted, inserted_rows, inserted_ptrs, updated_rows, updated_ptrs): (
+        usize,
+        Vec<Row>,
+        Vec<RowPointer>,
+        Vec<Row>,
+        Vec<RowPointer>,
+    ) = {
+        let mut db = db.write();
+        match db.insert_full_rows(
+            schema_name,
+            &table.name,
+            realized,
+            override_system_value,
+            txid,
+            params.as_ref(),
+            ctx,
+            resolved_conflict.clone(),
+        ) {
+            Ok(res) => res,
+            Err(e) => {
+                finish_writer_tx(txn_manager, txid, autocommit, false);
+                return Err(map_db_err(e));
+            }
+        }
+    };
+    if autocommit {
+        finish_writer_tx(txn_manager, txid, true, true);
+    } else {
+        session.record_inserts(inserted_ptrs.clone());
+        session.record_touched(updated_ptrs.clone());
+    }
+    let tag = format!("INSERT 0 {}", inserted);
+    if let Some(clause) = returning.clone() {
+        let schema = returning_schema
+            .clone()
+            .expect("returning schema missing for INSERT");
+        let all_rows: Vec<Row> = inserted_rows
+            .iter()
+            .zip(inserted_ptrs.iter())
+            .chain(updated_rows.iter().zip(updated_ptrs.iter()))
+            .map(|(row, _)| row.clone())
+            .collect();
+        let rows = materialize_returning_rows(&clause, &all_rows, &params, ctx)?;
+        Ok((
+            Box::new(ValuesExec::from_values(schema, rows)),
+            Some(tag),
+            Some(inserted),
+        ))
+    } else {
+        Ok((
+            Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+            Some(tag),
+            Some(inserted),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_update_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,

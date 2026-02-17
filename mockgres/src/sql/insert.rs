@@ -14,7 +14,8 @@ use super::returning::parse_returning_clause;
 use super::tokens::parse_index_columns;
 use super::update::parse_update_target_list;
 
-pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
+pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
+    let with_clause = ins.with_clause.take();
     let rv = ins.relation.ok_or_else(|| fe("missing target table"))?;
     let schema = if rv.schemaname.is_empty() {
         None
@@ -38,38 +39,52 @@ pub fn plan_insert(ins: InsertStmt) -> PgWireResult<Plan> {
     let sel = ins
         .select_stmt
         .and_then(|n| n.node)
-        .ok_or_else(|| fe("INSERT needs VALUES"))?;
+        .ok_or_else(|| fe("INSERT needs VALUES or SELECT"))?;
     let NodeEnum::SelectStmt(sel2) = sel else {
-        return Err(fe("only VALUES supported"));
+        return Err(fe("only VALUES or SELECT are supported for INSERT"));
     };
-    let mut all_rows: Vec<Vec<InsertSource>> = Vec::new();
-    for v in sel2.values_lists {
-        let NodeEnum::List(vlist) = v.node.unwrap() else {
-            continue;
-        };
-        let mut row = Vec::new();
-        for cell in vlist.items {
-            let n = cell.node.unwrap();
-            if matches!(n, NodeEnum::SetToDefault(_)) {
-                row.push(InsertSource::Default);
-            } else {
-                let expr = parse_insert_value_expr(&n)?;
-                row.push(InsertSource::Expr(expr));
-            }
-        }
-        all_rows.push(row);
-    }
+    let select_stmt = *sel2;
     let on_conflict = parse_on_conflict_clause(&ins.on_conflict_clause)?;
     let returning = parse_returning_clause(&ins.returning_list)?;
-    Ok(Plan::InsertValues {
-        table,
-        columns: insert_columns,
-        rows: all_rows,
-        override_system_value,
-        on_conflict,
-        returning,
-        returning_schema: None,
-    })
+    let plan = if select_stmt.values_lists.is_empty() {
+        Plan::InsertSelect {
+            table,
+            columns: insert_columns,
+            select: Box::new(super::dml::plan_select(select_stmt)?),
+            override_system_value,
+            on_conflict,
+            returning,
+            returning_schema: None,
+        }
+    } else {
+        let mut all_rows: Vec<Vec<InsertSource>> = Vec::new();
+        for v in select_stmt.values_lists {
+            let NodeEnum::List(vlist) = v.node.unwrap() else {
+                continue;
+            };
+            let mut row = Vec::new();
+            for cell in vlist.items {
+                let n = cell.node.unwrap();
+                if matches!(n, NodeEnum::SetToDefault(_)) {
+                    row.push(InsertSource::Default);
+                } else {
+                    let expr = parse_insert_value_expr(&n)?;
+                    row.push(InsertSource::Expr(expr));
+                }
+            }
+            all_rows.push(row);
+        }
+        Plan::InsertValues {
+            table,
+            columns: insert_columns,
+            rows: all_rows,
+            override_system_value,
+            on_conflict,
+            returning,
+            returning_schema: None,
+        }
+    };
+    super::cte::wrap_with_clause(with_clause, plan)
 }
 
 fn parse_insert_columns(cols: &[pg_query::Node]) -> PgWireResult<Option<Vec<String>>> {

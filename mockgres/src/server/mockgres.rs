@@ -63,7 +63,7 @@ struct BatchExecution {
 
 fn query_command_tag(plan: &Plan) -> String {
     match plan {
-        Plan::InsertValues { .. } => "INSERT 0".to_string(),
+        Plan::InsertValues { .. } | Plan::InsertSelect { .. } => "INSERT 0".to_string(),
         Plan::Update { .. } => "UPDATE".to_string(),
         Plan::Delete { .. } => "DELETE".to_string(),
         _ => command_tag(plan).to_string(),
@@ -72,7 +72,7 @@ fn query_command_tag(plan: &Plan) -> String {
 
 fn execution_tag(plan: &Plan, row_count: Option<usize>) -> Tag {
     let mut tag = Tag::new(command_tag(plan));
-    if matches!(plan, Plan::InsertValues { .. }) {
+    if matches!(plan, Plan::InsertValues { .. } | Plan::InsertSelect { .. }) {
         tag = tag.with_oid(0);
     }
     if let Some(rows) = row_count {
@@ -656,9 +656,8 @@ impl Mockgres {
             StatementPlan::Batch(plans) => plans.as_slice(),
         };
         let mut out = Vec::with_capacity(plans.len());
-        for (idx, plan) in plans.iter().enumerate() {
-            let bound = bind(&db, session, plan.clone())
-                .map_err(|e| fe(format!("statement {} bind failed: {}", idx + 1, e)))?;
+        for plan in plans {
+            let bound = bind(&db, session, plan.clone())?;
             out.push(bound);
         }
         Ok(out)

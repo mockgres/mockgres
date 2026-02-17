@@ -171,6 +171,14 @@ pub enum Selection {
 
 pub type ObjName = QualifiedName;
 
+#[derive(Clone, Debug)]
+pub struct CommonTableExprPlan {
+    pub name: String,
+    pub plan: Box<Plan>,
+    pub output_columns: Option<Vec<String>>,
+    pub schema: Option<Schema>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JoinType {
     Inner,
@@ -247,6 +255,10 @@ type ColumnSpec = (
 #[derive(Clone, Debug)]
 pub enum Plan {
     Empty,
+    With {
+        ctes: Vec<CommonTableExprPlan>,
+        body: Box<Plan>,
+    },
     Values {
         rows: Vec<Vec<Expr>>,
         schema: Schema,
@@ -294,6 +306,11 @@ pub enum Plan {
         cols: Vec<(usize, Field)>,
         schema: Schema,
         lock: Option<LockSpec>,
+    },
+    CteScan {
+        name: String,
+        cols: Vec<(usize, Field)>,
+        schema: Schema,
     },
     LockRows {
         table: ObjName,
@@ -418,8 +435,18 @@ pub enum Plan {
         returning: Option<ReturningClause>,
         returning_schema: Option<Schema>,
     },
+    InsertSelect {
+        table: ObjName,
+        columns: Option<Vec<String>>,
+        select: Box<Plan>,
+        override_system_value: bool,
+        on_conflict: Option<OnConflictAction>,
+        returning: Option<ReturningClause>,
+        returning_schema: Option<Schema>,
+    },
     Update {
         table: ObjName,
+        table_alias: Option<String>,
         sets: Vec<UpdateSet>,
         filter: Option<BoolExpr>,
         from: Option<Box<Plan>>,
@@ -476,9 +503,11 @@ impl Plan {
                 static EMPTY: Schema = Schema { fields: vec![] };
                 &EMPTY
             }
+            Plan::With { body, .. } => body.schema(),
             Plan::Values { schema, .. }
             | Plan::Aggregate { schema, .. }
             | Plan::SeqScan { schema, .. }
+            | Plan::CteScan { schema, .. }
             | Plan::LockRows { schema, .. }
             | Plan::Projection { schema, .. }
             | Plan::CountRows { schema, .. }
@@ -489,6 +518,11 @@ impl Plan {
                 input.schema()
             }
             Plan::InsertValues {
+                on_conflict: _,
+                returning_schema,
+                ..
+            }
+            | Plan::InsertSelect {
                 on_conflict: _,
                 returning_schema,
                 ..

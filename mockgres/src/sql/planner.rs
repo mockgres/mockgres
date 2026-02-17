@@ -342,6 +342,77 @@ mod tests {
     }
 
     #[test]
+    fn with_single_cte_select_plan_construction() {
+        let plan = Planner::plan_sql("with c as (select 1 as id) select id from c").expect("plan");
+        match plan {
+            Plan::With { ctes, body } => {
+                assert_eq!(ctes.len(), 1);
+                assert_eq!(ctes[0].name, "c");
+                assert!(matches!(*ctes[0].plan.clone(), Plan::Projection { .. }));
+                assert!(matches!(*body, Plan::Projection { .. }));
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_multi_cte_plan_construction_in_declaration_order() {
+        let plan = Planner::plan_sql(
+            "with first as (select 1 as id), second as (select id from first) select id from second",
+        )
+        .expect("plan");
+        match plan {
+            Plan::With { ctes, body } => {
+                let names: Vec<String> = ctes.into_iter().map(|cte| cte.name).collect();
+                assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
+                assert!(matches!(*body, Plan::Projection { .. }));
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_update_from_cte_plans() {
+        let plan = Planner::plan_sql(
+            "with c as (select 1 as id) update t set x = 1 from c where t.id = c.id",
+        );
+        match plan.expect("plan") {
+            Plan::With { body, .. } => match *body {
+                Plan::Update { from, .. } => assert!(from.is_some()),
+                other => panic!("unexpected body plan: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_insert_select_plans() {
+        let plan =
+            Planner::plan_sql("with c as (select 1 as id) insert into t(id) select id from c");
+        match plan.expect("plan") {
+            Plan::With { body, .. } => match *body {
+                Plan::InsertSelect { .. } => {}
+                other => panic!("unexpected body plan: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_delete_plans() {
+        let plan = Planner::plan_sql(
+            "with c as (select 1 as id) delete from t where id in (select id from c)",
+        );
+        match plan.expect("plan") {
+            Plan::With { body, .. } => match *body {
+                Plan::Delete { .. } => {}
+                other => panic!("unexpected body plan: {other:?}"),
+            },
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn plan_sql_batch_single_statement() {
         let plans = Planner::plan_sql_batch("select 1").expect("plan batch");
         assert_eq!(plans.len(), 1);

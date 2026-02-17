@@ -6,7 +6,8 @@ use pgwire::error::PgWireResult;
 use super::expr::parse_bool_expr;
 use super::returning::parse_returning_clause;
 
-pub fn plan_delete(del: DeleteStmt) -> PgWireResult<Plan> {
+pub fn plan_delete(mut del: DeleteStmt) -> PgWireResult<Plan> {
+    let with_clause = del.with_clause.take();
     let rv = del.relation.ok_or_else(|| fe("missing target table"))?;
     let schema = if rv.schemaname.is_empty() {
         None
@@ -23,10 +24,13 @@ pub fn plan_delete(del: DeleteStmt) -> PgWireResult<Plan> {
         None
     };
     let returning = parse_returning_clause(&del.returning_list)?;
-    Ok(Plan::Delete {
-        table,
-        filter,
-        returning,
-        returning_schema: None,
-    })
+    super::cte::wrap_with_clause(
+        with_clause,
+        Plan::Delete {
+            table,
+            filter,
+            returning,
+            returning_schema: None,
+        },
+    )
 }

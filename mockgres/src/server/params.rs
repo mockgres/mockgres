@@ -88,6 +88,12 @@ pub fn build_params_for_portal<S>(
 
 fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>) {
     match plan {
+        Plan::With { ctes, body } => {
+            for cte in ctes {
+                collect_param_hints_from_plan(&cte.plan, out);
+            }
+            collect_param_hints_from_plan(body, out);
+        }
         Plan::Filter { input, expr, .. } => {
             collect_param_hints_from_plan(input, out);
             collect_param_hints_from_bool(expr, out);
@@ -186,9 +192,21 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_returning(clause, out);
             }
         }
+        Plan::InsertSelect {
+            select,
+            returning,
+            on_conflict: _,
+            ..
+        } => {
+            collect_param_hints_from_plan(select, out);
+            if let Some(clause) = returning {
+                collect_param_hints_from_returning(clause, out);
+            }
+        }
         Plan::Alias { input, .. } => collect_param_hints_from_plan(input, out),
         Plan::Empty
         | Plan::SeqScan { .. }
+        | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }
@@ -296,6 +314,12 @@ fn collect_param_hints_from_returning(
 
 fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
     match plan {
+        Plan::With { ctes, body } => {
+            for cte in ctes {
+                collect_param_indexes(&cte.plan, out);
+            }
+            collect_param_indexes(body, out);
+        }
         Plan::Filter { input, expr, .. } => {
             collect_param_indexes(input, out);
             collect_param_indexes_from_bool(expr, out);
@@ -391,9 +415,18 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_returning(clause, out);
             }
         }
+        Plan::InsertSelect {
+            select, returning, ..
+        } => {
+            collect_param_indexes(select, out);
+            if let Some(clause) = returning {
+                collect_param_indexes_from_returning(clause, out);
+            }
+        }
         Plan::Alias { input, .. } => collect_param_indexes(input, out),
         Plan::Empty
         | Plan::SeqScan { .. }
+        | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }
         | Plan::Values { .. }
         | Plan::CreateTable { .. }

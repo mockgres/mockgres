@@ -8,7 +8,8 @@ use super::dml::{extract_col_name, parse_from_item};
 use super::expr::{parse_bool_expr, parse_scalar_expr};
 use super::returning::parse_returning_clause;
 
-pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
+pub fn plan_update(mut upd: UpdateStmt) -> PgWireResult<Plan> {
+    let with_clause = upd.with_clause.take();
     let rv = upd.relation.ok_or_else(|| fe("missing target table"))?;
     let schema = if rv.schemaname.is_empty() {
         None
@@ -19,6 +20,13 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
         schema,
         name: rv.relname,
     };
+    let table_alias = rv.alias.and_then(|a| {
+        if a.aliasname.is_empty() {
+            None
+        } else {
+            Some(a.aliasname)
+        }
+    });
 
     let mut sets = Vec::new();
     for tgt in upd.target_list {
@@ -63,15 +71,19 @@ pub fn plan_update(upd: UpdateStmt) -> PgWireResult<Plan> {
         from_plan = Some(Box::new(plan));
     }
     let returning = parse_returning_clause(&upd.returning_list)?;
-    Ok(Plan::Update {
-        table,
-        sets,
-        filter,
-        from: from_plan,
-        from_schema: None,
-        returning,
-        returning_schema: None,
-    })
+    super::cte::wrap_with_clause(
+        with_clause,
+        Plan::Update {
+            table,
+            table_alias,
+            sets,
+            filter,
+            from: from_plan,
+            from_schema: None,
+            returning,
+            returning_schema: None,
+        },
+    )
 }
 
 pub fn parse_update_target_list(

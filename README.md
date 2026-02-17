@@ -10,7 +10,9 @@
 - [Features](#features)
 - [Protocol Support Matrix](#protocol-support-matrix)
 - [Multi-Statement Behavior Contract](#multi-statement-behavior-contract)
+- [CTE Behavior Contract](#cte-behavior-contract)
 - [Troubleshooting Multi-Statement Clients](#troubleshooting-multi-statement-clients)
+- [Troubleshooting CTE Queries](#troubleshooting-cte-queries)
 - [Limitations](#limitations)
 - [Architecture Notes](#architecture-notes)
 - [Roadmap](#roadmap)
@@ -52,8 +54,9 @@ Testing covered pretty much exclusively by integration tests in the `tests` dire
 
 ## What's supported
 - Core SQL: SELECT/INSERT/UPDATE/DELETE, WHERE/ORDER BY/LIMIT/OFFSET, projections/aliases, aggregates (count/sum/avg/min/max), GROUP BY/HAVING, simple scalar functions (now/current_timestamp/current_date/upper/lower/length/coalesce/abs/log/ln/greatest/extract epoch), type casts, interval literals, expressions
+- CTEs (`WITH`): non-recursive CTEs on SELECT/UPDATE/INSERT/DELETE, including SELECT/INSERT/UPDATE/DELETE CTE bodies with RETURNING, dependency-aware multi-CTE resolution, column alias lists, CTE reuse in joins/`FROM`
 - Joins: CROSS/INNER/LEFT with ON predicates, multi-join, subqueries IN (SELECT ...)
-- DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, RETURNING
+- DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, INSERT ... SELECT, RETURNING
 - Locking and tx: BEGIN/COMMIT/ROLLBACK (read committed only), SELECT FOR UPDATE SKIP LOCKED
 - Copy-on-write snapshots: global freeze + per-session sandboxes (`mockgres_freeze()`, `mockgres_reset()`)
 - types: int4/int8, float8, text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
@@ -85,6 +88,18 @@ Known differences from PostgreSQL:
   - Non-query statements emit command-complete tags per statement.
   - Empty statements (`;;` or trailing `;`) are treated as empty-query segments and do not emit command tags.
 
+## CTE Behavior Contract
+- Scope: CTE names are statement-local and do not leak to later statements.
+- Precedence: unqualified relation names resolve to in-scope CTEs before catalog tables.
+- Ordering: CTEs bind/execute in dependency order; forward references are allowed when acyclic.
+- Reuse: each CTE is materialized once per statement execution and can be referenced multiple times.
+- Supported forms: non-recursive CTEs with SELECT/INSERT/UPDATE/DELETE bodies.
+- Explicitly unsupported:
+  - `WITH RECURSIVE`
+  - `MATERIALIZED` / `NOT MATERIALIZED`
+  - `SEARCH` / `CYCLE`
+  - circular CTE dependencies
+
 ## Troubleshooting Multi-Statement Clients
 - `batch_execute`/`simple_query` style APIs:
   - If a batch fails, verify whether your client sent simple or extended protocol before assuming rollback behavior.
@@ -95,6 +110,16 @@ Known differences from PostgreSQL:
 - Protocol differences to debug quickly:
   - If command tags look incomplete, check for an early error that short-circuited the batch.
   - If row shape changes across statements, consume results as a stream of per-statement responses.
+
+## Troubleshooting CTE Queries
+- Prepared statements with CTE parameters:
+  - Parameters inside CTE bodies and in the outer statement are both inferred/bound.
+  - If a client reports `UNKNOWN` parameter types unexpectedly, verify your query shape still includes typed comparisons/casts.
+- CTE error recovery:
+  - After a CTE planning/binding error, both simple and extended protocol paths should accept subsequent valid statements on the same connection.
+- Forward references:
+  - Forward references are supported when the dependency graph is acyclic.
+  - Cycles are rejected with `circular CTE dependencies are not supported`.
 
 ## Copy-on-write snapshots
 - Freeze the current database state with `SELECT mockgres_freeze();`. The first call captures a base snapshot; subsequent calls are no-ops and return `true`.

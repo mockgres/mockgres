@@ -15,6 +15,7 @@ fn bind_bool_expr_inner(
     search_path: &[SchemaId],
     current_database: Option<&str>,
     time_ctx: BindTimeContext,
+    cte_scope: &super::CteScope,
     allow_excluded: bool,
 ) -> PgWireResult<BoolExpr> {
     Ok(match expr {
@@ -61,6 +62,7 @@ fn bind_bool_expr_inner(
                         search_path,
                         current_database,
                         time_ctx,
+                        cte_scope,
                         allow_excluded,
                     )
                 })
@@ -77,6 +79,7 @@ fn bind_bool_expr_inner(
                         search_path,
                         current_database,
                         time_ctx,
+                        cte_scope,
                         allow_excluded,
                     )
                 })
@@ -89,6 +92,7 @@ fn bind_bool_expr_inner(
             search_path,
             current_database,
             time_ctx,
+            cte_scope,
             allow_excluded,
         )?)),
         BoolExpr::IsNull { expr, negated } => BoolExpr::IsNull {
@@ -120,6 +124,7 @@ fn bind_bool_expr_inner(
                 search_path,
                 current_database,
                 time_ctx,
+                cte_scope,
                 *subplan.clone(),
             )?;
             BoolExpr::InSubquery {
@@ -150,6 +155,7 @@ pub(crate) fn bind_bool_expr(
     search_path: &[SchemaId],
     current_database: Option<&str>,
     time_ctx: BindTimeContext,
+    cte_scope: &super::CteScope,
 ) -> PgWireResult<BoolExpr> {
     bind_bool_expr_inner(
         expr,
@@ -158,6 +164,7 @@ pub(crate) fn bind_bool_expr(
         search_path,
         current_database,
         time_ctx,
+        cte_scope,
         false,
     )
 }
@@ -169,6 +176,7 @@ pub(crate) fn bind_bool_expr_allow_excluded(
     search_path: &[SchemaId],
     current_database: Option<&str>,
     time_ctx: BindTimeContext,
+    cte_scope: &super::CteScope,
 ) -> PgWireResult<BoolExpr> {
     bind_bool_expr_inner(
         expr,
@@ -177,6 +185,7 @@ pub(crate) fn bind_bool_expr_allow_excluded(
         search_path,
         current_database,
         time_ctx,
+        cte_scope,
         true,
     )
 }

@@ -1,3 +1,4 @@
+mod cte;
 mod ddl;
 mod delete;
 mod dml;

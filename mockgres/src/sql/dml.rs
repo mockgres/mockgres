@@ -21,8 +21,10 @@ type ProjectionItems = Vec<(ScalarExpr, String)>;
 type ParsedSelectList = (Selection, Option<ProjectionItems>);
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
+    let with_clause = sel.with_clause.take();
     if sel.from_clause.is_empty() {
-        return plan_literal_select(sel);
+        let plan = plan_literal_select(sel)?;
+        return super::cte::wrap_with_clause(with_clause, plan);
     }
     let mut count_star = false;
     let mut count_alias = "count".to_string();
@@ -319,7 +321,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
 
-    Ok(plan)
+    super::cte::wrap_with_clause(with_clause, plan)
 }
 
 fn parse_locking_clause(
