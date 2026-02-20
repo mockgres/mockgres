@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::catalog::{SchemaName, TableId};
 #[allow(unused_imports)]
 use crate::engine::{
@@ -11,9 +13,9 @@ use pg_query::protobuf::{LockClauseStrength, LockWaitPolicy, ResTarget, SelectSt
 use pgwire::error::PgWireResult;
 
 use super::expr::{
-    AggregateExprCollector, agg_func_from_name, collect_columns_from_bool_expr,
-    collect_columns_from_scalar_expr, derive_expr_name, is_aggregate_func_name, parse_bool_expr,
-    parse_bool_expr_with_aggregates, parse_column_ref, parse_scalar_expr,
+    AggregateExprCollector, collect_columns_from_bool_expr, collect_columns_from_scalar_expr,
+    derive_expr_name, is_aggregate_func_name, parse_bool_expr, parse_bool_expr_with_aggregates,
+    parse_column_ref, parse_scalar_expr, parse_scalar_expr_with_aggregates,
 };
 use super::tokens::parse_type_name;
 
@@ -193,49 +195,38 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     } else if has_other_aggs || !sel.group_clause.is_empty() || has_having {
         let group_clause_exprs = parse_group_clause(&sel.group_clause)?;
-        let group_len = group_clause_exprs.len();
-        let items = parse_aggregate_select_list(&mut sel.target_list)?;
-        let mut select_proj = Vec::new();
-        let mut select_agg_exprs = Vec::new();
-        for item in items {
-            if let Some((agg_call, alias)) = item.agg_call {
-                let agg_idx = select_agg_exprs.len();
-                select_proj.push(SelectProjection::Agg {
-                    agg_idx,
-                    alias: alias.clone(),
-                });
-                select_agg_exprs.push((agg_call, alias));
-            } else if let Some((expr, alias)) = item.group_expr {
-                if group_clause_exprs.is_empty() {
+        let (items, select_agg_exprs) = parse_aggregate_select_list(&mut sel.target_list)?;
+        if items.is_empty() {
+            return Err(fe("SELECT list is empty"));
+        }
+
+        if group_clause_exprs.is_empty() {
+            let agg_aliases: HashSet<String> = select_agg_exprs
+                .iter()
+                .map(|(_, alias)| alias.clone())
+                .collect();
+            for item in &items {
+                let mut cols = Vec::new();
+                collect_columns_from_scalar_expr(&item.expr, &mut cols);
+                if cols.iter().any(|col| !agg_aliases.contains(col)) {
                     return Err(fe_code(
                         "42803",
                         "column must appear in the GROUP BY clause or be used in an aggregate function",
                     ));
                 }
-                let Some(idx) = find_group_expr_index(&expr, &group_clause_exprs) else {
+            }
+        } else {
+            for item in &items {
+                if item.contains_aggregate {
+                    continue;
+                }
+                if find_group_expr_index(&item.expr, &group_clause_exprs).is_none() {
                     return Err(fe_code(
                         "42803",
                         "column must appear in the GROUP BY clause or be used in an aggregate function",
                     ));
-                };
-                select_proj.push(SelectProjection::Group {
-                    group_idx: idx,
-                    alias,
-                });
+                }
             }
-        }
-        if select_proj.is_empty() {
-            return Err(fe("SELECT list is empty"));
-        }
-        if group_clause_exprs.is_empty()
-            && select_proj
-                .iter()
-                .any(|proj| matches!(proj, SelectProjection::Group { .. }))
-        {
-            return Err(fe_code(
-                "42803",
-                "column must appear in the GROUP BY clause or be used in an aggregate function",
-            ));
         }
 
         let mut agg_exprs_full = select_agg_exprs.clone();
@@ -271,31 +262,18 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             };
         }
 
-        let mut projection_exprs = Vec::new();
-        let mut projection_fields = Vec::new();
-        for proj in select_proj {
-            match proj {
-                SelectProjection::Group { group_idx, alias } => {
-                    projection_exprs.push((ScalarExpr::ColumnIdx(group_idx), alias.clone()));
-                    let dt = infer_expr_type(&group_clause_exprs[group_idx].0);
-                    projection_fields.push(Field {
-                        name: alias,
-                        data_type: dt,
-                        origin: None,
-                    });
-                }
-                SelectProjection::Agg { agg_idx, alias } => {
-                    let column_idx = group_len + agg_idx;
-                    projection_exprs.push((ScalarExpr::ColumnIdx(column_idx), alias.clone()));
-                    let dt = infer_agg_type(&select_agg_exprs[agg_idx].0);
-                    projection_fields.push(Field {
-                        name: alias,
-                        data_type: dt,
-                        origin: None,
-                    });
-                }
-            }
-        }
+        let projection_exprs: Vec<(ScalarExpr, String)> = items
+            .iter()
+            .map(|item| (item.expr.clone(), item.alias.clone()))
+            .collect();
+        let projection_fields: Vec<Field> = items
+            .iter()
+            .map(|item| Field {
+                name: item.alias.clone(),
+                data_type: infer_expr_type(&item.expr),
+                origin: None,
+            })
+            .collect();
         plan = Plan::Projection {
             input: Box::new(aggregate_plan),
             exprs: projection_exprs,
@@ -416,46 +394,114 @@ fn target_list_contains_aggregates(target_list: &[pg_query::Node]) -> bool {
         let Some(expr_node) = rt.val.as_ref().and_then(|n| n.node.as_ref()) else {
             continue;
         };
-        if let NodeEnum::FuncCall(fc) = expr_node {
-            let name = fc
-                .funcname
-                .iter()
-                .find_map(|n| {
-                    n.node.as_ref().and_then(|nn| {
-                        if let NodeEnum::String(s) = nn {
-                            Some(s.sval.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_default();
-            if is_aggregate_func_name(&name) {
-                if target_list.len() == 1 && fc.agg_star && name.eq_ignore_ascii_case("count") {
-                    continue;
-                }
-                return true;
+        if expr_node_contains_aggregate(expr_node) {
+            if let NodeEnum::FuncCall(fc) = expr_node
+                && target_list.len() == 1
+                && fc.agg_star
+                && function_name(fc).is_some_and(|name| name.eq_ignore_ascii_case("count"))
+            {
+                continue;
             }
+            return true;
         }
     }
     false
 }
 
-struct AggregateSelectItem {
-    group_expr: Option<(ScalarExpr, String)>,
-    agg_call: Option<(AggCall, String)>,
+fn function_name(fc: &pg_query::protobuf::FuncCall) -> Option<String> {
+    fc.funcname
+        .iter()
+        .filter_map(|n| {
+            n.node.as_ref().and_then(|nn| {
+                if let NodeEnum::String(s) = nn {
+                    Some(s.sval.to_ascii_lowercase())
+                } else {
+                    None
+                }
+            })
+        })
+        .next_back()
 }
 
-enum SelectProjection {
-    Group { group_idx: usize, alias: String },
-    Agg { agg_idx: usize, alias: String },
+fn expr_node_contains_aggregate(node: &NodeEnum) -> bool {
+    match node {
+        NodeEnum::FuncCall(fc) => {
+            if function_name(fc).is_some_and(|name| is_aggregate_func_name(&name)) {
+                return true;
+            }
+            fc.args
+                .iter()
+                .filter_map(|arg| arg.node.as_ref())
+                .any(expr_node_contains_aggregate)
+        }
+        NodeEnum::CoalesceExpr(ce) => ce
+            .args
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::AExpr(ax) => {
+            ax.lexpr
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+                .is_some_and(expr_node_contains_aggregate)
+                || ax
+                    .rexpr
+                    .as_ref()
+                    .and_then(|n| n.node.as_ref())
+                    .is_some_and(expr_node_contains_aggregate)
+        }
+        NodeEnum::TypeCast(tc) => tc
+            .arg
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .is_some_and(expr_node_contains_aggregate),
+        NodeEnum::MinMaxExpr(mm) => mm
+            .args
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::AArrayExpr(arr) => arr
+            .elements
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::ArrayExpr(arr) => arr
+            .elements
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::BoolExpr(be) => be
+            .args
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::NullTest(nt) => nt
+            .arg
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .is_some_and(expr_node_contains_aggregate),
+        NodeEnum::List(list) => list
+            .items
+            .iter()
+            .filter_map(|arg| arg.node.as_ref())
+            .any(expr_node_contains_aggregate),
+        NodeEnum::SubLink(_) => false,
+        _ => false,
+    }
+}
+
+struct AggregateSelectItem {
+    expr: ScalarExpr,
+    alias: String,
+    contains_aggregate: bool,
 }
 
 fn parse_aggregate_select_list(
     target_list: &mut Vec<pg_query::Node>,
-) -> PgWireResult<Vec<AggregateSelectItem>> {
+) -> PgWireResult<(Vec<AggregateSelectItem>, Vec<(AggCall, String)>)> {
     use pg_query::NodeEnum;
 
+    let mut collector = AggregateExprCollector::new("__select_agg");
     let mut items = Vec::new();
     for node in target_list.drain(..) {
         let rt = node
@@ -474,64 +520,25 @@ fn parse_aggregate_select_list(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or_else(|| fe("bad target expr"))?;
-        if let NodeEnum::FuncCall(fc) = expr_node {
-            let func_name = fc
-                .funcname
-                .iter()
-                .find_map(|n| {
-                    n.node.as_ref().and_then(|nn| {
-                        if let NodeEnum::String(s) = nn {
-                            Some(s.sval.to_ascii_lowercase())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_default();
-            if let Some(func) = agg_func_from_name(&func_name) {
-                if fc.agg_distinct {
-                    return Err(fe("DISTINCT aggregates are not supported"));
-                }
-                let alias = if rt.name.is_empty() {
-                    func_name.clone()
-                } else {
-                    rt.name.clone()
-                };
-                let agg_call = if func == AggFunc::Count && fc.agg_star {
-                    AggCall { func, expr: None }
-                } else {
-                    if fc.args.len() != 1 {
-                        return Err(fe("aggregate functions require exactly one argument"));
-                    }
-                    let arg_node = fc.args[0]
-                        .node
-                        .as_ref()
-                        .ok_or_else(|| fe("bad aggregate argument"))?;
-                    let expr = parse_scalar_expr(arg_node)?;
-                    AggCall {
-                        func,
-                        expr: Some(expr),
-                    }
-                };
-                items.push(AggregateSelectItem {
-                    group_expr: None,
-                    agg_call: Some((agg_call, alias)),
-                });
-                continue;
-            }
-        }
-        let expr = parse_scalar_expr(expr_node)?;
+        let agg_count_before = collector.agg_count();
+        let expr = parse_scalar_expr_with_aggregates(expr_node, &mut collector)?;
+        let contains_aggregate = collector.agg_count() > agg_count_before;
         let alias = if rt.name.is_empty() {
-            derive_expr_name(&expr)
+            if let NodeEnum::FuncCall(fc) = expr_node {
+                function_name(fc).unwrap_or_else(|| derive_expr_name(&expr))
+            } else {
+                derive_expr_name(&expr)
+            }
         } else {
             rt.name.clone()
         };
         items.push(AggregateSelectItem {
-            group_expr: Some((expr, alias)),
-            agg_call: None,
+            expr,
+            alias,
+            contains_aggregate,
         });
     }
-    Ok(items)
+    Ok((items, collector.into_aggs()))
 }
 
 fn parse_group_clause(group_clause: &[pg_query::Node]) -> PgWireResult<Vec<(ScalarExpr, String)>> {

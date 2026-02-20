@@ -356,6 +356,19 @@ mod tests {
     }
 
     #[test]
+    fn nested_aggregate_expression_is_planned() {
+        let plan =
+            Planner::plan_sql("select coalesce(sum(duration_seconds), 0) from observed_segments")
+                .expect("plan");
+        match plan {
+            Plan::Projection { input, .. } => {
+                assert!(matches!(*input, Plan::Aggregate { .. }));
+            }
+            other => panic!("unexpected plan: {other:?}"),
+        }
+    }
+
+    #[test]
     fn with_multi_cte_plan_construction_in_declaration_order() {
         let plan = Planner::plan_sql(
             "with first as (select 1 as id), second as (select id from first) select id from second",

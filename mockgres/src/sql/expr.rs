@@ -142,6 +142,13 @@ pub fn parse_scalar_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
     parse_scalar_expr_internal(node, None)
 }
 
+pub fn parse_scalar_expr_with_aggregates(
+    node: &NodeEnum,
+    collector: &mut AggregateExprCollector,
+) -> PgWireResult<ScalarExpr> {
+    parse_scalar_expr_internal(node, Some(collector))
+}
+
 fn parse_scalar_expr_internal(
     node: &NodeEnum,
     mut agg_ctx: Option<&mut AggregateExprCollector>,
@@ -461,6 +468,10 @@ impl AggregateExprCollector {
 
     pub fn into_aggs(self) -> Vec<(AggCall, String)> {
         self.aggs
+    }
+
+    pub fn agg_count(&self) -> usize {
+        self.aggs.len()
     }
 }
 
