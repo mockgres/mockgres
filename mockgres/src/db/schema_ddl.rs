@@ -111,6 +111,7 @@ impl Db {
         };
         self.remove_pg_class_row(schema_id, name);
         self.remove_information_schema_table_row(schema, name);
+        self.remove_pg_tables_row(schema, name);
         match self.catalog.remove_table(schema_id, name) {
             Some(meta) => {
                 if self.tables.remove(&meta.id).is_none() {

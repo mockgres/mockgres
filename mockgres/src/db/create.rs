@@ -63,6 +63,27 @@ impl Db {
         self.insert_pg_namespace_row(info_schema_id, "information_schema");
         self.insert_pg_class_row(ns_table, "pg_namespace", pg_catalog_id, "r");
         self.insert_pg_class_row(pg_class_table, "pg_class", pg_catalog_id, "r");
+        let _ = self
+            .create_table(
+                "pg_catalog",
+                "pg_tables",
+                vec![
+                    ("schemaname".to_string(), DataType::Text, false, None, None),
+                    ("tablename".to_string(), DataType::Text, false, None, None),
+                    ("tableowner".to_string(), DataType::Text, false, None, None),
+                    ("tablespace".to_string(), DataType::Text, true, None, None),
+                    ("hasindexes".to_string(), DataType::Bool, false, None, None),
+                    ("hasrules".to_string(), DataType::Bool, false, None, None),
+                    ("hastriggers".to_string(), DataType::Bool, false, None, None),
+                    ("rowsecurity".to_string(), DataType::Bool, false, None, None),
+                ],
+                None,
+                Vec::new(),
+                &[],
+            )
+            .expect("create pg_catalog.pg_tables");
+        self.refresh_pg_tables_row("pg_catalog", "pg_namespace");
+        self.refresh_pg_tables_row("pg_catalog", "pg_class");
         init_pg_type(self);
         let _ = self
             .create_table(
@@ -179,6 +200,7 @@ impl Db {
             self.insert_pg_class_row(id, name, schema_id, "r");
         }
         self.insert_information_schema_table_row(schema, name, "BASE TABLE");
+        self.refresh_pg_tables_row(schema, name);
         Ok(id)
     }
 
@@ -358,6 +380,42 @@ impl Db {
         );
     }
 
+    pub(crate) fn insert_pg_tables_row(&mut self, schema: &str, name: &str, has_indexes: bool) {
+        if self.catalog.get_table("pg_catalog", "pg_tables").is_none() {
+            return;
+        }
+        let ctx = EvalContext::new(SessionTimeZone::Utc);
+        let rows = vec![vec![
+            super::CellInput::Value(Value::Text(schema.to_string())),
+            super::CellInput::Value(Value::Text(name.to_string())),
+            super::CellInput::Value(Value::Text("mockgres".to_string())),
+            super::CellInput::Value(Value::Null),
+            super::CellInput::Value(Value::Bool(has_indexes)),
+            super::CellInput::Value(Value::Bool(false)),
+            super::CellInput::Value(Value::Bool(false)),
+            super::CellInput::Value(Value::Bool(false)),
+        ]];
+        let _ = self.insert_full_rows(
+            "pg_catalog",
+            "pg_tables",
+            rows,
+            false,
+            SYSTEM_TXID,
+            &[],
+            &ctx,
+            None,
+        );
+    }
+
+    pub(crate) fn refresh_pg_tables_row(&mut self, schema: &str, name: &str) {
+        let Some(meta) = self.catalog.get_table(schema, name) else {
+            return;
+        };
+        let has_indexes = meta.primary_key.is_some() || !meta.indexes.is_empty();
+        self.remove_pg_tables_row(schema, name);
+        self.insert_pg_tables_row(schema, name, has_indexes);
+    }
+
     pub(crate) fn remove_pg_class_row(&mut self, schema_id: SchemaId, relname: &str) {
         let Some(table_id) = self.catalog.table_id("pg_catalog", "pg_class") else {
             return;
@@ -387,6 +445,26 @@ impl Db {
             for (k, versions) in table.rows_by_key.iter() {
                 if let Some(row) = versions.last()
                     && matches!(row.data.get(0), Some(Value::Text(s)) if s == schema)
+                    && matches!(row.data.get(1), Some(Value::Text(n)) if n == name)
+                {
+                    to_remove.push(k.clone());
+                }
+            }
+            for k in to_remove {
+                table.rows_by_key.remove(&k);
+            }
+        }
+    }
+
+    pub(crate) fn remove_pg_tables_row(&mut self, schema: &str, name: &str) {
+        let Some(table_id) = self.catalog.table_id("pg_catalog", "pg_tables") else {
+            return;
+        };
+        if let Some(table) = self.tables.get_mut(&table_id) {
+            let mut to_remove = Vec::new();
+            for (k, versions) in table.rows_by_key.iter() {
+                if let Some(row) = versions.last()
+                    && matches!(row.data.first(), Some(Value::Text(s)) if s == schema)
                     && matches!(row.data.get(1), Some(Value::Text(n)) if n == name)
                 {
                     to_remove.push(k.clone());

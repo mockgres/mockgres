@@ -352,33 +352,38 @@ impl Db {
         if self.catalog.schema_entry(schema).is_none() {
             return Err(sql_err("3F000", format!("no such schema {schema}")));
         }
-        let table_meta = self
-            .catalog
-            .table_meta_mut(schema, table)
-            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
-        if table_meta.indexes.iter().any(|idx| idx.name == index_name) {
-            if if_not_exists {
-                return Ok(());
+        {
+            let table_meta = self
+                .catalog
+                .table_meta_mut(schema, table)
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+            if table_meta.indexes.iter().any(|idx| idx.name == index_name) {
+                if if_not_exists {
+                    return Ok(());
+                }
+                return Err(sql_err(
+                    "42P07",
+                    format!("index {index_name} already exists"),
+                ));
             }
-            return Err(sql_err(
-                "42P07",
-                format!("index {index_name} already exists"),
-            ));
+            let mut col_positions = Vec::with_capacity(columns.len());
+            for col_name in columns {
+                let pos = table_meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name == col_name)
+                    .ok_or_else(|| {
+                        sql_err("42703", format!("unknown column in index: {col_name}"))
+                    })?;
+                col_positions.push(pos);
+            }
+            table_meta.indexes.push(crate::catalog::IndexMeta {
+                name: index_name.to_string(),
+                columns: col_positions,
+                unique: is_unique,
+            });
         }
-        let mut col_positions = Vec::with_capacity(columns.len());
-        for col_name in columns {
-            let pos = table_meta
-                .columns
-                .iter()
-                .position(|c| c.name == col_name)
-                .ok_or_else(|| sql_err("42703", format!("unknown column in index: {col_name}")))?;
-            col_positions.push(pos);
-        }
-        table_meta.indexes.push(crate::catalog::IndexMeta {
-            name: index_name.to_string(),
-            columns: col_positions,
-            unique: is_unique,
-        });
+        self.refresh_pg_tables_row(schema, table);
         Ok(())
     }
 
@@ -420,6 +425,13 @@ impl Db {
             && let Some(table) = self.tables.get_mut(&tid)
         {
             table.unique_maps.remove(index_name);
+        }
+        if let Some(tid) = removed_table_id
+            && let Some(table_meta) = self.catalog.tables_by_id.get(&tid)
+        {
+            let schema_name = table_meta.schema.as_str().to_string();
+            let table_name = table_meta.name.clone();
+            self.refresh_pg_tables_row(&schema_name, &table_name);
         }
         if removed || if_exists {
             Ok(())
