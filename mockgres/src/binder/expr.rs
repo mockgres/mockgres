@@ -350,6 +350,57 @@ fn bind_scalar_expr_inner(
                 },
             }
         }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            let bound_when_then = when_then
+                .iter()
+                .map(|(cond, result)| {
+                    let bound_cond = bind_bool_expr_inner(
+                        cond,
+                        schema,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        &super::CteScope::default(),
+                        allow_excluded,
+                    )?;
+                    let bound_result = bind_scalar_expr_inner(
+                        result,
+                        schema,
+                        hint,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        allow_excluded,
+                    )?;
+                    Ok((bound_cond, bound_result))
+                })
+                .collect::<PgWireResult<Vec<_>>>()?;
+            let bound_else = else_expr
+                .as_ref()
+                .map(|expr| {
+                    bind_scalar_expr_inner(
+                        expr,
+                        schema,
+                        hint,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                        allow_excluded,
+                    )
+                    .map(Box::new)
+                })
+                .transpose()?;
+            ScalarExpr::Case {
+                when_then: bound_when_then,
+                else_expr: bound_else,
+            }
+        }
     })
 }
 
@@ -550,14 +601,39 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::PgAdvisoryLock => Some(DataType::Void),
             ScalarFunc::PgAdvisoryUnlock => Some(DataType::Bool),
         },
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => when_then
+            .iter()
+            .find_map(|(_, result)| scalar_expr_type(result, schema))
+            .or_else(|| {
+                else_expr
+                    .as_ref()
+                    .and_then(|expr| scalar_expr_type(expr, schema))
+            }),
         _ => None,
     }
 }
 
 pub(crate) fn apply_param_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
-    if let (ScalarExpr::Param { ty, .. }, Some(dt)) = (expr, hint)
+    if let Some(dt) = hint
+        && let ScalarExpr::Param { ty, .. } = expr
         && ty.is_none()
     {
         *ty = Some(dt.clone());
+        return;
+    }
+    if let ScalarExpr::Case {
+        when_then,
+        else_expr,
+    } = expr
+    {
+        for (_, result) in when_then {
+            apply_param_hint(result, hint);
+        }
+        if let Some(expr) = else_expr {
+            apply_param_hint(expr, hint);
+        }
     }
 }

@@ -37,7 +37,12 @@ pub(crate) fn schema_or_public(schema: &Option<SchemaName>) -> &str {
 pub(crate) fn assert_supported_aggs(aggs: &[(AggCall, String)]) {
     for (agg, _) in aggs {
         match agg.func {
-            AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {}
+            AggFunc::Count
+            | AggFunc::Sum
+            | AggFunc::Avg
+            | AggFunc::Min
+            | AggFunc::Max
+            | AggFunc::BoolAnd => {}
         }
     }
 }
@@ -220,6 +225,7 @@ pub fn build_executor(
         ),
         Plan::Delete {
             table,
+            table_alias: _,
             filter,
             returning,
             returning_schema,
@@ -510,11 +516,13 @@ fn rewrite_cte_refs(plan: &Plan, ctes: &HashMap<String, MaterializedCte>) -> PgW
         }),
         Plan::Delete {
             table,
+            table_alias,
             filter,
             returning,
             returning_schema,
         } => Ok(Plan::Delete {
             table: table.clone(),
+            table_alias: table_alias.clone(),
             filter: filter
                 .as_ref()
                 .map(|expr| rewrite_bool_expr_cte_refs(expr, ctes))
@@ -589,6 +597,24 @@ fn rewrite_scalar_expr_cte_refs(
                 .iter()
                 .map(|arg| rewrite_scalar_expr_cte_refs(arg, ctes))
                 .collect::<PgWireResult<Vec<_>>>()?,
+        },
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => ScalarExpr::Case {
+            when_then: when_then
+                .iter()
+                .map(|(cond, result)| {
+                    Ok((
+                        rewrite_bool_expr_cte_refs(cond, ctes)?,
+                        rewrite_scalar_expr_cte_refs(result, ctes)?,
+                    ))
+                })
+                .collect::<PgWireResult<Vec<_>>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|expr| rewrite_scalar_expr_cte_refs(expr, ctes).map(Box::new))
+                .transpose()?,
         },
         other => other.clone(),
     })

@@ -759,6 +759,7 @@ struct AggState {
     sum: Option<Value>,
     min: Option<Value>,
     max: Option<Value>,
+    bool_and: Option<bool>,
 }
 
 impl AggState {
@@ -768,6 +769,7 @@ impl AggState {
             sum: None,
             min: None,
             max: None,
+            bool_and: None,
         }
     }
 }
@@ -885,6 +887,25 @@ impl HashAggregateExec {
                             state.max = Some(v);
                         }
                     }
+                    AggFunc::BoolAnd => {
+                        let expr = agg
+                            .expr
+                            .as_ref()
+                            .ok_or_else(|| fe("BOOL_AND requires an expression"))?;
+                        let v = eval_scalar_expr(&row, expr, &self.params, &self.ctx)?;
+                        match v {
+                            Value::Null => {}
+                            Value::Bool(b) => {
+                                state.bool_and = Some(state.bool_and.unwrap_or(true) && b);
+                            }
+                            other => {
+                                return Err(fe(format!(
+                                    "BOOL_AND expects boolean values, got {:?}",
+                                    other
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -911,6 +932,10 @@ impl HashAggregateExec {
                     }
                     AggFunc::Min => state.min.unwrap_or(Value::Null),
                     AggFunc::Max => state.max.unwrap_or(Value::Null),
+                    AggFunc::BoolAnd => match state.bool_and {
+                        Some(v) => Value::Bool(v),
+                        None => Value::Null,
+                    },
                 };
                 out.push(value);
             }

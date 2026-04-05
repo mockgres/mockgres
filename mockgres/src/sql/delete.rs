@@ -18,6 +18,13 @@ pub fn plan_delete(mut del: DeleteStmt) -> PgWireResult<Plan> {
         schema,
         name: rv.relname,
     };
+    let table_alias = rv.alias.and_then(|a| {
+        if a.aliasname.is_empty() {
+            None
+        } else {
+            Some(a.aliasname)
+        }
+    });
     let filter = if let Some(w) = del.where_clause.as_ref().and_then(|n| n.node.as_ref()) {
         Some(parse_bool_expr(w)?)
     } else {
@@ -28,6 +35,7 @@ pub fn plan_delete(mut del: DeleteStmt) -> PgWireResult<Plan> {
         with_clause,
         Plan::Delete {
             table,
+            table_alias,
             filter,
             returning,
             returning_schema: None,

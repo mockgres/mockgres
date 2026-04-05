@@ -278,6 +278,18 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
                 collect_param_hints_from_scalar(arg, out);
             }
         }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (cond, result) in when_then {
+                collect_param_hints_from_bool(cond, out);
+                collect_param_hints_from_scalar(result, out);
+            }
+            if let Some(expr) = else_expr {
+                collect_param_hints_from_scalar(expr, out);
+            }
+        }
         ScalarExpr::Column(..)
         | ScalarExpr::ColumnIdx(..)
         | ScalarExpr::ExcludedIdx(..)
@@ -494,6 +506,18 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_param_indexes_from_scalar(arg, out);
+            }
+        }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (cond, result) in when_then {
+                collect_param_indexes_from_bool(cond, out);
+                collect_param_indexes_from_scalar(result, out);
+            }
+            if let Some(expr) = else_expr {
+                collect_param_indexes_from_scalar(expr, out);
             }
         }
         ScalarExpr::Column(..)

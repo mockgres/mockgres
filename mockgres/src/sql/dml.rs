@@ -1015,6 +1015,15 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::TimestamptzMicros(_)) => DataType::Timestamptz,
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
         ScalarExpr::Cast { ty, .. } => ty.clone(),
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => when_then
+            .iter()
+            .map(|(_, result)| infer_expr_type(result))
+            .next()
+            .or_else(|| else_expr.as_ref().map(|expr| infer_expr_type(expr)))
+            .unwrap_or(DataType::Text),
         _ => DataType::Text,
     }
 }
@@ -1032,5 +1041,6 @@ fn infer_agg_type(agg: &AggCall) -> DataType {
             .as_ref()
             .map(infer_expr_type)
             .unwrap_or(DataType::Text),
+        AggFunc::BoolAnd => DataType::Bool,
     }
 }

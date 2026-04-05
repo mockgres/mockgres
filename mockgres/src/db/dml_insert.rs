@@ -575,6 +575,24 @@ fn substitute_excluded_in_scalar(
             expr: Box::new(substitute_excluded_in_scalar(expr, excluded, meta)?),
             ty: ty.clone(),
         },
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => ScalarExpr::Case {
+            when_then: when_then
+                .iter()
+                .map(|(cond, result)| {
+                    Ok((
+                        substitute_excluded_in_bool(cond, excluded, meta)?,
+                        substitute_excluded_in_scalar(result, excluded, meta)?,
+                    ))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+            else_expr: else_expr
+                .as_ref()
+                .map(|expr| substitute_excluded_in_scalar(expr, excluded, meta).map(Box::new))
+                .transpose()?,
+        },
         other => other.clone(),
     })
 }

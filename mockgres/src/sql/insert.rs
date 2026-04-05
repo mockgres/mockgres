@@ -201,6 +201,18 @@ fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
             expr: Box::new(sanitize_insert_expr(*expr)?),
             ty,
         }),
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => Ok(ScalarExpr::Case {
+            when_then: when_then
+                .into_iter()
+                .map(|(cond, result)| Ok((cond, sanitize_insert_expr(result)?)))
+                .collect::<PgWireResult<Vec<_>>>()?,
+            else_expr: else_expr
+                .map(|expr| sanitize_insert_expr(*expr).map(Box::new))
+                .transpose()?,
+        }),
         other => Ok(other),
     }
 }

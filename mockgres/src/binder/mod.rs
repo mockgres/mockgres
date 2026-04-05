@@ -459,6 +459,7 @@ fn bind_with_search_path(
                         .as_ref()
                         .and_then(|e| scalar_expr_type(e, &child_schema))
                         .unwrap_or(DataType::Text),
+                    AggFunc::BoolAnd => DataType::Bool,
                 };
                 fields.push(Field {
                     name: name.clone(),
@@ -679,6 +680,7 @@ fn bind_with_search_path(
         }
         Plan::Delete {
             mut table,
+            table_alias,
             filter,
             mut returning,
             returning_schema: _,
@@ -690,7 +692,7 @@ fn bind_with_search_path(
             let schema_origin = Some(FieldOrigin {
                 schema: Some(tm.schema.as_str().to_string()),
                 table: Some(tm.name.clone()),
-                alias: None,
+                alias: table_alias.clone(),
             });
             let schema = Schema {
                 fields: tm
@@ -728,6 +730,7 @@ fn bind_with_search_path(
             };
             Ok(Plan::Delete {
                 table,
+                table_alias,
                 filter: bound_filter,
                 returning,
                 returning_schema,

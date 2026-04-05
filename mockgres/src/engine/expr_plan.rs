@@ -37,7 +37,7 @@ impl fmt::Display for ColumnRefName {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum ScalarExpr {
     Literal(Value),
     Column(ColumnRefName),
@@ -64,6 +64,62 @@ pub enum ScalarExpr {
         func: ScalarFunc,
         args: Vec<ScalarExpr>,
     },
+    Case {
+        when_then: Vec<(BoolExpr, ScalarExpr)>,
+        else_expr: Option<Box<ScalarExpr>>,
+    },
+}
+
+impl PartialEq for ScalarExpr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Literal(a), Self::Literal(b)) => a == b,
+            (Self::Column(a), Self::Column(b)) => a == b,
+            (Self::ColumnIdx(a), Self::ColumnIdx(b)) => a == b,
+            (Self::ExcludedIdx(a), Self::ExcludedIdx(b)) => a == b,
+            (Self::Cast { expr: ae, ty: at }, Self::Cast { expr: be, ty: bt }) => {
+                ae == be && at == bt
+            }
+            (Self::Param { idx: ai, ty: at }, Self::Param { idx: bi, ty: bt }) => {
+                ai == bi && at == bt
+            }
+            (
+                Self::BinaryOp {
+                    op: ao,
+                    left: al,
+                    right: ar,
+                },
+                Self::BinaryOp {
+                    op: bo,
+                    left: bl,
+                    right: br,
+                },
+            ) => ao == bo && al == bl && ar == br,
+            (Self::UnaryOp { op: ao, expr: ae }, Self::UnaryOp { op: bo, expr: be }) => {
+                ao == bo && ae == be
+            }
+            (Self::Func { func: af, args: aa }, Self::Func { func: bf, args: ba }) => {
+                af == bf && aa == ba
+            }
+            (
+                Self::Case {
+                    when_then: aw,
+                    else_expr: ae,
+                },
+                Self::Case {
+                    when_then: bw,
+                    else_expr: be,
+                },
+            ) => {
+                aw.len() == bw.len()
+                    && aw.iter().zip(bw.iter()).all(|((ac, ar), (bc, br))| {
+                        format!("{ac:?}") == format!("{bc:?}") && ar == br
+                    })
+                    && ae == be
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -113,6 +169,7 @@ pub enum AggFunc {
     Avg,
     Min,
     Max,
+    BoolAnd,
 }
 
 #[derive(Clone, Debug)]
@@ -456,6 +513,7 @@ pub enum Plan {
     },
     Delete {
         table: ObjName,
+        table_alias: Option<String>,
         filter: Option<BoolExpr>,
         returning: Option<ReturningClause>,
         returning_schema: Option<Schema>,

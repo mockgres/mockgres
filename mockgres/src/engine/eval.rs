@@ -173,6 +173,21 @@ pub fn eval_scalar_expr_with_mode(
             }
             eval_function(*func, evaluated, ctx, mode)
         }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (cond, result) in when_then {
+                if eval_bool_expr(row, cond, params, ctx)?.unwrap_or(false) {
+                    return eval_scalar_expr_with_mode(row, result, params, ctx, mode);
+                }
+            }
+            if let Some(expr) = else_expr {
+                eval_scalar_expr_with_mode(row, expr, params, ctx, mode)
+            } else {
+                Ok(Value::Null)
+            }
+        }
         ScalarExpr::Cast { expr, ty } => {
             let value = eval_scalar_expr_with_mode(row, expr, params, ctx, mode)?;
             if matches!(value, Value::Null) {

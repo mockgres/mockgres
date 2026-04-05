@@ -173,6 +173,42 @@ fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
             }
             Ok(())
         }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (cond, result) in when_then {
+                ensure_default_bool_expr_is_const(cond)?;
+                ensure_default_expr_is_const(result)?;
+            }
+            if let Some(expr) = else_expr {
+                ensure_default_expr_is_const(expr)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn ensure_default_bool_expr_is_const(expr: &crate::engine::BoolExpr) -> PgWireResult<()> {
+    use crate::engine::BoolExpr;
+
+    match expr {
+        BoolExpr::Literal(_) => Ok(()),
+        BoolExpr::Comparison { lhs, rhs, .. } => {
+            ensure_default_expr_is_const(lhs)?;
+            ensure_default_expr_is_const(rhs)
+        }
+        BoolExpr::And(parts) | BoolExpr::Or(parts) => {
+            for part in parts {
+                ensure_default_bool_expr_is_const(part)?;
+            }
+            Ok(())
+        }
+        BoolExpr::Not(inner) => ensure_default_bool_expr_is_const(inner),
+        BoolExpr::IsNull { expr, .. } => ensure_default_expr_is_const(expr),
+        BoolExpr::InSubquery { .. } | BoolExpr::InListValues { .. } => {
+            Err(fe("DEFAULT expressions cannot contain subqueries"))
+        }
     }
 }
 

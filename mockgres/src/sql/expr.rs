@@ -6,7 +6,7 @@ use crate::engine::{
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
-    AArrayExpr, AExpr, AExprKind, BoolExprType, CoalesceExpr, ColumnRef, FuncCall, Node,
+    AArrayExpr, AExpr, AExprKind, BoolExprType, CaseExpr, CoalesceExpr, ColumnRef, FuncCall, Node,
     NullTestType, ParamRef, ResTarget, SelectStmt, SqlValueFunction, SqlValueFunctionOp,
 };
 use pgwire::error::PgWireResult;
@@ -16,7 +16,7 @@ use super::tokens::{const_to_value, parse_type_name, try_parse_literal};
 pub fn is_aggregate_func_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "avg" | "min" | "max"
+        "count" | "sum" | "avg" | "min" | "max" | "bool_and"
     )
 }
 
@@ -126,6 +126,7 @@ fn parse_bool_expr_internal(
         NodeEnum::ColumnRef(_)
         | NodeEnum::FuncCall(_)
         | NodeEnum::CoalesceExpr(_)
+        | NodeEnum::CaseExpr(_)
         | NodeEnum::TypeCast(_) => {
             let expr = parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?;
             Ok(BoolExpr::Comparison {
@@ -159,6 +160,7 @@ fn parse_scalar_expr_internal(
         NodeEnum::AExpr(ax) => parse_arithmetic_expr(ax, agg_ctx.as_deref_mut()),
         NodeEnum::FuncCall(fc) => parse_function_call(fc, agg_ctx.as_deref_mut()),
         NodeEnum::CoalesceExpr(ce) => parse_coalesce_expr(ce, agg_ctx.as_deref_mut()),
+        NodeEnum::CaseExpr(ce) => parse_case_expr(ce, agg_ctx.as_deref_mut()),
         NodeEnum::SqlvalueFunction(svf) => parse_sql_value_function(svf),
         NodeEnum::SubLink(sl) => {
             let subselect = sl
@@ -272,6 +274,62 @@ fn parse_coalesce_expr(
     Ok(ScalarExpr::Func {
         func: ScalarFunc::Coalesce,
         args,
+    })
+}
+
+fn parse_case_expr(
+    ce: &CaseExpr,
+    mut agg_ctx: Option<&mut AggregateExprCollector>,
+) -> PgWireResult<ScalarExpr> {
+    let case_operand = ce
+        .arg
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .map(|node| parse_scalar_expr_internal(node, agg_ctx.as_deref_mut()))
+        .transpose()?;
+
+    let mut when_then = Vec::with_capacity(ce.args.len());
+    for arg in &ce.args {
+        let node = arg.node.as_ref().ok_or_else(|| fe("bad CASE branch"))?;
+        let NodeEnum::CaseWhen(cw) = node else {
+            return Err(fe("bad CASE branch"));
+        };
+        let when_node = cw
+            .expr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("missing CASE WHEN condition"))?;
+        let condition = if let Some(case_operand) = case_operand.as_ref() {
+            let rhs = parse_scalar_expr_internal(when_node, agg_ctx.as_deref_mut())?;
+            BoolExpr::Comparison {
+                lhs: case_operand.clone(),
+                op: CmpOp::Eq,
+                rhs,
+            }
+        } else {
+            parse_bool_expr_internal(when_node, agg_ctx.as_deref_mut())?
+        };
+        let result_node = cw
+            .result
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("missing CASE THEN result"))?;
+        let result = parse_scalar_expr_internal(result_node, agg_ctx.as_deref_mut())?;
+        when_then.push((condition, result));
+    }
+    if when_then.is_empty() {
+        return Err(fe("CASE requires at least one WHEN"));
+    }
+    let else_expr = ce
+        .defresult
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .map(|node| parse_scalar_expr_internal(node, agg_ctx.as_deref_mut()))
+        .transpose()?
+        .map(Box::new);
+    Ok(ScalarExpr::Case {
+        when_then,
+        else_expr,
     })
 }
 
@@ -410,6 +468,7 @@ pub fn agg_func_from_name(name: &str) -> Option<AggFunc> {
         "avg" => Some(AggFunc::Avg),
         "min" => Some(AggFunc::Min),
         "max" => Some(AggFunc::Max),
+        "bool_and" => Some(AggFunc::BoolAnd),
         _ => None,
     }
 }
@@ -691,6 +750,18 @@ pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>
                 collect_columns_from_scalar_expr(arg, out);
             }
         }
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (cond, result) in when_then {
+                collect_columns_from_bool_expr(cond, out);
+                collect_columns_from_scalar_expr(result, out);
+            }
+            if let Some(expr) = else_expr {
+                collect_columns_from_scalar_expr(expr, out);
+            }
+        }
     }
 }
 
@@ -724,6 +795,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
         ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
         ScalarExpr::Func { .. } => "?column?".into(),
+        ScalarExpr::Case { .. } => "?column?".into(),
     }
 }
 
