@@ -21,6 +21,7 @@ use super::tokens::parse_type_name;
 
 type ProjectionItems = Vec<(ScalarExpr, String)>;
 type ParsedSelectList = (Selection, Option<ProjectionItems>);
+type AggregateSelectList = (Vec<AggregateSelectItem>, Vec<(AggCall, String)>);
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let with_clause = sel.with_clause.take();
@@ -498,7 +499,7 @@ struct AggregateSelectItem {
 
 fn parse_aggregate_select_list(
     target_list: &mut Vec<pg_query::Node>,
-) -> PgWireResult<(Vec<AggregateSelectItem>, Vec<(AggCall, String)>)> {
+) -> PgWireResult<AggregateSelectList> {
     use pg_query::NodeEnum;
 
     let mut collector = AggregateExprCollector::new("__select_agg");

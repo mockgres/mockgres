@@ -37,13 +37,10 @@ async fn drain_until_ready(stream: &mut TcpStream, buf: &mut BytesMut) -> io::Re
                         msg = Some(String::from_utf8_lossy(field.value_bytes()).to_string());
                     }
                 }
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "server error: {}",
-                        msg.unwrap_or_else(|| "unknown".to_string())
-                    ),
-                ));
+                return Err(io::Error::other(format!(
+                    "server error: {}",
+                    msg.unwrap_or_else(|| "unknown".to_string())
+                )));
             }
             _ => {}
         }

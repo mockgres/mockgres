@@ -8,6 +8,7 @@ use pgwire::error::PgWireResult;
 
 use super::{BindTimeContext, bind_time_scalar_func, current_schema_name, schema_names_for_path};
 
+#[allow(clippy::too_many_arguments)]
 fn bind_bool_expr_inner(
     expr: &BoolExpr,
     schema: &Schema,

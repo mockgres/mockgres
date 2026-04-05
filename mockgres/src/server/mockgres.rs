@@ -652,7 +652,7 @@ impl Mockgres {
     ) -> PgWireResult<Vec<Plan>> {
         let db = active_db.read();
         let plans = match statement {
-            StatementPlan::Single(plan) => std::slice::from_ref(plan),
+            StatementPlan::Single(plan) => std::slice::from_ref(plan.as_ref()),
             StatementPlan::Batch(plans) => plans.as_slice(),
         };
         let mut out = Vec::with_capacity(plans.len());
@@ -763,7 +763,7 @@ pub mod pgwire_parser {
             C: ClientInfo + Unpin + Send + Sync,
         {
             let plan = Planner::plan_sql(sql)?;
-            Ok(StatementPlan::Single(plan))
+            Ok(StatementPlan::Single(Box::new(plan)))
         }
 
         fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {

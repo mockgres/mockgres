@@ -2,14 +2,14 @@ use crate::engine::Plan;
 
 #[derive(Clone, Debug)]
 pub enum StatementPlan {
-    Single(Plan),
+    Single(Box<Plan>),
     Batch(Vec<Plan>),
 }
 
 impl StatementPlan {
     pub fn from_plans(plans: Vec<Plan>) -> Self {
         if plans.len() == 1 {
-            Self::Single(plans.into_iter().next().expect("single plan"))
+            Self::Single(Box::new(plans.into_iter().next().expect("single plan")))
         } else {
             Self::Batch(plans)
         }
@@ -17,7 +17,7 @@ impl StatementPlan {
 
     pub fn first_non_empty(&self) -> Option<&Plan> {
         match self {
-            Self::Single(plan) => (!matches!(plan, Plan::Empty)).then_some(plan),
+            Self::Single(plan) => (!matches!(plan.as_ref(), Plan::Empty)).then_some(plan.as_ref()),
             Self::Batch(plans) => plans.iter().find(|plan| !matches!(plan, Plan::Empty)),
         }
     }
@@ -28,7 +28,7 @@ impl StatementPlan {
 
     pub fn single_non_empty(&self) -> Option<&Plan> {
         match self {
-            Self::Single(plan) => (!matches!(plan, Plan::Empty)).then_some(plan),
+            Self::Single(plan) => (!matches!(plan.as_ref(), Plan::Empty)).then_some(plan.as_ref()),
             Self::Batch(plans) => {
                 let mut non_empty = plans.iter().filter(|plan| !matches!(plan, Plan::Empty));
                 let first = non_empty.next()?;

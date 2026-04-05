@@ -201,12 +201,11 @@ async fn connection_recovers_after_rejected_multi_statement_parse() {
     stream.flush().await.expect("flush parse");
 
     loop {
-        match read_message(&mut stream, &mut read_buf)
+        if let Message::ReadyForQuery(_) = read_message(&mut stream, &mut read_buf)
             .await
             .expect("read message")
         {
-            Message::ReadyForQuery(_) => break,
-            _ => {}
+            break;
         }
     }
 

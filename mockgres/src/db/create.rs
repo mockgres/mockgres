@@ -444,7 +444,7 @@ impl Db {
             let mut to_remove = Vec::new();
             for (k, versions) in table.rows_by_key.iter() {
                 if let Some(row) = versions.last()
-                    && matches!(row.data.get(0), Some(Value::Text(s)) if s == schema)
+                    && matches!(row.data.first(), Some(Value::Text(s)) if s == schema)
                     && matches!(row.data.get(1), Some(Value::Text(n)) if n == name)
                 {
                     to_remove.push(k.clone());
