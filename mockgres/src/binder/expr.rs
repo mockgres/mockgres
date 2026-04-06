@@ -351,6 +351,34 @@ fn bind_scalar_expr_inner(
                 },
             }
         }
+        ScalarExpr::Predicate(expr) => {
+            let bound = bind_bool_expr_inner(
+                expr,
+                schema,
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                &super::CteScope::default(),
+                allow_excluded,
+            )?;
+            ScalarExpr::Predicate(Box::new(bound))
+        }
+        ScalarExpr::Subquery(plan) => {
+            let bound = super::bind_with_search_path(
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                &super::CteScope::default(),
+                *plan.clone(),
+            )?;
+            let width = bound.schema().fields.len();
+            if width != 1 {
+                return Err(fe_code("42601", "subquery must return only one column"));
+            }
+            ScalarExpr::Subquery(Box::new(bound))
+        }
         ScalarExpr::Case {
             when_then,
             else_expr,
@@ -602,6 +630,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::PgAdvisoryLock => Some(DataType::Void),
             ScalarFunc::PgAdvisoryUnlock => Some(DataType::Bool),
         },
+        ScalarExpr::Predicate(_) => Some(DataType::Bool),
+        ScalarExpr::Subquery(plan) => plan.schema().fields.first().map(|f| f.data_type.clone()),
         ScalarExpr::Case {
             when_then,
             else_expr,

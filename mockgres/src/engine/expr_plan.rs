@@ -64,6 +64,8 @@ pub enum ScalarExpr {
         func: ScalarFunc,
         args: Vec<ScalarExpr>,
     },
+    Predicate(Box<BoolExpr>),
+    Subquery(Box<Plan>),
     Case {
         when_then: Vec<(BoolExpr, ScalarExpr)>,
         else_expr: Option<Box<ScalarExpr>>,
@@ -101,6 +103,8 @@ impl PartialEq for ScalarExpr {
             (Self::Func { func: af, args: aa }, Self::Func { func: bf, args: ba }) => {
                 af == bf && aa == ba
             }
+            (Self::Predicate(a), Self::Predicate(b)) => format!("{a:?}") == format!("{b:?}"),
+            (Self::Subquery(a), Self::Subquery(b)) => format!("{a:?}") == format!("{b:?}"),
             (
                 Self::Case {
                     when_then: aw,

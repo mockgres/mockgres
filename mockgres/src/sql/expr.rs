@@ -157,7 +157,29 @@ fn parse_scalar_expr_internal(
     match node {
         NodeEnum::ColumnRef(cr) => Ok(ScalarExpr::Column(parse_column_ref(cr)?)),
         NodeEnum::ParamRef(pr) => parse_param_ref(pr),
-        NodeEnum::AExpr(ax) => parse_arithmetic_expr(ax, agg_ctx.as_deref_mut()),
+        NodeEnum::AExpr(ax) => {
+            if ax.name.is_empty() {
+                let inner = ax
+                    .lexpr
+                    .as_ref()
+                    .and_then(|n| n.node.as_ref())
+                    .ok_or_else(|| fe("bad parenthesized scalar expression"))?;
+                return parse_scalar_expr_internal(inner, agg_ctx);
+            }
+            let kind = AExprKind::try_from(ax.kind).map_err(|_| fe("unknown expression kind"))?;
+            let is_bool_expr = matches!(kind, AExprKind::AexprIn | AExprKind::AexprOpAny)
+                || parse_cmp_op(&ax.name).is_ok();
+            if is_bool_expr {
+                let be = parse_bool_expr_internal(node, agg_ctx.as_deref_mut())?;
+                Ok(ScalarExpr::Predicate(Box::new(be)))
+            } else {
+                parse_arithmetic_expr(ax, agg_ctx.as_deref_mut())
+            }
+        }
+        NodeEnum::BoolExpr(_) | NodeEnum::NullTest(_) => {
+            let be = parse_bool_expr_internal(node, agg_ctx.as_deref_mut())?;
+            Ok(ScalarExpr::Predicate(Box::new(be)))
+        }
         NodeEnum::FuncCall(fc) => parse_function_call(fc, agg_ctx.as_deref_mut()),
         NodeEnum::CoalesceExpr(ce) => parse_coalesce_expr(ce, agg_ctx.as_deref_mut()),
         NodeEnum::CaseExpr(ce) => parse_case_expr(ce, agg_ctx.as_deref_mut()),
@@ -750,6 +772,8 @@ pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>
                 collect_columns_from_scalar_expr(arg, out);
             }
         }
+        ScalarExpr::Predicate(expr) => collect_columns_from_bool_expr(expr, out),
+        ScalarExpr::Subquery(_) => {}
         ScalarExpr::Case {
             when_then,
             else_expr,
@@ -795,6 +819,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
         ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
         ScalarExpr::Func { .. } => "?column?".into(),
+        ScalarExpr::Predicate(_) | ScalarExpr::Subquery(_) => "?column?".into(),
         ScalarExpr::Case { .. } => "?column?".into(),
     }
 }

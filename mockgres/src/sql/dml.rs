@@ -1016,6 +1016,13 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::TimestamptzMicros(_)) => DataType::Timestamptz,
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
         ScalarExpr::Cast { ty, .. } => ty.clone(),
+        ScalarExpr::Predicate(_) => DataType::Bool,
+        ScalarExpr::Subquery(plan) => plan
+            .schema()
+            .fields
+            .first()
+            .map(|f| f.data_type.clone())
+            .unwrap_or(DataType::Text),
         ScalarExpr::Case {
             when_then,
             else_expr,

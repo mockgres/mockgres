@@ -598,6 +598,10 @@ fn rewrite_scalar_expr_cte_refs(
                 .map(|arg| rewrite_scalar_expr_cte_refs(arg, ctes))
                 .collect::<PgWireResult<Vec<_>>>()?,
         },
+        ScalarExpr::Predicate(expr) => {
+            ScalarExpr::Predicate(Box::new(rewrite_bool_expr_cte_refs(expr, ctes)?))
+        }
+        ScalarExpr::Subquery(plan) => ScalarExpr::Subquery(Box::new(rewrite_cte_refs(plan, ctes)?)),
         ScalarExpr::Case {
             when_then,
             else_expr,

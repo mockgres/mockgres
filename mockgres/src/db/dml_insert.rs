@@ -575,6 +575,15 @@ fn substitute_excluded_in_scalar(
             expr: Box::new(substitute_excluded_in_scalar(expr, excluded, meta)?),
             ty: ty.clone(),
         },
+        ScalarExpr::Predicate(expr) => {
+            ScalarExpr::Predicate(Box::new(substitute_excluded_in_bool(expr, excluded, meta)?))
+        }
+        ScalarExpr::Subquery(_) => {
+            return Err(sql_err(
+                "0A000",
+                "scalar subqueries are not supported in this context",
+            ));
+        }
         ScalarExpr::Case {
             when_then,
             else_expr,

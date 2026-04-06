@@ -201,6 +201,8 @@ fn sanitize_insert_expr(expr: ScalarExpr) -> PgWireResult<ScalarExpr> {
             expr: Box::new(sanitize_insert_expr(*expr)?),
             ty,
         }),
+        ScalarExpr::Predicate(_) => Err(fe("INSERT expressions cannot use boolean predicates")),
+        ScalarExpr::Subquery(_) => Err(fe("INSERT expressions cannot use scalar subqueries")),
         ScalarExpr::Case {
             when_then,
             else_expr,

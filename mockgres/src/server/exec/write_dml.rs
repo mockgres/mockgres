@@ -10,7 +10,9 @@ use crate::engine::{
     fe_code,
 };
 use crate::server::errors::map_db_err;
-use crate::server::exec::read::subquery::materialize_in_subqueries;
+use crate::server::exec::read::subquery::{
+    materialize_in_subqueries, materialize_scalar_subqueries,
+};
 use crate::server::exec_builder::schema_or_public;
 use crate::server::insert::evaluate_insert_source;
 use crate::session::{RowPointer, Session};
@@ -382,7 +384,18 @@ pub(crate) fn build_update_executor(
     let assignments = sets
         .iter()
         .map(|set| match set {
-            UpdateSet::ByIndex(idx, expr) => Ok((*idx, expr.clone())),
+            UpdateSet::ByIndex(idx, expr) => Ok((
+                *idx,
+                materialize_scalar_subqueries(
+                    expr,
+                    db,
+                    txn_manager,
+                    session,
+                    snapshot_xid,
+                    params.clone(),
+                    ctx,
+                )?,
+            )),
             UpdateSet::ByName(name, _) => Err(fe(format!("unbound assignment target: {name}"))),
         })
         .collect::<PgWireResult<Vec<_>>>()?;

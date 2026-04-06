@@ -278,6 +278,8 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
                 collect_param_hints_from_scalar(arg, out);
             }
         }
+        ScalarExpr::Predicate(expr) => collect_param_hints_from_bool(expr, out),
+        ScalarExpr::Subquery(plan) => collect_param_hints_from_plan(plan, out),
         ScalarExpr::Case {
             when_then,
             else_expr,
@@ -508,6 +510,8 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
                 collect_param_indexes_from_scalar(arg, out);
             }
         }
+        ScalarExpr::Predicate(expr) => collect_param_indexes_from_bool(expr, out),
+        ScalarExpr::Subquery(plan) => collect_param_indexes(plan, out),
         ScalarExpr::Case {
             when_then,
             else_expr,

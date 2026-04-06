@@ -1,5 +1,5 @@
 use crate::catalog::SchemaName;
-use crate::engine::{JoinType, ObjName, Plan, UpdateSet, fe};
+use crate::engine::{JoinType, ObjName, Plan, ScalarExpr, UpdateSet, fe};
 use pg_query::NodeEnum;
 use pg_query::protobuf::UpdateStmt;
 use pgwire::error::PgWireResult;
@@ -43,7 +43,7 @@ pub fn plan_update(mut upd: UpdateStmt) -> PgWireResult<Plan> {
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or_else(|| fe("missing update value"))?;
-        let expr = parse_scalar_expr(expr_node)?;
+        let expr = parse_update_set_expr(expr_node)?;
         sets.push(UpdateSet::ByName(col_name, expr));
     }
     if sets.is_empty() {
@@ -104,11 +104,31 @@ pub fn parse_update_target_list(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or_else(|| fe("missing update value"))?;
-        let expr = parse_scalar_expr(expr_node)?;
+        let expr = parse_update_set_expr(expr_node)?;
         sets.push(UpdateSet::ByName(col_name, expr));
     }
     if sets.is_empty() {
         return Err(fe("UPDATE requires SET clauses"));
     }
     Ok(sets)
+}
+
+fn parse_update_set_expr(node: &NodeEnum) -> PgWireResult<ScalarExpr> {
+    match node {
+        NodeEnum::SubLink(sl) => parse_update_scalar_subquery(sl),
+        _ => parse_scalar_expr(node),
+    }
+}
+
+fn parse_update_scalar_subquery(sl: &pg_query::protobuf::SubLink) -> PgWireResult<ScalarExpr> {
+    let subselect = sl
+        .subselect
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("subquery missing SELECT"))?;
+    let NodeEnum::SelectStmt(sel) = subselect else {
+        return Err(fe("only SELECT supported in scalar subquery"));
+    };
+    let plan = crate::sql::dml::plan_select(*sel.clone())?;
+    Ok(ScalarExpr::Subquery(Box::new(plan)))
 }

@@ -173,6 +173,13 @@ pub fn eval_scalar_expr_with_mode(
             }
             eval_function(*func, evaluated, ctx, mode)
         }
+        ScalarExpr::Predicate(expr) => match eval_bool_expr(row, expr, params, ctx)? {
+            Some(v) => Ok(Value::Bool(v)),
+            None => Ok(Value::Null),
+        },
+        ScalarExpr::Subquery(_) => Err(fe(
+            "scalar subquery was not materialized before scalar evaluation",
+        )),
         ScalarExpr::Case {
             when_then,
             else_expr,
