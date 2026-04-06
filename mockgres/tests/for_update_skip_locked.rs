@@ -1,6 +1,6 @@
 mod common;
 
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use tokio_postgres::error::SqlState;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -170,6 +170,73 @@ async fn for_update_nowait_errors_immediately() {
         .execute("rollback", &[])
         .await
         .expect("rollback locker");
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn for_update_honors_lock_timeout() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute("create table t_lock_timeout(id int primary key)", &[])
+        .await
+        .expect("create table");
+    ctx.client
+        .execute("insert into t_lock_timeout values (1)", &[])
+        .await
+        .expect("seed table");
+
+    let blocked_client = ctx.new_client().await;
+
+    ctx.client
+        .execute("begin", &[])
+        .await
+        .expect("begin lock holder");
+    ctx.client
+        .query("select id from t_lock_timeout for update", &[])
+        .await
+        .expect("lock row");
+
+    blocked_client
+        .execute("begin", &[])
+        .await
+        .expect("begin waiter");
+    blocked_client
+        .execute("set lock_timeout = '50ms'", &[])
+        .await
+        .expect("set lock_timeout");
+
+    let started = Instant::now();
+    let err = blocked_client
+        .query("select id from t_lock_timeout for update", &[])
+        .await
+        .expect_err("waiter should time out");
+    assert_eq!(
+        err.code(),
+        Some(&SqlState::LOCK_NOT_AVAILABLE),
+        "expected 55P03"
+    );
+    let message = err
+        .as_db_error()
+        .expect("expected db error")
+        .message()
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("lock timeout"),
+        "unexpected error message: {message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "lock timeout should fail quickly"
+    );
+
+    blocked_client
+        .execute("rollback", &[])
+        .await
+        .expect("rollback waiter");
+    ctx.client
+        .execute("rollback", &[])
+        .await
+        .expect("rollback holder");
     let _ = ctx.shutdown.send(());
 }
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use pgwire::error::PgWireResult;
@@ -38,6 +39,8 @@ pub(crate) fn build_set_show_executor(
                 iso.as_str().to_string()
             } else if normalized == "default_transaction_isolation" {
                 session.default_txn_isolation().as_str().to_string()
+            } else if normalized == "lock_timeout" {
+                format_lock_timeout(session.lock_timeout())
             } else {
                 match lookup_show_value(&normalized) {
                     Some(v) => v,
@@ -108,6 +111,15 @@ pub(crate) fn build_set_show_executor(
                     None,
                 ))
             }
+            "lock_timeout" => {
+                let timeout = parse_lock_timeout(value)?;
+                session.set_lock_timeout(timeout);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
             "transaction_isolation" => {
                 let iso = match value {
                     Some(values) => {
@@ -152,4 +164,86 @@ pub(crate) fn build_set_show_executor(
         },
         _ => unreachable!("non set/show plan routed to build_set_show_executor"),
     }
+}
+
+fn parse_lock_timeout(value: &Option<Vec<String>>) -> PgWireResult<Option<Duration>> {
+    let Some(values) = value else {
+        return Ok(None);
+    };
+    if values.len() != 1 {
+        return Err(fe("SET lock_timeout requires a single value"));
+    }
+
+    let original = values[0].trim();
+    if original.is_empty() {
+        return Err(invalid_lock_timeout(""));
+    }
+    let normalized = original.to_ascii_lowercase();
+    if normalized.starts_with('-') {
+        return Err(invalid_lock_timeout(original));
+    }
+
+    let (raw_qty, raw_unit) = if normalized.chars().any(char::is_whitespace) {
+        let mut parts = normalized.split_whitespace();
+        let qty = parts.next().unwrap_or_default();
+        let unit = parts.next().unwrap_or("ms");
+        if parts.next().is_some() {
+            return Err(invalid_lock_timeout(original));
+        }
+        (qty, unit)
+    } else {
+        let first_non_digit = normalized
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(normalized.len());
+        if first_non_digit == 0 {
+            return Err(invalid_lock_timeout(original));
+        }
+        let qty = &normalized[..first_non_digit];
+        let unit = if first_non_digit == normalized.len() {
+            "ms"
+        } else {
+            &normalized[first_non_digit..]
+        };
+        (qty, unit)
+    };
+
+    let quantity: u64 = raw_qty
+        .parse()
+        .map_err(|_| invalid_lock_timeout(original))?;
+    let multiplier_ms: u64 = match raw_unit {
+        "ms" | "msec" | "msecs" | "millisecond" | "milliseconds" => 1,
+        "s" | "sec" | "secs" | "second" | "seconds" => 1_000,
+        "min" | "mins" | "minute" | "minutes" => 60_000,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600_000,
+        _ => return Err(invalid_lock_timeout(original)),
+    };
+    let timeout_ms = quantity
+        .checked_mul(multiplier_ms)
+        .ok_or_else(|| invalid_lock_timeout(original))?;
+    if timeout_ms == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::from_millis(timeout_ms)))
+}
+
+fn format_lock_timeout(timeout: Option<Duration>) -> String {
+    let Some(timeout) = timeout else {
+        return "0".to_string();
+    };
+    let timeout_ms = timeout.as_millis();
+    if timeout_ms == 0 {
+        return "0".to_string();
+    }
+    if timeout_ms % 1_000 == 0 {
+        format!("{}s", timeout_ms / 1_000)
+    } else {
+        format!("{timeout_ms}ms")
+    }
+}
+
+fn invalid_lock_timeout(value: &str) -> pgwire::error::PgWireError {
+    fe_code(
+        "22023",
+        format!("invalid value for parameter \"lock_timeout\": \"{value}\""),
+    )
 }

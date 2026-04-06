@@ -437,6 +437,7 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "search_path"
             | "timezone"
             | "time_zone"
+            | "lock_timeout"
             | "transaction_isolation"
             | "default_transaction_isolation"
     );

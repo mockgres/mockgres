@@ -4,7 +4,9 @@ use crate::storage::RowId;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::{Instant, timeout};
 
 use super::sql_err;
 
@@ -94,6 +96,38 @@ impl LockRegistry {
         }
     }
 
+    async fn acquire_blocking_timeout(
+        &self,
+        key: (TableId, RowId),
+        owner: LockOwner,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout_dur;
+        loop {
+            {
+                let mut state = self.inner.lock();
+                match state.holders.get(&key) {
+                    Some(existing) if *existing == owner => return Ok(()),
+                    Some(_) => {}
+                    None => {
+                        state.holders.insert(key, owner);
+                        state.owned.entry(owner).or_default().insert(key);
+                        return Ok(());
+                    }
+                }
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(sql_err("55P03", "canceling statement due to lock timeout"));
+            }
+            let remaining = deadline.duration_since(now);
+            if timeout(remaining, self.notify.notified()).await.is_err() {
+                return Err(sql_err("55P03", "canceling statement due to lock timeout"));
+            }
+        }
+    }
+
     pub(super) fn release_owner(&self, owner: LockOwner) {
         let mut state = self.inner.lock();
         if let Some(keys) = state.owned.remove(&owner) {
@@ -144,5 +178,17 @@ impl LockHandle {
         owner: LockOwner,
     ) -> anyhow::Result<()> {
         self.inner.acquire_blocking((table_id, row_id), owner).await
+    }
+
+    pub async fn lock_row_blocking_timeout(
+        &self,
+        table_id: TableId,
+        row_id: RowId,
+        owner: LockOwner,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .acquire_blocking_timeout((table_id, row_id), owner, timeout_dur)
+            .await
     }
 }

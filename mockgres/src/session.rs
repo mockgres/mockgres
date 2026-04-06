@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -148,6 +149,7 @@ pub struct SessionState {
     pub db_override: Option<Arc<RwLock<Db>>>,
     pub default_txn_isolation: TransactionIsolation,
     pub txn_isolation: Option<TransactionIsolation>,
+    pub lock_timeout: Option<Duration>,
 }
 
 impl Default for SessionState {
@@ -167,6 +169,7 @@ impl Default for SessionState {
             db_override: None,
             default_txn_isolation: TransactionIsolation::ReadCommitted,
             txn_isolation: None,
+            lock_timeout: None,
         }
     }
 }
@@ -325,6 +328,15 @@ impl Session {
 
     pub fn txn_isolation(&self) -> Option<TransactionIsolation> {
         self.state.lock().txn_isolation
+    }
+
+    pub fn set_lock_timeout(&self, timeout: Option<Duration>) {
+        let mut guard = self.state.lock();
+        guard.lock_timeout = timeout;
+    }
+
+    pub fn lock_timeout(&self) -> Option<Duration> {
+        self.state.lock().lock_timeout
     }
 
     pub fn set_statement_time_micros(&self, micros: i64) {

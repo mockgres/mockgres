@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use pgwire::error::PgWireResult;
+use std::time::Duration;
 
 use crate::db::{LockHandle, LockOwner};
 use crate::engine::{ExecNode, LockSpec, Schema, Value, fe};
@@ -13,9 +14,16 @@ pub fn wrap_with_lock_apply(
     row_id_idx: usize,
     owner: LockOwner,
     locks: LockHandle,
+    lock_timeout: Option<Duration>,
 ) -> Box<dyn ExecNode> {
     Box::new(LockApplyExec::new(
-        schema, child, lock_spec, row_id_idx, owner, locks,
+        schema,
+        child,
+        lock_spec,
+        row_id_idx,
+        owner,
+        locks,
+        lock_timeout,
     ))
 }
 
@@ -26,6 +34,7 @@ struct LockApplyExec {
     row_id_idx: usize,
     owner: LockOwner,
     locks: LockHandle,
+    lock_timeout: Option<Duration>,
 }
 
 enum AcquireOutcome {
@@ -41,6 +50,7 @@ impl LockApplyExec {
         row_id_idx: usize,
         owner: LockOwner,
         locks: LockHandle,
+        lock_timeout: Option<Duration>,
     ) -> Self {
         Self {
             schema,
@@ -49,6 +59,7 @@ impl LockApplyExec {
             row_id_idx,
             owner,
             locks,
+            lock_timeout,
         }
     }
 }
@@ -90,10 +101,21 @@ impl ExecNode for LockApplyExec {
                     .lock_row_nowait(self.lock_spec.target, row_id, self.owner)
                     .map(|_| AcquireOutcome::Acquired)
             } else {
-                self.locks
-                    .lock_row_blocking(self.lock_spec.target, row_id, self.owner)
-                    .await
-                    .map(|_| AcquireOutcome::Acquired)
+                let result = if let Some(timeout) = self.lock_timeout {
+                    self.locks
+                        .lock_row_blocking_timeout(
+                            self.lock_spec.target,
+                            row_id,
+                            self.owner,
+                            timeout,
+                        )
+                        .await
+                } else {
+                    self.locks
+                        .lock_row_blocking(self.lock_spec.target, row_id, self.owner)
+                        .await
+                };
+                result.map(|_| AcquireOutcome::Acquired)
             };
             match acquire_result {
                 Ok(AcquireOutcome::Acquired) => return Ok(Some(row)),

@@ -174,6 +174,7 @@ pub fn build_read_executor(
                 *row_id_idx,
                 owner,
                 lock_handle,
+                session.lock_timeout(),
             );
             Ok((exec, None, None))
         }
