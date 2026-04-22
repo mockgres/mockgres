@@ -74,6 +74,43 @@ impl Db {
         Ok(())
     }
 
+    pub fn rename_table(&mut self, schema: &str, old: &str, new: &str) -> anyhow::Result<()> {
+        let schema_id = self
+            .catalog
+            .schema_id(schema)
+            .ok_or_else(|| sql_err("3F000", format!("no such schema {schema}")))?;
+        let table_id = self
+            .catalog
+            .table_id(schema, old)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{old}")))?;
+        if self.catalog.table_id(schema, new).is_some() {
+            return Err(sql_err(
+                "42P07",
+                format!("relation {schema}.{new} already exists"),
+            ));
+        }
+
+        self.remove_pg_class_row(schema_id, old);
+        self.remove_information_schema_table_row(schema, old);
+        self.remove_pg_tables_row(schema, old);
+        self.catalog
+            .rename_table(schema_id, old, new)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{old}")))?;
+
+        for meta in self.catalog.tables_by_id.values_mut() {
+            for fk in &mut meta.foreign_keys {
+                if fk.referenced_table == table_id {
+                    fk.referenced_table_name = new.to_string();
+                }
+            }
+        }
+
+        self.insert_pg_class_row(table_id, new, schema_id, "r");
+        self.insert_information_schema_table_row(schema, new, "BASE TABLE");
+        self.refresh_pg_tables_row(schema, new);
+        Ok(())
+    }
+
     pub fn drop_table(
         &mut self,
         schema: &str,

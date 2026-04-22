@@ -69,9 +69,11 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableAddConstraintCheck { .. }
-        | Plan::AlterTableDropConstraint { .. } => "ALTER TABLE",
+        | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableRename { .. } => "ALTER TABLE",
         Plan::CreateIndex { .. } => "CREATE INDEX",
         Plan::DropIndex { .. } => "DROP INDEX",
         Plan::DropTable { .. } => "DROP TABLE",
@@ -139,9 +141,11 @@ pub fn build_executor(
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableAddConstraintCheck { .. }
         | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableRename { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }

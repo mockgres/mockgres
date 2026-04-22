@@ -162,6 +162,34 @@ pub(crate) fn build_ddl_executor(
                 None,
             ))
         }
+        Plan::AlterTableAddConstraintPrimaryKey {
+            table,
+            name,
+            columns,
+        } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .alter_table_add_primary_key(
+                    &schema_name,
+                    &table.name,
+                    name.clone(),
+                    columns.clone(),
+                )
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
         Plan::AlterTableAddConstraintForeignKey { table, fk } => {
             let schema_name = {
                 let db_read = db.read();
@@ -259,6 +287,7 @@ pub(crate) fn build_ddl_executor(
             };
             enum DropConstraintAction {
                 DropIndex(String),
+                DropPrimaryKey,
                 Handled,
                 NotFound,
             }
@@ -280,6 +309,13 @@ pub(crate) fn build_ddl_executor(
                     .position(|idx| idx.unique && idx.name == constraint_name)
                 {
                     DropConstraintAction::DropIndex(meta.indexes[pos].name.clone())
+                } else if meta
+                    .primary_key
+                    .as_ref()
+                    .map(|pk| pk.name == constraint_name)
+                    .unwrap_or(false)
+                {
+                    DropConstraintAction::DropPrimaryKey
                 } else if let Some(pos) = meta
                     .foreign_keys
                     .iter()
@@ -306,6 +342,11 @@ pub(crate) fn build_ddl_executor(
                 DropConstraintAction::DropIndex(index_name) => {
                     db_write
                         .drop_index(&schema_name, &index_name, *if_exists)
+                        .map_err(map_db_err)?;
+                }
+                DropConstraintAction::DropPrimaryKey => {
+                    db_write
+                        .alter_table_drop_primary_key(&schema_name, &table.name, &constraint_name)
                         .map_err(map_db_err)?;
                 }
                 DropConstraintAction::Handled => {}
@@ -479,6 +520,25 @@ pub(crate) fn build_ddl_executor(
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("ALTER SCHEMA".into()),
+                None,
+            ))
+        }
+        Plan::AlterTableRename { table, new_name } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .rename_table(&schema_name, &table.name, new_name)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
                 None,
             ))
         }

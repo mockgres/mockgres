@@ -213,9 +213,11 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableAddConstraintCheck { .. }
         | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableRename { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }
@@ -447,9 +449,11 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
+        | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }
         | Plan::AlterTableAddConstraintCheck { .. }
         | Plan::AlterTableDropConstraint { .. }
+        | Plan::AlterTableRename { .. }
         | Plan::CreateIndex { .. }
         | Plan::DropIndex { .. }
         | Plan::DropTable { .. }

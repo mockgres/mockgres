@@ -153,3 +153,91 @@ async fn alter_table_add_and_drop_check_constraint() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alter_table_rename_after_copy_swap() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "
+            create table foo (
+                id text primary key,
+                value text not null
+            );
+            insert into foo values ('one', 'first'), ('two', 'second');
+            create table foo_v2 (
+                id text not null,
+                kind text not null,
+                value text not null,
+                primary key (id, kind)
+            );
+            insert into foo_v2 (id, kind, value)
+            select id, 'default', value
+            from foo;
+            drop table foo;
+            alter table foo_v2 rename to foo;
+            ",
+        )
+        .await
+        .expect("copy and rename table");
+
+    let rows = ctx
+        .client
+        .query("select id, kind, value from foo order by id", &[])
+        .await
+        .expect("select renamed table");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, &str>(0), "one");
+    assert_eq!(rows[0].get::<_, &str>(1), "default");
+    assert_eq!(rows[0].get::<_, &str>(2), "first");
+    assert_eq!(rows[1].get::<_, &str>(0), "two");
+    assert_eq!(rows[1].get::<_, &str>(1), "default");
+    assert_eq!(rows[1].get::<_, &str>(2), "second");
+
+    let err = ctx
+        .client
+        .execute(
+            "insert into foo values ('one', 'default', 'duplicate')",
+            &[],
+        )
+        .await
+        .expect_err("composite primary key should still be enforced");
+    common::assert_db_error_contains(&err, "unique constraint foo_v2_pkey");
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alter_table_drop_and_add_primary_key_constraint() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "
+            create table foo (
+                id text primary key,
+                value text not null
+            );
+            insert into foo values ('one', 'first');
+            alter table foo drop constraint foo_pkey;
+            alter table foo add constraint foo_pkey primary key (id, value);
+            ",
+        )
+        .await
+        .expect("replace primary key");
+
+    ctx.client
+        .execute("insert into foo values ('one', 'second')", &[])
+        .await
+        .expect("same id with different value");
+
+    let err = ctx
+        .client
+        .execute("insert into foo values ('one', 'first')", &[])
+        .await
+        .expect_err("same composite key should fail");
+    common::assert_db_error_contains(&err, "unique constraint foo_pkey");
+
+    let _ = ctx.shutdown.send(());
+}

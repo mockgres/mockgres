@@ -417,6 +417,11 @@ pub enum Plan {
         name: Option<String>,
         columns: Vec<String>,
     },
+    AlterTableAddConstraintPrimaryKey {
+        table: ObjName,
+        name: Option<String>,
+        columns: Vec<String>,
+    },
     AlterTableAddConstraintForeignKey {
         table: ObjName,
         fk: ForeignKeySpec,
@@ -460,6 +465,10 @@ pub enum Plan {
     AlterSchemaRename {
         name: SchemaName,
         new_name: SchemaName,
+    },
+    AlterTableRename {
+        table: ObjName,
+        new_name: String,
     },
     CreateDatabase {
         name: String,
@@ -604,9 +613,11 @@ impl Plan {
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
             | Plan::AlterTableAddConstraintUnique { .. }
+            | Plan::AlterTableAddConstraintPrimaryKey { .. }
             | Plan::AlterTableAddConstraintForeignKey { .. }
             | Plan::AlterTableAddConstraintCheck { .. }
             | Plan::AlterTableDropConstraint { .. }
+            | Plan::AlterTableRename { .. }
             | Plan::CreateIndex { .. }
             | Plan::DropIndex { .. }
             | Plan::DropTable { .. }

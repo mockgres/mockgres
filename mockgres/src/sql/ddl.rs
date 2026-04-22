@@ -236,13 +236,7 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                 .map_err(|_| fe("unknown constraint type"))?
             {
                 pg_query::protobuf::ConstrType::ConstrUnique => {
-                    let mut columns = Vec::new();
-                    for key in &cons.keys {
-                        let Some(pg_query::NodeEnum::String(s)) = key.node.as_ref() else {
-                            continue;
-                        };
-                        columns.push(s.sval.clone());
-                    }
+                    let columns = parse_constraint_key_columns(cons);
                     if columns.is_empty() {
                         return Err(fe("UNIQUE constraint requires column list"));
                     }
@@ -252,6 +246,22 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                         Some(cons.conname.clone())
                     };
                     Ok(Plan::AlterTableAddConstraintUnique {
+                        table,
+                        name,
+                        columns,
+                    })
+                }
+                pg_query::protobuf::ConstrType::ConstrPrimary => {
+                    let columns = parse_constraint_key_columns(cons);
+                    if columns.is_empty() {
+                        return Err(fe("PRIMARY KEY requires column list"));
+                    }
+                    let name = if cons.conname.is_empty() {
+                        None
+                    } else {
+                        Some(cons.conname.clone())
+                    };
+                    Ok(Plan::AlterTableAddConstraintPrimaryKey {
                         table,
                         name,
                         columns,
@@ -467,18 +477,49 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     })
 }
 
-pub(super) fn plan_rename_schema(stmt: RenameStmt) -> PgWireResult<Plan> {
+pub(super) fn plan_rename(stmt: RenameStmt) -> PgWireResult<Plan> {
     let rename_type = ObjectType::try_from(stmt.rename_type).map_err(|_| fe("bad RENAME type"))?;
-    if rename_type != ObjectType::ObjectSchema {
-        return Err(fe("only ALTER SCHEMA ... RENAME TO is supported"));
+    match rename_type {
+        ObjectType::ObjectSchema => {
+            if stmt.subname.is_empty() || stmt.newname.is_empty() {
+                return Err(fe("schema name required"));
+            }
+            Ok(Plan::AlterSchemaRename {
+                name: SchemaName::new(stmt.subname),
+                new_name: SchemaName::new(stmt.newname),
+            })
+        }
+        ObjectType::ObjectTable => {
+            let rv = stmt.relation.ok_or_else(|| fe("missing table name"))?;
+            if rv.relname.is_empty() || stmt.newname.is_empty() {
+                return Err(fe("table name required"));
+            }
+            let schema = if rv.schemaname.is_empty() {
+                None
+            } else {
+                Some(SchemaName::new(rv.schemaname))
+            };
+            Ok(Plan::AlterTableRename {
+                table: ObjName {
+                    schema,
+                    name: rv.relname,
+                },
+                new_name: stmt.newname,
+            })
+        }
+        _ => Err(fe("only ALTER SCHEMA/TABLE ... RENAME TO is supported")),
     }
-    if stmt.subname.is_empty() || stmt.newname.is_empty() {
-        return Err(fe("schema name required"));
+}
+
+fn parse_constraint_key_columns(cons: &Constraint) -> Vec<String> {
+    let mut columns = Vec::new();
+    for key in &cons.keys {
+        let Some(pg_query::NodeEnum::String(s)) = key.node.as_ref() else {
+            continue;
+        };
+        columns.push(s.sval.clone());
     }
-    Ok(Plan::AlterSchemaRename {
-        name: SchemaName::new(stmt.subname),
-        new_name: SchemaName::new(stmt.newname),
-    })
+    columns
 }
 
 fn collect_column_foreign_keys(

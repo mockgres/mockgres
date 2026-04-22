@@ -75,7 +75,7 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::IndexStmt(idx) => ddl::plan_create_index(*idx),
         NodeEnum::DropStmt(drop) => ddl::plan_drop_stmt(drop),
         NodeEnum::DropdbStmt(db) => ddl::plan_drop_database(db),
-        NodeEnum::RenameStmt(rename) => ddl::plan_rename_schema(*rename),
+        NodeEnum::RenameStmt(rename) => ddl::plan_rename(*rename),
         NodeEnum::VariableShowStmt(show) => ddl::plan_show(show),
         NodeEnum::VariableSetStmt(set) => ddl::plan_set(set),
         NodeEnum::AlterDatabaseStmt(db) => ddl::plan_alter_database(db),

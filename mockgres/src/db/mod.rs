@@ -1,4 +1,4 @@
-use crate::catalog::{Catalog, SchemaId, TableId, TableMeta};
+use crate::catalog::{Catalog, PrimaryKeyMeta, SchemaId, TableId, TableMeta};
 use crate::engine::{
     BoolExpr, Column, DataType, EvalContext, IdentitySpec, OnConflictTarget, ReferentialAction,
     ScalarExpr, SqlError, UpdateSet, Value, eval_bool_expr, eval_scalar_expr,
@@ -335,6 +335,169 @@ impl Db {
                 .retain(|index| !dropped_index_names.contains(&index.name));
         }
         Ok(())
+    }
+
+    pub fn alter_table_add_primary_key(
+        &mut self,
+        schema: &str,
+        table: &str,
+        name: Option<String>,
+        columns: Vec<String>,
+    ) -> anyhow::Result<()> {
+        if columns.is_empty() {
+            return Err(sql_err(
+                "42P16",
+                format!("primary key on {table} must reference at least one column"),
+            ));
+        }
+
+        let (table_id, pk_name, positions) = {
+            let meta = self
+                .catalog
+                .get_table(schema, table)
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+            if meta.primary_key.is_some() {
+                return Err(sql_err(
+                    "42P16",
+                    format!("multiple primary keys for table {schema}.{table} are not allowed"),
+                ));
+            }
+            let pk_name = name.unwrap_or_else(|| format!("{table}_pkey"));
+            let name_exists = meta.indexes.iter().any(|idx| idx.name == pk_name)
+                || meta.foreign_keys.iter().any(|fk| fk.name == pk_name)
+                || meta.check_constraints.iter().any(|ck| ck.name == pk_name);
+            if name_exists {
+                return Err(sql_err(
+                    "42710",
+                    format!("constraint {pk_name} for table {schema}.{table} already exists"),
+                ));
+            }
+            let mut positions = Vec::with_capacity(columns.len());
+            for col_name in columns {
+                let pos = meta
+                    .columns
+                    .iter()
+                    .position(|c| c.name == col_name)
+                    .ok_or_else(|| {
+                        sql_err(
+                            "42703",
+                            format!("primary key column {col_name} does not exist"),
+                        )
+                    })?;
+                if positions.contains(&pos) {
+                    return Err(sql_err(
+                        "42P16",
+                        format!("column {col_name} referenced multiple times in primary key"),
+                    ));
+                }
+                positions.push(pos);
+            }
+            (meta.id, pk_name, positions)
+        };
+
+        let mut pk_map = HashMap::new();
+        {
+            let table_storage = self.tables.get(&table_id).ok_or_else(|| {
+                sql_err("XX000", format!("missing storage for table id {table_id}"))
+            })?;
+            for (storage_key, versions) in table_storage.rows_by_key.iter() {
+                let Some(row) = versions
+                    .last()
+                    .filter(|v| v.xmax.is_none())
+                    .map(|v| &v.data)
+                else {
+                    continue;
+                };
+                let mut key_values = Vec::with_capacity(positions.len());
+                for pos in &positions {
+                    let value = row.get(*pos).cloned().unwrap_or(Value::Null);
+                    if matches!(value, Value::Null) {
+                        let col_name = self.catalog.tables_by_id[&table_id].columns[*pos]
+                            .name
+                            .clone();
+                        return Err(sql_err(
+                            "23502",
+                            format!("primary key column {col_name} cannot be null"),
+                        ));
+                    }
+                    key_values.push(value);
+                }
+                let pk_key = RowKey::Primary(key_values);
+                let row_id = row_key_to_row_id(storage_key)?;
+                if pk_map.insert(pk_key, row_id).is_some() {
+                    return Err(sql_err(
+                        "23505",
+                        format!("duplicate key value violates unique constraint {pk_name}"),
+                    ));
+                }
+            }
+        }
+
+        let table_storage = self
+            .tables
+            .get_mut(&table_id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
+        table_storage.pk_map = Some(pk_map);
+
+        let meta = self
+            .catalog
+            .get_table_mut_by_id(&table_id)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+        for pos in &positions {
+            meta.columns[*pos].nullable = false;
+        }
+        meta.primary_key = Some(PrimaryKeyMeta {
+            name: pk_name,
+            columns: positions,
+        });
+        self.refresh_pg_tables_row(schema, table);
+        Ok(())
+    }
+
+    pub fn alter_table_drop_primary_key(
+        &mut self,
+        schema: &str,
+        table: &str,
+        name: &str,
+    ) -> anyhow::Result<bool> {
+        let (table_id, pk_columns) = {
+            let meta = self
+                .catalog
+                .get_table(schema, table)
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+            let Some(pk) = meta.primary_key.as_ref() else {
+                return Ok(false);
+            };
+            if pk.name != name {
+                return Ok(false);
+            }
+            (meta.id, pk.columns.clone())
+        };
+
+        let inbound = collect_inbound_foreign_keys(&self.catalog, schema, table);
+        if let Some(fk) = inbound
+            .iter()
+            .find(|fk| fk.fk.referenced_columns == pk_columns)
+        {
+            return Err(sql_err(
+                "2BP01",
+                format!(
+                    "cannot drop constraint {name} because it is referenced by {}.{}",
+                    fk.schema, fk.table
+                ),
+            ));
+        }
+
+        if let Some(storage) = self.tables.get_mut(&table_id) {
+            storage.pk_map = None;
+        }
+        let meta = self
+            .catalog
+            .get_table_mut_by_id(&table_id)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+        meta.primary_key = None;
+        self.refresh_pg_tables_row(schema, table);
+        Ok(true)
     }
 
     pub fn create_index(

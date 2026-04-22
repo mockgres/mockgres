@@ -187,6 +187,21 @@ impl Catalog {
         self.tables_by_id.remove(&table_id)
     }
 
+    pub fn rename_table(
+        &mut self,
+        schema_id: SchemaId,
+        old_name: &str,
+        new_name: &str,
+    ) -> Option<TableId> {
+        let entry = self.schemas.get_mut(&schema_id)?;
+        let table_id = entry.objects.remove(old_name)?;
+        entry.objects.insert(new_name.to_string(), table_id);
+        if let Some(meta) = self.tables_by_id.get_mut(&table_id) {
+            meta.name = new_name.to_string();
+        }
+        Some(table_id)
+    }
+
     pub fn drop_schema_entry(&mut self, schema_id: SchemaId) {
         if let Some(entry) = self.schemas.remove(&schema_id) {
             self.schemas_by_name.remove(entry.name.as_str());
