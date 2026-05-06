@@ -210,6 +210,7 @@ pub fn materialize_scalar_subqueries(
                 })
                 .collect::<PgWireResult<Vec<_>>>()?,
         },
+        ScalarExpr::WindowRowNumber(_) => expr.clone(),
         ScalarExpr::Predicate(expr) => ScalarExpr::Predicate(Box::new(materialize_in_subqueries(
             expr,
             db,

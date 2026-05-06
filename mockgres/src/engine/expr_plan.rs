@@ -64,6 +64,7 @@ pub enum ScalarExpr {
         func: ScalarFunc,
         args: Vec<ScalarExpr>,
     },
+    WindowRowNumber(WindowSpec),
     Predicate(Box<BoolExpr>),
     Subquery(Box<Plan>),
     Case {
@@ -102,6 +103,10 @@ impl PartialEq for ScalarExpr {
             }
             (Self::Func { func: af, args: aa }, Self::Func { func: bf, args: ba }) => {
                 af == bf && aa == ba
+            }
+            (Self::WindowRowNumber(a), Self::WindowRowNumber(b)) => {
+                a.partition_by == b.partition_by
+                    && format!("{:?}", a.order_by) == format!("{:?}", b.order_by)
             }
             (Self::Predicate(a), Self::Predicate(b)) => format!("{a:?}") == format!("{b:?}"),
             (Self::Subquery(a), Self::Subquery(b)) => format!("{a:?}") == format!("{b:?}"),
@@ -180,6 +185,12 @@ pub enum AggFunc {
 pub struct AggCall {
     pub func: AggFunc,
     pub expr: Option<ScalarExpr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowSpec {
+    pub partition_by: Vec<ScalarExpr>,
+    pub order_by: Vec<SortKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -385,6 +396,11 @@ pub enum Plan {
         exprs: Vec<(ScalarExpr, String)>,
         schema: Schema,
     },
+    WindowRowNumber {
+        input: Box<Plan>,
+        specs: Vec<(WindowSpec, String)>,
+        schema: Schema,
+    },
     Aggregate {
         input: Box<Plan>,
         group_exprs: Vec<(ScalarExpr, String)>,
@@ -581,6 +597,7 @@ impl Plan {
             | Plan::CteScan { schema, .. }
             | Plan::LockRows { schema, .. }
             | Plan::Projection { schema, .. }
+            | Plan::WindowRowNumber { schema, .. }
             | Plan::CountRows { schema, .. }
             | Plan::Join { schema, .. } => schema,
             Plan::ShowVariable { schema, .. } => schema,

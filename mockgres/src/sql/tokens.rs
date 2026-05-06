@@ -173,6 +173,9 @@ fn ensure_default_expr_is_const(expr: &ScalarExpr) -> PgWireResult<()> {
             }
             Ok(())
         }
+        ScalarExpr::WindowRowNumber(_) => {
+            Err(fe("DEFAULT expressions cannot contain window functions"))
+        }
         ScalarExpr::Predicate(expr) => ensure_default_bool_expr_is_const(expr),
         ScalarExpr::Subquery(_) => Err(fe("DEFAULT expressions cannot contain subqueries")),
         ScalarExpr::Case {

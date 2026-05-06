@@ -55,6 +55,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::Projection { .. }
+        | Plan::WindowRowNumber { .. }
         | Plan::Aggregate { .. }
         | Plan::CountRows { .. }
         | Plan::Filter { .. }
@@ -125,6 +126,7 @@ pub fn build_executor(
         Plan::Empty => Err(fe("empty query")),
         Plan::Values { .. }
         | Plan::Projection { .. }
+        | Plan::WindowRowNumber { .. }
         | Plan::Aggregate { .. }
         | Plan::CountRows { .. }
         | Plan::SeqScan { .. }
@@ -461,6 +463,15 @@ fn rewrite_cte_refs(plan: &Plan, ctes: &HashMap<String, MaterializedCte>) -> PgW
             exprs: exprs.clone(),
             schema: schema.clone(),
         }),
+        Plan::WindowRowNumber {
+            input,
+            specs,
+            schema,
+        } => Ok(Plan::WindowRowNumber {
+            input: Box::new(rewrite_cte_refs(input, ctes)?),
+            specs: specs.clone(),
+            schema: schema.clone(),
+        }),
         Plan::Aggregate {
             input,
             group_exprs,
@@ -602,6 +613,7 @@ fn rewrite_scalar_expr_cte_refs(
                 .map(|arg| rewrite_scalar_expr_cte_refs(arg, ctes))
                 .collect::<PgWireResult<Vec<_>>>()?,
         },
+        ScalarExpr::WindowRowNumber(spec) => ScalarExpr::WindowRowNumber(spec.clone()),
         ScalarExpr::Predicate(expr) => {
             ScalarExpr::Predicate(Box::new(rewrite_bool_expr_cte_refs(expr, ctes)?))
         }

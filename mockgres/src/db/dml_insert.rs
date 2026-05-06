@@ -571,6 +571,12 @@ fn substitute_excluded_in_scalar(
                 .map(|a| substitute_excluded_in_scalar(a, excluded, meta))
                 .collect::<anyhow::Result<Vec<_>>>()?,
         },
+        ScalarExpr::WindowRowNumber(_) => {
+            return Err(sql_err(
+                "0A000",
+                "window functions are not supported in this context",
+            ));
+        }
         ScalarExpr::Cast { expr, ty } => ScalarExpr::Cast {
             expr: Box::new(substitute_excluded_in_scalar(expr, excluded, meta)?),
             ty: ty.clone(),

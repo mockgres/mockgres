@@ -820,7 +820,7 @@ pub(super) fn parse_from_item(node: pg_query::Node) -> PgWireResult<Plan> {
     }
 }
 
-fn parse_order_clause(clause: &[pg_query::Node]) -> PgWireResult<Vec<SortKey>> {
+pub(super) fn parse_order_clause(clause: &[pg_query::Node]) -> PgWireResult<Vec<SortKey>> {
     let mut keys = Vec::with_capacity(clause.len());
     for sort in clause {
         let NodeEnum::SortBy(s) = sort.node.as_ref().ok_or_else(|| fe("bad order by"))? else {
@@ -1017,6 +1017,7 @@ fn infer_expr_type(expr: &ScalarExpr) -> DataType {
         ScalarExpr::Literal(Value::Bytes(_)) => DataType::Bytea,
         ScalarExpr::Cast { ty, .. } => ty.clone(),
         ScalarExpr::Predicate(_) => DataType::Bool,
+        ScalarExpr::WindowRowNumber(_) => DataType::Int8,
         ScalarExpr::Subquery(plan) => plan
             .schema()
             .fields

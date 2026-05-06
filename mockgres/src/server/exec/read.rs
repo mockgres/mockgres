@@ -7,7 +7,7 @@ use crate::db::{Db, LockOwner};
 use crate::engine::{
     CountExec, CountExpr, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinType,
     LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec,
-    Value, ValuesExec, eval_scalar_expr, fe,
+    Value, ValuesExec, WindowRowNumberExec, eval_scalar_expr, fe,
 };
 use crate::server::errors::map_db_err;
 use crate::session::Session;
@@ -60,6 +60,32 @@ pub fn build_read_executor(
                     params.clone(),
                     ctx.clone(),
                 )),
+                None,
+                cnt,
+            ))
+        }
+        Plan::WindowRowNumber {
+            input,
+            specs,
+            schema,
+        } => {
+            let (child, _tag, cnt) = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                input,
+                params.clone(),
+                ctx,
+            )?;
+            Ok((
+                Box::new(WindowRowNumberExec::new(
+                    schema.clone(),
+                    child,
+                    specs.clone(),
+                    params.clone(),
+                    ctx.clone(),
+                )?),
                 None,
                 cnt,
             ))

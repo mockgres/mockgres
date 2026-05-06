@@ -118,6 +118,19 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_scalar(expr, out);
             }
         }
+        Plan::WindowRowNumber { input, specs, .. } => {
+            collect_param_hints_from_plan(input, out);
+            for (spec, _) in specs {
+                for expr in &spec.partition_by {
+                    collect_param_hints_from_scalar(expr, out);
+                }
+                for key in &spec.order_by {
+                    if let crate::engine::SortKey::Expr { expr, .. } = key {
+                        collect_param_hints_from_scalar(expr, out);
+                    }
+                }
+            }
+        }
         Plan::Aggregate {
             input,
             group_exprs,
@@ -280,6 +293,16 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
                 collect_param_hints_from_scalar(arg, out);
             }
         }
+        ScalarExpr::WindowRowNumber(spec) => {
+            for expr in &spec.partition_by {
+                collect_param_hints_from_scalar(expr, out);
+            }
+            for key in &spec.order_by {
+                if let crate::engine::SortKey::Expr { expr, .. } = key {
+                    collect_param_hints_from_scalar(expr, out);
+                }
+            }
+        }
         ScalarExpr::Predicate(expr) => collect_param_hints_from_bool(expr, out),
         ScalarExpr::Subquery(plan) => collect_param_hints_from_plan(plan, out),
         ScalarExpr::Case {
@@ -358,6 +381,19 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             collect_param_indexes(input, out);
             for (expr, _) in exprs {
                 collect_param_indexes_from_scalar(expr, out);
+            }
+        }
+        Plan::WindowRowNumber { input, specs, .. } => {
+            collect_param_indexes(input, out);
+            for (spec, _) in specs {
+                for expr in &spec.partition_by {
+                    collect_param_indexes_from_scalar(expr, out);
+                }
+                for key in &spec.order_by {
+                    if let crate::engine::SortKey::Expr { expr, .. } = key {
+                        collect_param_indexes_from_scalar(expr, out);
+                    }
+                }
             }
         }
         Plan::Aggregate {
@@ -512,6 +548,16 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_param_indexes_from_scalar(arg, out);
+            }
+        }
+        ScalarExpr::WindowRowNumber(spec) => {
+            for expr in &spec.partition_by {
+                collect_param_indexes_from_scalar(expr, out);
+            }
+            for key in &spec.order_by {
+                if let crate::engine::SortKey::Expr { expr, .. } = key {
+                    collect_param_indexes_from_scalar(expr, out);
+                }
             }
         }
         ScalarExpr::Predicate(expr) => collect_param_indexes_from_bool(expr, out),

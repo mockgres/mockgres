@@ -351,6 +351,9 @@ fn bind_scalar_expr_inner(
                 },
             }
         }
+        ScalarExpr::WindowRowNumber(_) => {
+            return Err(fe("window functions are only supported as SELECT targets"));
+        }
         ScalarExpr::Predicate(expr) => {
             let bound = bind_bool_expr_inner(
                 expr,
@@ -630,6 +633,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::PgAdvisoryLock => Some(DataType::Void),
             ScalarFunc::PgAdvisoryUnlock => Some(DataType::Bool),
         },
+        ScalarExpr::WindowRowNumber(_) => Some(DataType::Int8),
         ScalarExpr::Predicate(_) => Some(DataType::Bool),
         ScalarExpr::Subquery(plan) => plan.schema().fields.first().map(|f| f.data_type.clone()),
         ScalarExpr::Case {

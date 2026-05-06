@@ -2,12 +2,12 @@
 
 use crate::engine::{
     AggCall, AggFunc, BoolExpr, CmpOp, ColumnRefName, ScalarBinaryOp, ScalarExpr, ScalarFunc,
-    ScalarUnaryOp, Value, fe,
+    ScalarUnaryOp, SortKey, Value, WindowSpec, fe,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
     AArrayExpr, AExpr, AExprKind, BoolExprType, CaseExpr, CoalesceExpr, ColumnRef, FuncCall, Node,
-    NullTestType, ParamRef, ResTarget, SelectStmt, SqlValueFunction, SqlValueFunctionOp,
+    NullTestType, ParamRef, ResTarget, SelectStmt, SqlValueFunction, SqlValueFunctionOp, WindowDef,
 };
 use pgwire::error::PgWireResult;
 
@@ -630,6 +630,16 @@ fn parse_function_call(
         })
         .next_back()
         .ok_or_else(|| fe("bad function name"))?;
+    if fc.over.is_some() {
+        if name != "row_number" {
+            return Err(fe("only row_number() window function is supported"));
+        }
+        if !fc.args.is_empty() || fc.agg_star {
+            return Err(fe("row_number() takes no arguments"));
+        }
+        let over = fc.over.as_ref().expect("checked above");
+        return Ok(ScalarExpr::WindowRowNumber(parse_row_number_window(over)?));
+    }
     if is_aggregate_func_name(&name) {
         if let Some(ctx) = agg_ctx.as_deref_mut() {
             return ctx.register_aggregate_call(name.as_str(), fc);
@@ -756,6 +766,27 @@ fn parse_function_call(
     Ok(ScalarExpr::Func { func, args })
 }
 
+fn parse_row_number_window(wd: &WindowDef) -> PgWireResult<WindowSpec> {
+    if !wd.name.is_empty() || !wd.refname.is_empty() {
+        return Err(fe("named windows are not supported"));
+    }
+    if wd.start_offset.is_some() || wd.end_offset.is_some() {
+        return Err(fe("window frames are not supported"));
+    }
+    let mut partition_by = Vec::with_capacity(wd.partition_clause.len());
+    for node in &wd.partition_clause {
+        let expr_node = node
+            .node
+            .as_ref()
+            .ok_or_else(|| fe("bad window partition expression"))?;
+        partition_by.push(parse_scalar_expr_internal(expr_node, None)?);
+    }
+    Ok(WindowSpec {
+        partition_by,
+        order_by: crate::sql::dml::parse_order_clause(&wd.order_clause)?,
+    })
+}
+
 pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) {
     match expr {
         ScalarExpr::Column(col) => out.push(col.column.clone()),
@@ -770,6 +801,18 @@ pub fn collect_columns_from_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>
         ScalarExpr::Func { args, .. } => {
             for arg in args {
                 collect_columns_from_scalar_expr(arg, out);
+            }
+        }
+        ScalarExpr::WindowRowNumber(spec) => {
+            for expr in &spec.partition_by {
+                collect_columns_from_scalar_expr(expr, out);
+            }
+            for key in &spec.order_by {
+                match key {
+                    SortKey::ByName { col, .. } => out.push(col.clone()),
+                    SortKey::Expr { expr, .. } => collect_columns_from_scalar_expr(expr, out),
+                    SortKey::ByIndex { .. } => {}
+                }
             }
         }
         ScalarExpr::Predicate(expr) => collect_columns_from_bool_expr(expr, out),
@@ -819,6 +862,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
         ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
         ScalarExpr::Func { .. } => "?column?".into(),
+        ScalarExpr::WindowRowNumber(_) => "row_number".into(),
         ScalarExpr::Predicate(_) | ScalarExpr::Subquery(_) => "?column?".into(),
         ScalarExpr::Case { .. } => "?column?".into(),
     }

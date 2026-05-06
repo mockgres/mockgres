@@ -4,8 +4,8 @@ use crate::catalog::{SchemaId, TableMeta};
 use crate::db::Db;
 use crate::engine::{
     AggCall, AggFunc, DataType, DbDdlKind, Field, FieldOrigin, InsertSource, LockSpec, ObjName,
-    OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet, fe,
-    fe_code,
+    OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet,
+    WindowSpec, fe, fe_code,
 };
 use crate::session::Session;
 use anyhow::Error;
@@ -28,6 +28,82 @@ struct CteBinding {
 }
 
 type CteScope = HashMap<String, CteBinding>;
+
+fn bind_window_spec(
+    spec: &WindowSpec,
+    schema: &Schema,
+    db: &Db,
+    search_path: &[SchemaId],
+    current_database: Option<&str>,
+    time_ctx: BindTimeContext,
+) -> PgWireResult<WindowSpec> {
+    let mut partition_by = Vec::with_capacity(spec.partition_by.len());
+    for expr in &spec.partition_by {
+        partition_by.push(bind_scalar_expr(
+            expr,
+            schema,
+            None,
+            db,
+            search_path,
+            current_database,
+            time_ctx,
+        )?);
+    }
+    let mut order_by = Vec::with_capacity(spec.order_by.len());
+    for key in &spec.order_by {
+        match key {
+            SortKey::ByName {
+                col,
+                asc,
+                nulls_first,
+            } => {
+                let idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == *col)
+                    .ok_or_else(|| fe_code("42703", format!("unknown column: {col}")))?;
+                order_by.push(SortKey::ByIndex {
+                    idx,
+                    asc: *asc,
+                    nulls_first: *nulls_first,
+                });
+            }
+            SortKey::ByIndex {
+                idx,
+                asc,
+                nulls_first,
+            } => order_by.push(SortKey::ByIndex {
+                idx: *idx,
+                asc: *asc,
+                nulls_first: *nulls_first,
+            }),
+            SortKey::Expr {
+                expr,
+                asc,
+                nulls_first,
+            } => {
+                let bound = bind_scalar_expr(
+                    expr,
+                    schema,
+                    None,
+                    db,
+                    search_path,
+                    current_database,
+                    time_ctx,
+                )?;
+                order_by.push(SortKey::Expr {
+                    expr: bound,
+                    asc: *asc,
+                    nulls_first: *nulls_first,
+                });
+            }
+        }
+    }
+    Ok(WindowSpec {
+        partition_by,
+        order_by,
+    })
+}
 
 pub fn bind(db: &Db, session: &Session, p: Plan) -> PgWireResult<Plan> {
     let search_path = session.search_path();
@@ -353,7 +429,7 @@ fn bind_with_search_path(
             exprs,
             schema: _,
         } => {
-            let child = bind_with_search_path(
+            let mut child = bind_with_search_path(
                 db,
                 search_path,
                 current_database,
@@ -361,18 +437,60 @@ fn bind_with_search_path(
                 cte_scope,
                 *input,
             )?;
+            let child_schema = child.schema().clone();
+            let mut window_specs = Vec::new();
+            let mut window_expr_indexes = Vec::new();
+            for (idx, (expr, name)) in exprs.iter().enumerate() {
+                if let ScalarExpr::WindowRowNumber(spec) = expr {
+                    window_specs.push((
+                        bind_window_spec(
+                            spec,
+                            &child_schema,
+                            db,
+                            search_path,
+                            current_database,
+                            time_ctx,
+                        )?,
+                        name.clone(),
+                    ));
+                    window_expr_indexes
+                        .push((idx, child_schema.fields.len() + window_specs.len() - 1));
+                }
+            }
+            if !window_specs.is_empty() {
+                let mut fields = child_schema.fields.clone();
+                for (_, name) in &window_specs {
+                    fields.push(Field {
+                        name: name.clone(),
+                        data_type: DataType::Int8,
+                        origin: None,
+                    });
+                }
+                child = Plan::WindowRowNumber {
+                    input: Box::new(child),
+                    specs: window_specs,
+                    schema: Schema { fields },
+                };
+            }
             let mut bound_exprs = Vec::with_capacity(exprs.len());
             let mut fields = Vec::with_capacity(exprs.len());
-            for (expr, name) in exprs {
-                let bound = bind_scalar_expr(
-                    &expr,
-                    child.schema(),
-                    None,
-                    db,
-                    search_path,
-                    current_database,
-                    time_ctx,
-                )?;
+            for (idx, (expr, name)) in exprs.into_iter().enumerate() {
+                let bound = if let Some((_, col_idx)) = window_expr_indexes
+                    .iter()
+                    .find(|(expr_idx, _)| *expr_idx == idx)
+                {
+                    ScalarExpr::ColumnIdx(*col_idx)
+                } else {
+                    bind_scalar_expr(
+                        &expr,
+                        child.schema(),
+                        None,
+                        db,
+                        search_path,
+                        current_database,
+                        time_ctx,
+                    )?
+                };
                 let dt = scalar_expr_type(&bound, child.schema()).unwrap_or(DataType::Text);
                 fields.push(Field {
                     name: name.clone(),
@@ -387,6 +505,8 @@ fn bind_with_search_path(
                 schema: Schema { fields },
             })
         }
+
+        Plan::WindowRowNumber { .. } => Err(fe("window plan cannot be bound directly")),
 
         Plan::Aggregate {
             input,

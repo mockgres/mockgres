@@ -1,10 +1,13 @@
 use crate::storage::Row;
 use async_trait::async_trait;
 use pgwire::error::PgWireResult;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::eval::{EvalContext, eval_bool_expr, eval_scalar_expr};
-use super::{AggCall, AggFunc, BoolExpr, JoinType, ScalarExpr, Schema, SortKey, Value, fe};
+use super::{
+    AggCall, AggFunc, BoolExpr, JoinType, ScalarExpr, Schema, SortKey, Value, WindowSpec, fe,
+};
 
 mod values;
 
@@ -71,6 +74,137 @@ pub struct CountExec {
     schema: Schema,
     input: Box<dyn ExecNode>,
     produced: bool,
+}
+
+pub struct WindowRowNumberExec {
+    schema: Schema,
+    child: Option<Box<dyn ExecNode>>,
+    specs: Vec<ResolvedWindowSpec>,
+    params: Arc<Vec<Value>>,
+    ctx: EvalContext,
+    rows: Vec<Row>,
+    pos: usize,
+    built: bool,
+}
+
+struct ResolvedWindowSpec {
+    partition_by: Vec<ScalarExpr>,
+    order_keys: Vec<OrderKeySpec>,
+    order_exprs: Vec<ScalarExpr>,
+}
+
+impl WindowRowNumberExec {
+    pub fn new(
+        schema: Schema,
+        child: Box<dyn ExecNode>,
+        specs: Vec<(WindowSpec, String)>,
+        params: Arc<Vec<Value>>,
+        ctx: EvalContext,
+    ) -> PgWireResult<Self> {
+        let child_schema = child.schema().clone();
+        let mut resolved = Vec::with_capacity(specs.len());
+        for (spec, _) in specs {
+            let (order_keys, order_exprs) = resolve_order_keys(&child_schema, spec.order_by)?;
+            resolved.push(ResolvedWindowSpec {
+                partition_by: spec.partition_by,
+                order_keys,
+                order_exprs,
+            });
+        }
+        Ok(Self {
+            schema,
+            child: Some(child),
+            specs: resolved,
+            params,
+            ctx,
+            rows: Vec::new(),
+            pos: 0,
+            built: false,
+        })
+    }
+
+    async fn ensure_built(&mut self) -> PgWireResult<()> {
+        if self.built {
+            return Ok(());
+        }
+        let mut child = self.child.take().expect("window child missing");
+        child.open().await?;
+        let mut rows = Vec::new();
+        while let Some(row) = child.next().await? {
+            rows.push(row);
+        }
+        child.close().await?;
+
+        let base_width = rows
+            .first()
+            .map(|r| r.len())
+            .unwrap_or_else(|| self.schema.fields.len().saturating_sub(self.specs.len()));
+        for row in &mut rows {
+            row.resize(base_width + self.specs.len(), Value::Null);
+        }
+
+        for (spec_idx, spec) in self.specs.iter().enumerate() {
+            let mut partitions: HashMap<Vec<Value>, Vec<(usize, Vec<Value>)>> = HashMap::new();
+            for (row_idx, row) in rows.iter().enumerate() {
+                let mut partition_key = Vec::with_capacity(spec.partition_by.len());
+                for expr in &spec.partition_by {
+                    partition_key.push(eval_scalar_expr(row, expr, &self.params, &self.ctx)?);
+                }
+                let mut order_vals = Vec::with_capacity(spec.order_exprs.len());
+                for expr in &spec.order_exprs {
+                    order_vals.push(eval_scalar_expr(row, expr, &self.params, &self.ctx)?);
+                }
+                partitions
+                    .entry(partition_key)
+                    .or_default()
+                    .push((row_idx, order_vals));
+            }
+
+            for entries in partitions.values_mut() {
+                entries.sort_by(|(idx_a, exprs_a), (idx_b, exprs_b)| {
+                    compare_window_entries(
+                        &rows[*idx_a],
+                        exprs_a,
+                        &rows[*idx_b],
+                        exprs_b,
+                        &spec.order_keys,
+                    )
+                });
+                for (rank, (row_idx, _)) in entries.iter().enumerate() {
+                    rows[*row_idx][base_width + spec_idx] = Value::Int64((rank + 1) as i64);
+                }
+            }
+        }
+
+        self.rows = rows;
+        self.pos = 0;
+        self.built = true;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ExecNode for WindowRowNumberExec {
+    async fn open(&mut self) -> PgWireResult<()> {
+        self.ensure_built().await
+    }
+    async fn next(&mut self) -> PgWireResult<Option<Row>> {
+        if !self.built {
+            self.ensure_built().await?;
+        }
+        if self.pos >= self.rows.len() {
+            return Ok(None);
+        }
+        let row = self.rows[self.pos].clone();
+        self.pos += 1;
+        Ok(Some(row))
+    }
+    async fn close(&mut self) -> PgWireResult<()> {
+        Ok(())
+    }
+    fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 impl CountExec {
@@ -356,15 +490,73 @@ pub struct OrderExec {
     ctx: EvalContext,
 }
 
+#[derive(Clone)]
 struct OrderKeySpec {
     kind: OrderKeyKind,
     asc: bool,
     nulls_first: bool,
 }
 
+#[derive(Clone)]
 enum OrderKeyKind {
     Column(usize),
     Expr(usize),
+}
+
+fn resolve_order_keys(
+    schema: &Schema,
+    keys: Vec<SortKey>,
+) -> PgWireResult<(Vec<OrderKeySpec>, Vec<ScalarExpr>)> {
+    let mut expr_specs = Vec::new();
+    let mut resolved_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        match key {
+            SortKey::ByIndex {
+                idx,
+                asc,
+                nulls_first,
+            } => {
+                let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                resolved_keys.push(OrderKeySpec {
+                    kind: OrderKeyKind::Column(idx),
+                    asc,
+                    nulls_first: nulls_first_eff,
+                });
+            }
+            SortKey::ByName {
+                col,
+                asc,
+                nulls_first,
+            } => {
+                let idx = schema
+                    .fields
+                    .iter()
+                    .position(|f| f.name == col)
+                    .ok_or_else(|| fe(format!("unknown column in order by: {}", col)))?;
+                let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                resolved_keys.push(OrderKeySpec {
+                    kind: OrderKeyKind::Column(idx),
+                    asc,
+                    nulls_first: nulls_first_eff,
+                });
+            }
+            SortKey::Expr {
+                expr,
+                asc,
+                nulls_first,
+            } => {
+                let idx = expr_specs.len();
+                expr_specs.push(expr);
+                let nulls_first_eff = nulls_first.unwrap_or(!asc);
+                resolved_keys.push(OrderKeySpec {
+                    kind: OrderKeyKind::Expr(idx),
+                    asc,
+                    nulls_first: nulls_first_eff,
+                });
+            }
+        }
+    }
+    Ok((resolved_keys, expr_specs))
 }
 
 impl OrderExec {
@@ -375,55 +567,7 @@ impl OrderExec {
         params: Arc<Vec<Value>>,
         ctx: EvalContext,
     ) -> PgWireResult<Self> {
-        let mut expr_specs = Vec::new();
-        let mut resolved_keys = Vec::with_capacity(keys.len());
-        for key in keys {
-            match key {
-                SortKey::ByIndex {
-                    idx,
-                    asc,
-                    nulls_first,
-                } => {
-                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
-                    resolved_keys.push(OrderKeySpec {
-                        kind: OrderKeyKind::Column(idx),
-                        asc,
-                        nulls_first: nulls_first_eff,
-                    });
-                }
-                SortKey::ByName {
-                    col,
-                    asc,
-                    nulls_first,
-                } => {
-                    let idx = schema
-                        .fields
-                        .iter()
-                        .position(|f| f.name == col)
-                        .ok_or_else(|| fe(format!("unknown column in order by: {}", col)))?;
-                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
-                    resolved_keys.push(OrderKeySpec {
-                        kind: OrderKeyKind::Column(idx),
-                        asc,
-                        nulls_first: nulls_first_eff,
-                    });
-                }
-                SortKey::Expr {
-                    expr,
-                    asc,
-                    nulls_first,
-                } => {
-                    let idx = expr_specs.len();
-                    expr_specs.push(expr);
-                    let nulls_first_eff = nulls_first.unwrap_or(!asc);
-                    resolved_keys.push(OrderKeySpec {
-                        kind: OrderKeyKind::Expr(idx),
-                        asc,
-                        nulls_first: nulls_first_eff,
-                    });
-                }
-            }
-        }
+        let (resolved_keys, expr_specs) = resolve_order_keys(&schema, keys)?;
 
         Ok(Self {
             schema,
@@ -481,6 +625,34 @@ impl OrderExec {
         self.sorted = true;
         Ok(())
     }
+}
+
+fn compare_window_entries(
+    row_a: &Row,
+    exprs_a: &[Value],
+    row_b: &Row,
+    exprs_b: &[Value],
+    keys: &[OrderKeySpec],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for spec in keys {
+        let ord = match spec.kind {
+            OrderKeyKind::Column(idx) => {
+                let av = row_a.get(idx);
+                let bv = row_b.get(idx);
+                order_values(av, bv, spec.asc, spec.nulls_first)
+            }
+            OrderKeyKind::Expr(idx) => {
+                let av = exprs_a.get(idx);
+                let bv = exprs_b.get(idx);
+                order_values(av, bv, spec.asc, spec.nulls_first)
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 #[async_trait]
