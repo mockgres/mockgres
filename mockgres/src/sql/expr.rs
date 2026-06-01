@@ -2,7 +2,7 @@
 
 use crate::engine::{
     AggCall, AggFunc, BoolExpr, CmpOp, ColumnRefName, ScalarBinaryOp, ScalarExpr, ScalarFunc,
-    ScalarUnaryOp, SortKey, Value, WindowSpec, fe,
+    ScalarUnaryOp, SortKey, Value, WindowSpec, fe, fe_code,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
@@ -355,6 +355,22 @@ fn parse_case_expr(
     })
 }
 
+fn parse_row_expr_items(
+    node: &NodeEnum,
+    mut agg_ctx: Option<&mut AggregateExprCollector>,
+) -> PgWireResult<Option<Vec<ScalarExpr>>> {
+    let args = match node {
+        NodeEnum::RowExpr(row) => row.args.as_slice(),
+        _ => return Ok(None),
+    };
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let node = arg.node.as_ref().ok_or_else(|| fe("bad row expression"))?;
+        out.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
+    }
+    Ok(Some(out))
+}
+
 fn parse_in_expr(
     ax: &AExpr,
     mut agg_ctx: Option<&mut AggregateExprCollector>,
@@ -364,6 +380,9 @@ fn parse_in_expr(
         .as_ref()
         .and_then(|n| n.node.as_ref())
         .ok_or_else(|| fe("IN expression missing lhs"))?;
+    if let Some(lhs_items) = parse_row_expr_items(lexpr, agg_ctx.as_deref_mut())? {
+        return parse_tuple_in_expr(lhs_items, ax, agg_ctx.as_deref_mut());
+    }
     let lhs = parse_scalar_expr_internal(lexpr, agg_ctx.as_deref_mut())?;
     let rexpr_node = ax
         .rexpr
@@ -410,6 +429,63 @@ fn parse_in_expr(
             })
         }
         _ => Err(fe("IN expression expects list or subquery")),
+    }
+}
+
+fn parse_tuple_in_expr(
+    lhs_items: Vec<ScalarExpr>,
+    ax: &AExpr,
+    mut agg_ctx: Option<&mut AggregateExprCollector>,
+) -> PgWireResult<BoolExpr> {
+    if lhs_items.is_empty() {
+        return Err(fe("row IN expression requires at least one column"));
+    }
+    let rexpr_node = ax
+        .rexpr
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+        .ok_or_else(|| fe("IN expression missing rhs"))?;
+    let NodeEnum::List(list) = rexpr_node else {
+        return Err(fe("row IN expression expects list"));
+    };
+    if list.items.is_empty() {
+        return Err(fe("IN list must have at least one element"));
+    }
+
+    let mut row_matches = Vec::with_capacity(list.items.len());
+    for item in &list.items {
+        let node = item
+            .node
+            .as_ref()
+            .ok_or_else(|| fe("bad IN list element"))?;
+        let rhs_items = parse_row_expr_items(node, agg_ctx.as_deref_mut())?
+            .ok_or_else(|| fe("row IN expression expects row values"))?;
+        if rhs_items.len() != lhs_items.len() {
+            return Err(fe_code(
+                "42601",
+                "row IN expressions must have the same number of columns",
+            ));
+        }
+
+        let mut comparisons = Vec::with_capacity(lhs_items.len());
+        for (lhs, rhs) in lhs_items.iter().cloned().zip(rhs_items.into_iter()) {
+            comparisons.push(BoolExpr::Comparison {
+                lhs,
+                op: CmpOp::Eq,
+                rhs,
+            });
+        }
+        if comparisons.len() == 1 {
+            row_matches.push(comparisons.pop().unwrap());
+        } else {
+            row_matches.push(BoolExpr::And(comparisons));
+        }
+    }
+
+    if row_matches.len() == 1 {
+        Ok(row_matches.pop().unwrap())
+    } else {
+        Ok(BoolExpr::Or(row_matches))
     }
 }
 

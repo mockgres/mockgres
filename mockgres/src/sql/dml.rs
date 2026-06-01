@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::catalog::{SchemaName, TableId};
 #[allow(unused_imports)]
 use crate::engine::{
-    AggCall, AggFunc, AliasSpec, BoolExpr, CountExpr, DataType, Field, JoinType, LockMode,
+    AggCall, AggFunc, AliasSpec, BoolExpr, CountExpr, DataType, Expr, Field, JoinType, LockMode,
     LockRequest, LockSpec, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, Schema,
     Selection, SortKey, Value, fe, fe_code,
 };
@@ -25,6 +25,10 @@ type AggregateSelectList = (Vec<AggregateSelectItem>, Vec<(AggCall, String)>);
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let with_clause = sel.with_clause.take();
+    if !sel.values_lists.is_empty() {
+        let plan = plan_values_select(sel)?;
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
     if sel.from_clause.is_empty() {
         let plan = plan_literal_select(sel)?;
         return super::cte::wrap_with_clause(with_clause, plan);
@@ -677,6 +681,141 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
         exprs: out_exprs,
         schema: Schema { fields: vec![] },
     })
+}
+
+fn plan_values_select(sel: SelectStmt) -> PgWireResult<Plan> {
+    if !sel.target_list.is_empty()
+        || !sel.from_clause.is_empty()
+        || sel.where_clause.is_some()
+        || !sel.group_clause.is_empty()
+        || sel.having_clause.is_some()
+        || !sel.locking_clause.is_empty()
+    {
+        return Err(fe("unsupported VALUES query shape"));
+    }
+
+    let mut rows = Vec::with_capacity(sel.values_lists.len());
+    let mut column_types: Vec<Option<DataType>> = Vec::new();
+    let mut width: Option<usize> = None;
+    for value_list in sel.values_lists {
+        let Some(NodeEnum::List(list)) = value_list.node else {
+            return Err(fe("bad VALUES row"));
+        };
+        if let Some(expected) = width {
+            if list.items.len() != expected {
+                return Err(fe_code(
+                    "42601",
+                    "VALUES rows must all have the same number of columns",
+                ));
+            }
+        } else {
+            width = Some(list.items.len());
+            column_types.resize(list.items.len(), None);
+        }
+
+        let mut row = Vec::with_capacity(list.items.len());
+        for (idx, cell) in list.items.into_iter().enumerate() {
+            let node = cell.node.as_ref().ok_or_else(|| fe("bad VALUES cell"))?;
+            let expr = parse_scalar_expr(node)?;
+            let ty = infer_values_expr_type(&expr);
+            column_types[idx] = merge_values_type(column_types[idx].clone(), ty);
+            row.push(Expr::Scalar(expr));
+        }
+        rows.push(row);
+    }
+
+    let fields = column_types
+        .into_iter()
+        .enumerate()
+        .map(|(idx, ty)| Field {
+            name: format!("column{}", idx + 1),
+            data_type: ty.unwrap_or(DataType::Text),
+            origin: None,
+        })
+        .collect();
+    let mut plan = Plan::Values {
+        rows,
+        schema: Schema { fields },
+    };
+
+    if !sel.sort_clause.is_empty() {
+        plan = Plan::Order {
+            input: Box::new(plan),
+            keys: parse_order_clause(&sel.sort_clause)?,
+        };
+    }
+
+    let mut limit_value = None;
+    if let Some(limit_node) = sel.limit_count.as_ref().and_then(|n| n.node.as_ref()) {
+        limit_value = Some(parse_limit_count(limit_node)?);
+    }
+    let mut offset_value = CountExpr::Value(0);
+    if let Some(offset_node) = sel.limit_offset.as_ref().and_then(|n| n.node.as_ref()) {
+        offset_value = parse_offset_count(offset_node)?;
+    }
+    if limit_value.is_some() || !matches!(offset_value, CountExpr::Value(0)) {
+        plan = Plan::Limit {
+            input: Box::new(plan),
+            limit: limit_value,
+            offset: offset_value,
+        };
+    }
+
+    Ok(plan)
+}
+
+fn infer_values_expr_type(expr: &ScalarExpr) -> Option<DataType> {
+    match expr {
+        ScalarExpr::Literal(Value::Int64(i)) => {
+            if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                Some(DataType::Int4)
+            } else {
+                Some(DataType::Int8)
+            }
+        }
+        ScalarExpr::Literal(Value::Float64Bits(_)) => Some(DataType::Float8),
+        ScalarExpr::Literal(Value::Text(_)) => Some(DataType::Text),
+        ScalarExpr::Literal(Value::Bool(_)) => Some(DataType::Bool),
+        ScalarExpr::Literal(Value::Date(_)) => Some(DataType::Date),
+        ScalarExpr::Literal(Value::TimestampMicros(_)) => Some(DataType::Timestamp),
+        ScalarExpr::Literal(Value::TimestamptzMicros(_)) => Some(DataType::Timestamptz),
+        ScalarExpr::Literal(Value::Bytes(_)) => Some(DataType::Bytea),
+        ScalarExpr::Literal(Value::IntervalMicros(_)) => Some(DataType::Interval),
+        ScalarExpr::Literal(Value::Null) => None,
+        ScalarExpr::Cast { ty, .. } => Some(ty.clone()),
+        ScalarExpr::Param { ty, .. } => ty.clone(),
+        ScalarExpr::Func {
+            func: crate::engine::ScalarFunc::Coalesce,
+            args,
+        } => args.iter().find_map(infer_values_expr_type),
+        ScalarExpr::Predicate(_) => Some(DataType::Bool),
+        _ => Some(infer_expr_type(expr)),
+    }
+}
+
+fn merge_values_type(existing: Option<DataType>, incoming: Option<DataType>) -> Option<DataType> {
+    match (existing, incoming) {
+        (None, next) => next,
+        (current, None) => current,
+        (Some(DataType::Float8), Some(_)) | (Some(_), Some(DataType::Float8)) => {
+            Some(DataType::Float8)
+        }
+        (Some(DataType::Int8), Some(DataType::Int4))
+        | (Some(DataType::Int4), Some(DataType::Int8)) => Some(DataType::Int8),
+        (Some(current), Some(incoming)) if current == incoming => Some(current),
+        (Some(current), Some(incoming))
+            if matches!(
+                (&current, &incoming),
+                (DataType::Int4, DataType::Int4)
+                    | (DataType::Int4, DataType::Int8)
+                    | (DataType::Int8, DataType::Int4)
+                    | (DataType::Int8, DataType::Int8)
+            ) =>
+        {
+            Some(DataType::Int8)
+        }
+        _ => Some(DataType::Text),
+    }
 }
 
 fn parse_select_list(target_list: &mut Vec<pg_query::Node>) -> PgWireResult<ParsedSelectList> {

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{SchemaId, TableMeta};
 use crate::db::Db;
 use crate::engine::{
-    AggCall, AggFunc, DataType, DbDdlKind, Field, FieldOrigin, InsertSource, LockSpec, ObjName,
-    OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet,
+    AggCall, AggFunc, DataType, DbDdlKind, Expr, Field, FieldOrigin, InsertSource, LockSpec,
+    ObjName, OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet,
     WindowSpec, fe, fe_code,
 };
 use crate::session::Session;
@@ -131,6 +131,35 @@ fn bind_with_search_path(
 ) -> PgWireResult<Plan> {
     match p {
         Plan::Empty => Ok(Plan::Empty),
+        Plan::Values { rows, schema } => {
+            let empty_schema = Schema { fields: vec![] };
+            let mut bound_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut bound_row = Vec::with_capacity(row.len());
+                for (idx, expr) in row.into_iter().enumerate() {
+                    let hint = schema.fields.get(idx).map(|field| &field.data_type);
+                    let bound = match expr {
+                        Expr::Literal(value) => Expr::Literal(value),
+                        Expr::Column(idx) => Expr::Column(idx),
+                        Expr::Scalar(expr) => Expr::Scalar(bind_scalar_expr(
+                            &expr,
+                            &empty_schema,
+                            hint,
+                            db,
+                            search_path,
+                            current_database,
+                            time_ctx,
+                        )?),
+                    };
+                    bound_row.push(bound);
+                }
+                bound_rows.push(bound_row);
+            }
+            Ok(Plan::Values {
+                rows: bound_rows,
+                schema,
+            })
+        }
         Plan::With { ctes, body } => {
             let mut scoped = cte_scope.clone();
             let mut pending = ctes;

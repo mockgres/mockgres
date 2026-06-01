@@ -8,8 +8,8 @@ use pgwire::error::PgWireResult;
 
 use crate::engine::types::parse_interval_literal;
 use crate::engine::{
-    BoolExpr, CountExpr, DataType, InsertSource, Plan, ReturningClause, ReturningExpr, ScalarExpr,
-    UpdateSet, Value, fe,
+    BoolExpr, CountExpr, DataType, Expr, InsertSource, Plan, ReturningClause, ReturningExpr,
+    ScalarExpr, UpdateSet, Value, fe,
 };
 use crate::session::SessionTimeZone;
 use crate::types::{
@@ -217,11 +217,17 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::Alias { input, .. } => collect_param_hints_from_plan(input, out),
+        Plan::Values { rows, .. } => {
+            for row in rows {
+                for expr in row {
+                    collect_param_hints_from_values_expr(expr, out);
+                }
+            }
+        }
         Plan::Empty
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }
-        | Plan::Values { .. }
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
@@ -321,6 +327,12 @@ fn collect_param_hints_from_scalar(expr: &ScalarExpr, out: &mut HashMap<usize, D
         | ScalarExpr::ColumnIdx(..)
         | ScalarExpr::ExcludedIdx(..)
         | ScalarExpr::Literal(_) => {}
+    }
+}
+
+fn collect_param_hints_from_values_expr(expr: &Expr, out: &mut HashMap<usize, DataType>) {
+    if let Expr::Scalar(expr) = expr {
+        collect_param_hints_from_scalar(expr, out);
     }
 }
 
@@ -476,11 +488,17 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             }
         }
         Plan::Alias { input, .. } => collect_param_indexes(input, out),
+        Plan::Values { rows, .. } => {
+            for row in rows {
+                for expr in row {
+                    collect_param_indexes_from_values_expr(expr, out);
+                }
+            }
+        }
         Plan::Empty
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }
-        | Plan::Values { .. }
         | Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
@@ -578,6 +596,12 @@ fn collect_param_indexes_from_scalar(expr: &ScalarExpr, out: &mut BTreeSet<usize
         | ScalarExpr::ColumnIdx(..)
         | ScalarExpr::ExcludedIdx(..)
         | ScalarExpr::Literal(_) => {}
+    }
+}
+
+fn collect_param_indexes_from_values_expr(expr: &Expr, out: &mut BTreeSet<usize>) {
+    if let Expr::Scalar(expr) = expr {
+        collect_param_indexes_from_scalar(expr, out);
     }
 }
 

@@ -33,7 +33,12 @@ pub fn build_read_executor(
         Plan::Values { rows, schema } => {
             let cnt = rows.len();
             Ok((
-                Box::new(ValuesExec::new(schema.clone(), rows.clone())?),
+                Box::new(ValuesExec::new_with_context(
+                    schema.clone(),
+                    rows.clone(),
+                    params.clone(),
+                    ctx.clone(),
+                )?),
                 None,
                 Some(cnt),
             ))

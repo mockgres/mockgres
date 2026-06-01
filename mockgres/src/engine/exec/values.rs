@@ -1,8 +1,10 @@
 use async_trait::async_trait;
 use pgwire::error::PgWireResult;
+use std::sync::Arc;
 
 use crate::engine::{Expr, Schema, Value, fe};
 
+use super::super::eval::{EvalContext, eval_scalar_expr};
 use super::ExecNode;
 
 pub struct ValuesExec {
@@ -13,11 +15,25 @@ pub struct ValuesExec {
 
 impl ValuesExec {
     pub fn new(schema: Schema, rows_expr: Vec<Vec<Expr>>) -> PgWireResult<Self> {
+        Self::new_with_context(
+            schema,
+            rows_expr,
+            Arc::new(Vec::new()),
+            EvalContext::default(),
+        )
+    }
+
+    pub fn new_with_context(
+        schema: Schema,
+        rows_expr: Vec<Vec<Expr>>,
+        params: Arc<Vec<Value>>,
+        ctx: EvalContext,
+    ) -> PgWireResult<Self> {
         let mut rows = Vec::with_capacity(rows_expr.len());
         for r in rows_expr {
             let mut out = Vec::with_capacity(r.len());
             for e in r {
-                out.push(eval_const(&e)?);
+                out.push(eval_const(&e, &params, &ctx)?);
             }
             rows.push(out);
         }
@@ -61,9 +77,10 @@ impl ExecNode for ValuesExec {
     }
 }
 
-fn eval_const(e: &Expr) -> PgWireResult<Value> {
+fn eval_const(e: &Expr, params: &[Value], ctx: &EvalContext) -> PgWireResult<Value> {
     match e {
         Expr::Literal(v) => Ok(v.clone()),
         Expr::Column(_) => Err(fe("column not allowed here")),
+        Expr::Scalar(expr) => eval_scalar_expr(&[], expr, params, ctx),
     }
 }

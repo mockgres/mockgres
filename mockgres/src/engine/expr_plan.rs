@@ -16,6 +16,7 @@ pub enum CmpOp {
 pub enum Expr {
     Literal(Value),
     Column(usize),
+    Scalar(ScalarExpr),
 }
 
 #[derive(Clone, Debug, PartialEq)]
