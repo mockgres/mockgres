@@ -367,7 +367,7 @@ fn detect_count_star(node: &pg_query::Node) -> Option<String> {
     let NodeEnum::FuncCall(fc) = expr_node else {
         return None;
     };
-    if !fc.agg_star {
+    if !fc.agg_star || fc.agg_distinct {
         return None;
     }
     let name = fc.funcname.iter().find_map(|n| {
@@ -403,6 +403,7 @@ fn target_list_contains_aggregates(target_list: &[pg_query::Node]) -> bool {
             if let NodeEnum::FuncCall(fc) = expr_node
                 && target_list.len() == 1
                 && fc.agg_star
+                && !fc.agg_distinct
                 && function_name(fc).is_some_and(|name| name.eq_ignore_ascii_case("count"))
             {
                 continue;

@@ -619,6 +619,7 @@ fn bind_with_search_path(
                     AggCall {
                         func: agg_call.func,
                         expr: bound_expr,
+                        distinct: agg_call.distinct,
                     },
                     name,
                 ));

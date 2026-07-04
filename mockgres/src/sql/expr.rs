@@ -594,11 +594,15 @@ impl AggregateExprCollector {
         let Some(func) = agg_func_from_name(name) else {
             return Err(fe("unsupported function"));
         };
-        if fc.agg_distinct {
-            return Err(fe("DISTINCT aggregates are not supported"));
-        }
         let agg_call = if func == AggFunc::Count && fc.agg_star {
-            AggCall { func, expr: None }
+            if fc.agg_distinct {
+                return Err(fe("COUNT(DISTINCT *) is not supported"));
+            }
+            AggCall {
+                func,
+                expr: None,
+                distinct: false,
+            }
         } else {
             if fc.args.len() != 1 {
                 return Err(fe("aggregate functions require exactly one argument"));
@@ -611,6 +615,7 @@ impl AggregateExprCollector {
             AggCall {
                 func,
                 expr: Some(expr),
+                distinct: fc.agg_distinct,
             }
         };
         let alias = format!("{}{}", self.prefix, self.counter);

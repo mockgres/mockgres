@@ -186,6 +186,7 @@ pub enum AggFunc {
 pub struct AggCall {
     pub func: AggFunc,
     pub expr: Option<ScalarExpr>,
+    pub distinct: bool,
 }
 
 #[derive(Clone, Debug)]

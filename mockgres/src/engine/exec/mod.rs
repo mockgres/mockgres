@@ -1,7 +1,7 @@
 use crate::storage::Row;
 use async_trait::async_trait;
 use pgwire::error::PgWireResult;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::eval::{EvalContext, eval_bool_expr, eval_scalar_expr};
@@ -932,6 +932,7 @@ struct AggState {
     min: Option<Value>,
     max: Option<Value>,
     bool_and: Option<bool>,
+    distinct_seen: Option<HashSet<Value>>,
 }
 
 impl AggState {
@@ -942,7 +943,17 @@ impl AggState {
             min: None,
             max: None,
             bool_and: None,
+            distinct_seen: None,
         }
+    }
+
+    fn accepts_distinct_value(&mut self, distinct: bool, value: &Value) -> bool {
+        if !distinct {
+            return true;
+        }
+        self.distinct_seen
+            .get_or_insert_with(HashSet::new)
+            .insert(value.clone())
     }
 }
 
@@ -975,8 +986,6 @@ impl HashAggregateExec {
             return Ok(());
         }
 
-        use std::collections::HashMap;
-
         let mut map: HashMap<Vec<Value>, Vec<AggState>> = HashMap::new();
 
         self.child.open().await?;
@@ -998,6 +1007,9 @@ impl HashAggregateExec {
                         if let Some(expr) = &agg.expr {
                             let v = eval_scalar_expr(&row, expr, &self.params, &self.ctx)?;
                             if !matches!(v, Value::Null) {
+                                if !state.accepts_distinct_value(agg.distinct, &v) {
+                                    continue;
+                                }
                                 state.count += 1;
                             }
                         } else {
@@ -1013,6 +1025,9 @@ impl HashAggregateExec {
                         if matches!(v, Value::Null) {
                             continue;
                         }
+                        if !state.accepts_distinct_value(agg.distinct, &v) {
+                            continue;
+                        }
                         state.count += 1;
                         state.sum = Some(match state.sum.take() {
                             None => v,
@@ -1026,6 +1041,9 @@ impl HashAggregateExec {
                             .ok_or_else(|| fe("MIN requires an expression"))?;
                         let v = eval_scalar_expr(&row, expr, &self.params, &self.ctx)?;
                         if matches!(v, Value::Null) {
+                            continue;
+                        }
+                        if !state.accepts_distinct_value(agg.distinct, &v) {
                             continue;
                         }
                         let replace = match &state.min {
@@ -1048,6 +1066,9 @@ impl HashAggregateExec {
                         if matches!(v, Value::Null) {
                             continue;
                         }
+                        if !state.accepts_distinct_value(agg.distinct, &v) {
+                            continue;
+                        }
                         let replace = match &state.max {
                             None => true,
                             Some(prev) => matches!(
@@ -1065,8 +1086,13 @@ impl HashAggregateExec {
                             .as_ref()
                             .ok_or_else(|| fe("BOOL_AND requires an expression"))?;
                         let v = eval_scalar_expr(&row, expr, &self.params, &self.ctx)?;
+                        if matches!(v, Value::Null) {
+                            continue;
+                        }
+                        if !state.accepts_distinct_value(agg.distinct, &v) {
+                            continue;
+                        }
                         match v {
-                            Value::Null => {}
                             Value::Bool(b) => {
                                 state.bool_and = Some(state.bool_and.unwrap_or(true) && b);
                             }
