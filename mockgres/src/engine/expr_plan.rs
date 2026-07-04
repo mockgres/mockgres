@@ -430,6 +430,10 @@ pub enum Plan {
         column: String,
         if_exists: bool,
     },
+    AlterTableSetNotNull {
+        table: ObjName,
+        column: String,
+    },
     AlterTableAddConstraintUnique {
         table: ObjName,
         name: Option<String>,
@@ -631,6 +635,7 @@ impl Plan {
             | Plan::CreateTable { .. }
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
+            | Plan::AlterTableSetNotNull { .. }
             | Plan::AlterTableAddConstraintUnique { .. }
             | Plan::AlterTableAddConstraintPrimaryKey { .. }
             | Plan::AlterTableAddConstraintForeignKey { .. }

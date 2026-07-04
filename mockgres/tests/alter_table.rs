@@ -127,6 +127,80 @@ async fn alter_table_drop_column_constraints() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn alter_table_set_not_null_enforces_future_writes() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "
+            create table nn_values(
+                id int primary key,
+                value text
+            );
+            insert into nn_values values (1, 'one'), (2, 'two');
+            ",
+        )
+        .await
+        .expect("create nullable table");
+
+    ctx.client
+        .execute("alter table nn_values alter column value set not null", &[])
+        .await
+        .expect("set not null");
+
+    let insert_err = ctx
+        .client
+        .execute("insert into nn_values values (3, NULL)", &[])
+        .await
+        .expect_err("null insert should fail after set not null");
+    common::assert_db_error_contains(&insert_err, "column value is not null");
+
+    let update_err = ctx
+        .client
+        .execute("update nn_values set value = NULL where id = 1", &[])
+        .await
+        .expect_err("null update should fail after set not null");
+    common::assert_db_error_contains(&update_err, "column value is not null");
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn alter_table_set_not_null_rejects_existing_nulls() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "
+            create table nullable_values(
+                id int primary key,
+                value text
+            );
+            insert into nullable_values values (1, 'one'), (2, NULL);
+            ",
+        )
+        .await
+        .expect("create table with null");
+
+    let alter_err = ctx
+        .client
+        .execute(
+            "alter table nullable_values alter column value set not null",
+            &[],
+        )
+        .await
+        .expect_err("set not null should reject existing nulls");
+    common::assert_db_error_contains(&alter_err, "contains null values");
+
+    ctx.client
+        .execute("insert into nullable_values values (3, NULL)", &[])
+        .await
+        .expect("failed set not null should leave column nullable");
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn alter_table_add_and_drop_check_constraint() {
     let ctx = common::start().await;
 

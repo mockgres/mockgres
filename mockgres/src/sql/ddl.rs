@@ -223,6 +223,15 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                 if_exists: cmd.missing_ok,
             })
         }
+        AlterTableType::AtSetNotNull => {
+            if cmd.name.is_empty() {
+                return Err(fe("ALTER COLUMN SET NOT NULL requires column name"));
+            }
+            Ok(Plan::AlterTableSetNotNull {
+                table,
+                column: cmd.name,
+            })
+        }
         AlterTableType::AtAddConstraint => {
             let cons_node = cmd
                 .def

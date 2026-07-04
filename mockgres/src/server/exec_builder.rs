@@ -69,6 +69,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CreateTable { .. } => "CREATE TABLE",
         Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::AlterTableSetNotNull { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
         | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }
@@ -142,6 +143,7 @@ pub fn build_executor(
         Plan::CreateTable { .. }
         | Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
+        | Plan::AlterTableSetNotNull { .. }
         | Plan::AlterTableAddConstraintUnique { .. }
         | Plan::AlterTableAddConstraintPrimaryKey { .. }
         | Plan::AlterTableAddConstraintForeignKey { .. }

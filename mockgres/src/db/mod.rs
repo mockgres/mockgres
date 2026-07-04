@@ -337,6 +337,60 @@ impl Db {
         Ok(())
     }
 
+    pub fn alter_table_set_not_null(
+        &mut self,
+        schema: &str,
+        table: &str,
+        column: &str,
+    ) -> anyhow::Result<()> {
+        let (table_id, col_idx, already_not_null) = {
+            let meta = self
+                .catalog
+                .get_table(schema, table)
+                .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+            let col_idx = meta
+                .columns
+                .iter()
+                .position(|c| c.name == column)
+                .ok_or_else(|| sql_err("42703", format!("column {column} does not exist")))?;
+            (meta.id, col_idx, !meta.columns[col_idx].nullable)
+        };
+        if already_not_null {
+            return Ok(());
+        }
+
+        let table_storage = self
+            .tables
+            .get(&table_id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
+        for versions in table_storage.rows_by_key.values() {
+            let Some(row) = versions
+                .last()
+                .filter(|version| version.xmax.is_none())
+                .map(|version| &version.data)
+            else {
+                continue;
+            };
+            let value_is_null = match row.get(col_idx) {
+                Some(Value::Null) | None => true,
+                Some(_) => false,
+            };
+            if value_is_null {
+                return Err(sql_err(
+                    "23502",
+                    format!("column \"{column}\" of relation \"{table}\" contains null values"),
+                ));
+            }
+        }
+
+        let meta = self
+            .catalog
+            .get_table_mut_by_id(&table_id)
+            .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
+        meta.columns[col_idx].nullable = false;
+        Ok(())
+    }
+
     pub fn alter_table_add_primary_key(
         &mut self,
         schema: &str,

@@ -129,6 +129,25 @@ pub(crate) fn build_ddl_executor(
                 None,
             ))
         }
+        Plan::AlterTableSetNotNull { table, column } => {
+            let schema_name = {
+                let db_read = db.read();
+                match resolve_table_schema(&db_read, session, table)? {
+                    Some(name) => name,
+                    None => return Err(fe_code("42P01", format!("no such table {}", table.name))),
+                }
+            };
+            let mut db_write = db.write();
+            db_write
+                .alter_table_set_not_null(&schema_name, &table.name, column)
+                .map_err(map_db_err)?;
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("ALTER TABLE".into()),
+                None,
+            ))
+        }
         Plan::AlterTableAddConstraintUnique {
             table,
             name,
