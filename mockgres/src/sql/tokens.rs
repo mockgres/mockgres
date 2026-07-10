@@ -86,6 +86,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
             "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),
+            "point" => DataType::Point,
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
@@ -413,6 +414,7 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         Value::Float64Bits(b) => Ok(Some(Value::from_f64(-f64::from_bits(b)))),
                         Value::Null => Err(fe("minus over null")),
                         Value::Text(_)
+                        | Value::Point(_)
                         | Value::Bool(_)
                         | Value::Date(_)
                         | Value::TimestampMicros(_)

@@ -58,6 +58,7 @@ pub enum DataType {
     Float8,
     Text,
     BpChar(Option<usize>),
+    Point,
     Json,
     Jsonb,
     Bool,
@@ -78,6 +79,7 @@ impl DataType {
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
             DataType::BpChar(_) => Type::BPCHAR,
+            DataType::Point => Type::POINT,
             DataType::Json => Type::JSON,
             DataType::Jsonb => Type::JSONB,
             DataType::Bool => Type::BOOL,
@@ -126,6 +128,29 @@ pub struct Schema {
     pub fields: Vec<Field>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PointValue {
+    x_bits: u64,
+    y_bits: u64,
+}
+
+impl PointValue {
+    pub fn new(x: f64, y: f64) -> Self {
+        Self {
+            x_bits: x.to_bits(),
+            y_bits: y.to_bits(),
+        }
+    }
+
+    pub fn x(self) -> f64 {
+        f64::from_bits(self.x_bits)
+    }
+
+    pub fn y(self) -> f64 {
+        f64::from_bits(self.y_bits)
+    }
+}
+
 impl Schema {
     pub fn field(&self, i: usize) -> &Field {
         &self.fields[i]
@@ -141,6 +166,7 @@ pub enum Value {
     Int64(i64),
     Float64Bits(u64),
     Text(String),
+    Point(PointValue),
     Bool(bool),
     Date(i32),
     TimestampMicros(i64),
@@ -157,6 +183,7 @@ impl PartialEq for Value {
             (Int64(a), Int64(b)) => a == b,
             (Float64Bits(a), Float64Bits(b)) => a == b,
             (Text(a), Text(b)) => a == b,
+            (Point(a), Point(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
             (TimestampMicros(a), TimestampMicros(b)) => a == b,
@@ -179,6 +206,7 @@ impl Hash for Value {
             Int64(v) => v.hash(state),
             Float64Bits(v) => v.hash(state),
             Text(s) => s.hash(state),
+            Point(point) => point.hash(state),
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
             TimestampMicros(t) => t.hash(state),
@@ -216,6 +244,86 @@ pub fn cast_value_to_type(
     tz: &SessionTimeZone,
 ) -> Result<Value, SqlError> {
     convert_value_to_type(val, target, tz, false)
+}
+
+pub fn parse_point_text(input: &str) -> Result<PointValue, SqlError> {
+    fn invalid(input: &str) -> SqlError {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type point: \"{input}\""),
+        )
+    }
+
+    fn parse_coordinate(value: &str, input: &str) -> Result<f64, SqlError> {
+        let trimmed = value.trim();
+        let normalized = match trimmed.to_ascii_lowercase().as_str() {
+            "inf" | "+inf" | "infinity" | "+infinity" => "inf",
+            "-inf" | "-infinity" => "-inf",
+            "nan" | "+nan" | "-nan" => "NaN",
+            _ => trimmed,
+        };
+        let coordinate = normalized.parse::<f64>().map_err(|_| invalid(input))?;
+        let explicitly_infinite = matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "inf" | "+inf" | "infinity" | "+infinity" | "-inf" | "-infinity"
+        );
+        if coordinate.is_infinite() && !explicitly_infinite {
+            return Err(SqlError::new(
+                "22003",
+                format!("\"{trimmed}\" is out of range for type double precision"),
+            ));
+        }
+        Ok(coordinate)
+    }
+
+    let trimmed = input.trim();
+    let coordinates = if let Some(inner) = trimmed
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        inner
+    } else if trimmed.starts_with('(') || trimmed.ends_with(')') {
+        return Err(invalid(input));
+    } else {
+        trimmed
+    };
+    let mut parts = coordinates.split(',');
+    let x = parts.next().ok_or_else(|| invalid(input))?;
+    let y = parts.next().ok_or_else(|| invalid(input))?;
+    if parts.next().is_some() || x.trim().is_empty() || y.trim().is_empty() {
+        return Err(invalid(input));
+    }
+    Ok(PointValue::new(
+        parse_coordinate(x, input)?,
+        parse_coordinate(y, input)?,
+    ))
+}
+
+pub fn format_point_text(point: PointValue) -> String {
+    fn coordinate(value: f64) -> String {
+        if value.is_nan() {
+            return "NaN".to_string();
+        }
+        if value == f64::INFINITY {
+            return "Infinity".to_string();
+        }
+        if value == f64::NEG_INFINITY {
+            return "-Infinity".to_string();
+        }
+        let mut buffer = ryu::Buffer::new();
+        let mut formatted = buffer.format(value).to_string();
+        if formatted.ends_with(".0") {
+            formatted.truncate(formatted.len() - 2);
+        }
+        if let Some(exponent) = formatted.find('e')
+            && !matches!(formatted.as_bytes().get(exponent + 1), Some(b'+' | b'-'))
+        {
+            formatted.insert(exponent + 1, '+');
+        }
+        formatted
+    }
+
+    format!("({},{})", coordinate(point.x()), coordinate(point.y()))
 }
 
 pub fn coerce_value_to_type(
@@ -342,6 +450,9 @@ fn convert_value_to_type(
             Ok(Value::Text(text))
         }
         (DataType::BpChar(length), Value::Text(s)) => coerce_bpchar(s, *length, assignment),
+        (DataType::Point, Value::Point(point)) => Ok(Value::Point(point)),
+        (DataType::Point, Value::Text(value)) => parse_point_text(&value).map(Value::Point),
+        (DataType::Text, Value::Point(point)) => Ok(Value::Text(format_point_text(point))),
         (DataType::Json, Value::Text(s)) => {
             validate_json(&s, "json")?;
             Ok(Value::Text(s))

@@ -696,6 +696,9 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             .map_err(|e| fe_code(e.code, e.message))?;
             Ok(value)
         }
+        DataType::Point => crate::engine::parse_point_text(s)
+            .map(Value::Point)
+            .map_err(|error| fe_code(error.code, error.message)),
         DataType::Json => Ok(Value::Text(s.to_string())),
         DataType::Jsonb => Ok(Value::Text(s.to_string())),
         DataType::Bool => {
@@ -777,6 +780,14 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
                 tz,
             )
             .map_err(|e| fe_code(e.code, e.message))
+        }
+        DataType::Point => {
+            if bytes.len() != 16 {
+                return Err(fe("binary point must be 16 bytes"));
+            }
+            let x = f64::from_be_bytes(bytes[..8].try_into().expect("point x width checked"));
+            let y = f64::from_be_bytes(bytes[8..].try_into().expect("point y width checked"));
+            Ok(Value::Point(crate::engine::PointValue::new(x, y)))
         }
         DataType::Json => {
             let s = std::str::from_utf8(bytes)

@@ -27,13 +27,15 @@ time = { version = "0.3", features = ["macros", "parsing", "formatting"] }
 dashmap = "5.5"
 serde_json = "1.0"
 postgres-types = { version = "0.2", features = ["with-serde_json-1"] }
+bytes = "1"
+ryu = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-geo-types-0_7"] }
 anyhow = "1"
 rand = "0.8.5"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-bytes = "1"
 fallible-iterator = "0.2"
 postgres-protocol = "0.6"
+geo-types = "0.7"

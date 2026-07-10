@@ -4,21 +4,24 @@ use crate::types::{
     date_days_to_postgres, format_bytea, format_date, format_timestamp, format_timestamptz,
     timestamp_micros_to_date_days, timestamp_to_postgres_micros,
 };
+use bytes::{BufMut, BytesMut};
 use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
+use pgwire::types::ToSqlText;
 use pgwire::types::format::FormatOptions;
-use postgres_types::Json;
+use postgres_types::{IsNull, Json, ToSql};
 use serde_json::Value as JsonValue;
+use std::error::Error;
 use std::sync::Arc;
 
 use super::exec::ExecNode;
 use super::types::format_interval_micros;
 use super::{
-    BoolExpr, CmpOp, DataType, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, Value,
-    cast_value_to_type, fe, fe_code,
+    BoolExpr, CmpOp, DataType, PointValue, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp,
+    Value, cast_value_to_type, fe, fe_code, format_point_text,
 };
 
 #[derive(Clone)]
@@ -584,6 +587,7 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
     Ok(match v {
         Value::Null => None,
         Value::Text(s) => Some(s),
+        Value::Point(point) => Some(format_point_text(point)),
         Value::Int64(i) => Some(i.to_string()),
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
         Value::Bool(b) => Some(if b { "t" } else { "f" }.into()),
@@ -593,6 +597,39 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
             return Err(fe("text conversion not supported for date/timestamp"));
         }
     })
+}
+
+#[derive(Debug)]
+struct PointOutput(PointValue);
+
+impl ToSql for PointOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.x());
+        out.put_f64(self.0.y());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::POINT
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for PointOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_point_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
 }
 
 pub fn eval_bool_expr(
@@ -776,6 +813,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::BpChar(_)) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Point) => {
+                                    enc.encode_field(&Option::<PointOutput>::None)
+                                }
                                 (Value::Null, DataType::Json) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
@@ -810,6 +850,9 @@ pub async fn to_pgwire_stream(
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::BpChar(_)) => enc.encode_field(&s),
+                                (Value::Point(point), DataType::Point) => {
+                                    enc.encode_field(&PointOutput(point))
+                                }
                                 (Value::Text(s), DataType::Json) => {
                                     let parsed: JsonValue = match serde_json::from_str(&s) {
                                         Ok(v) => v,

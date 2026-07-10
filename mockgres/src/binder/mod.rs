@@ -1082,6 +1082,7 @@ fn bind_with_search_path(
                                 | DataType::Int8
                                 | DataType::Float8
                                 | DataType::BpChar(_)
+                                | DataType::Point
                                 | DataType::Bool
                                 | DataType::Date
                                 | DataType::Timestamp

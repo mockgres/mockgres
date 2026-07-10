@@ -547,6 +547,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             }
             Value::Float64Bits(_) => Some(DataType::Float8),
             Value::Text(_) => Some(DataType::Text),
+            Value::Point(_) => Some(DataType::Point),
             Value::Bool(_) => Some(DataType::Bool),
             Value::Date(_) => Some(DataType::Date),
             Value::TimestampMicros(_) => Some(DataType::Timestamp),

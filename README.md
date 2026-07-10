@@ -74,7 +74,7 @@ details. The upstream suite uses a fresh shared database and does not invoke
 - DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, INSERT ... SELECT, RETURNING
 - Locking and tx: BEGIN/COMMIT/ROLLBACK (read committed only), SELECT FOR UPDATE SKIP LOCKED
 - Copy-on-write snapshots: global freeze + per-session sandboxes (`mockgres_freeze()`, `mockgres_reset()`)
-- types: int2/int4/int8, float8, char(n), text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
+- types: int2/int4/int8, float8, point, char(n), text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
 - Constraints/indices: primary key, unique, foreign key (cascade), create/drop index supported but no-op
 - Catalog: schemas, in-memory database creation and routing (drop and alter not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
 - Regression setup utilities: stateful `synchronous_commit` and `allow_in_place_tablespaces`; schema `GRANT`/`REVOKE` accepted as authorization no-ops; tablespace names tracked while physical storage remains a no-op; `VACUUM`/`ANALYZE` validate targets but require no disk maintenance
