@@ -1,6 +1,6 @@
 use crate::catalog::TableMeta;
 use crate::engine::{
-    Column, EvalContext, EvalMode, ScalarExpr, Value, cast_value_to_type,
+    Column, EvalContext, EvalMode, ScalarExpr, Value, coerce_value_to_type,
     eval_scalar_expr_with_mode,
 };
 
@@ -39,7 +39,7 @@ pub(crate) fn coerce_value_for_column(
         }
         return Ok(Value::Null);
     }
-    let coerced = cast_value_to_type(val, &col.data_type, &ctx.time_zone).map_err(|e| {
+    let coerced = coerce_value_to_type(val, &col.data_type, &ctx.time_zone).map_err(|e| {
         sql_err(
             e.code,
             format!("column {} (index {}): {}", col.name, idx, e.message),

@@ -1077,9 +1077,11 @@ fn bind_with_search_path(
                         InsertSource::Expr(expr) => {
                             let field = table_schema.field(target_idx);
                             let hint = match field.data_type {
-                                DataType::Int4
+                                DataType::Int2
+                                | DataType::Int4
                                 | DataType::Int8
                                 | DataType::Float8
+                                | DataType::BpChar(_)
                                 | DataType::Bool
                                 | DataType::Date
                                 | DataType::Timestamp

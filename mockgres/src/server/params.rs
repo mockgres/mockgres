@@ -9,7 +9,7 @@ use pgwire::error::PgWireResult;
 use crate::engine::types::parse_interval_literal;
 use crate::engine::{
     BoolExpr, CountExpr, DataType, Expr, InsertSource, Plan, ReturningClause, ReturningExpr,
-    ScalarExpr, UpdateSet, Value, fe,
+    ScalarExpr, UpdateSet, Value, fe, fe_code,
 };
 use crate::session::SessionTimeZone;
 use crate::types::{
@@ -659,12 +659,25 @@ pub fn decode_param_value(
 fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWireResult<Value> {
     let s = std::str::from_utf8(bytes).map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
     match ty {
+        DataType::Int2 => {
+            let v: i16 = s
+                .trim()
+                .parse()
+                .map_err(|e| fe(format!("bad int2 param: {e}")))?;
+            Ok(Value::Int64(v as i64))
+        }
         DataType::Int4 => {
-            let v: i32 = s.parse().map_err(|e| fe(format!("bad int4 param: {e}")))?;
+            let v: i32 = s
+                .trim()
+                .parse()
+                .map_err(|e| fe(format!("bad int4 param: {e}")))?;
             Ok(Value::Int64(v as i64))
         }
         DataType::Int8 => {
-            let v: i64 = s.parse().map_err(|e| fe(format!("bad int8 param: {e}")))?;
+            let v: i64 = s
+                .trim()
+                .parse()
+                .map_err(|e| fe(format!("bad int8 param: {e}")))?;
             Ok(Value::Int64(v))
         }
         DataType::Float8 => {
@@ -674,6 +687,15 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             Ok(Value::from_f64(v))
         }
         DataType::Text => Ok(Value::Text(s.to_string())),
+        DataType::BpChar(length) => {
+            let value = crate::engine::coerce_value_to_type(
+                Value::Text(s.to_string()),
+                &DataType::BpChar(*length),
+                tz,
+            )
+            .map_err(|e| fe_code(e.code, e.message))?;
+            Ok(value)
+        }
         DataType::Json => Ok(Value::Text(s.to_string())),
         DataType::Jsonb => Ok(Value::Text(s.to_string())),
         DataType::Bool => {
@@ -709,8 +731,14 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
     }
 }
 
-fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgWireResult<Value> {
+fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWireResult<Value> {
     match ty {
+        DataType::Int2 => {
+            let arr: [u8; 2] = bytes
+                .try_into()
+                .map_err(|_| fe("binary int2 must be 2 bytes"))?;
+            Ok(Value::Int64(i16::from_be_bytes(arr) as i64))
+        }
         DataType::Int4 => {
             let arr: [u8; 4] = bytes
                 .try_into()
@@ -739,6 +767,16 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, _tz: &SessionTimeZone) -> PgW
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))
+        }
+        DataType::BpChar(length) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
+            crate::engine::coerce_value_to_type(
+                Value::Text(s.to_string()),
+                &DataType::BpChar(*length),
+                tz,
+            )
+            .map_err(|e| fe_code(e.code, e.message))
         }
         DataType::Json => {
             let s = std::str::from_utf8(bytes)

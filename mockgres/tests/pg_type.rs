@@ -10,15 +10,17 @@ async fn pg_type_contains_supported_types() {
         .query(
             "select typname, oid, typarray \
              from pg_catalog.pg_type \
-             where typname in ('bool','int4','text','timestamptz') \
+             where typname in ('bool','bpchar','int2','int4','text','timestamptz') \
              order by typname",
             &[],
         )
         .await
         .expect("pg_type query");
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 6);
     let expected = [
         ("bool".to_string(), 16_i32, 1000_i32),
+        ("bpchar".to_string(), 1042_i32, 1014_i32),
+        ("int2".to_string(), 21_i32, 1005_i32),
         ("int4".to_string(), 23_i32, 1007_i32),
         ("text".to_string(), 25_i32, 1009_i32),
         ("timestamptz".to_string(), 1184_i32, 1185_i32),

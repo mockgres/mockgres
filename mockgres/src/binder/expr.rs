@@ -46,6 +46,8 @@ fn bind_bool_expr_inner(
             let rhs_hint = scalar_expr_type(&rhs_bound, schema);
             apply_param_hint(&mut lhs_bound, rhs_hint.as_ref());
             apply_param_hint(&mut rhs_bound, lhs_hint.as_ref());
+            apply_bpchar_literal_hint(&mut lhs_bound, rhs_hint.as_ref());
+            apply_bpchar_literal_hint(&mut rhs_bound, lhs_hint.as_ref());
             BoolExpr::Comparison {
                 lhs: lhs_bound,
                 op: *op,
@@ -590,7 +592,10 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
                         Some(DataType::Float8)
                     }
                     (Some(DataType::Int8), _) | (_, Some(DataType::Int8)) => Some(DataType::Int8),
-                    (Some(DataType::Int4), Some(DataType::Int4)) => Some(DataType::Int4),
+                    (Some(DataType::Int4), Some(DataType::Int4 | DataType::Int2))
+                    | (Some(DataType::Int2), Some(DataType::Int4 | DataType::Int2)) => {
+                        Some(DataType::Int4)
+                    }
                     (Some(DataType::Int4), None) | (None, Some(DataType::Int4)) => {
                         Some(DataType::Int4)
                     }
@@ -671,4 +676,18 @@ pub(crate) fn apply_param_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
             apply_param_hint(expr, hint);
         }
     }
+}
+
+fn apply_bpchar_literal_hint(expr: &mut ScalarExpr, hint: Option<&DataType>) {
+    let Some(DataType::BpChar(length)) = hint else {
+        return;
+    };
+    let ScalarExpr::Literal(Value::Text(value)) = expr else {
+        return;
+    };
+    let value = std::mem::take(value);
+    *expr = ScalarExpr::Cast {
+        expr: Box::new(ScalarExpr::Literal(Value::Text(value))),
+        ty: DataType::BpChar(*length),
+    };
 }

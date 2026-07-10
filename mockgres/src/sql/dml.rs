@@ -1115,7 +1115,7 @@ fn parse_nonnegative_count(node: &NodeEnum, label: &str) -> PgWireResult<CountEx
                 .as_ref()
                 .ok_or_else(|| fe("missing cast target"))?;
             let dt = parse_type_name(cast_type)?;
-            if !matches!(dt, DataType::Int4 | DataType::Int8) {
+            if !matches!(dt, DataType::Int2 | DataType::Int4 | DataType::Int8) {
                 return Err(fe(format!("{label} must be integer")));
             }
             let count = parse_nonnegative_count(inner, label)?;

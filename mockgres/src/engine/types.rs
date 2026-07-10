@@ -52,10 +52,12 @@ pub fn fe_code(code: &'static str, msg: impl Into<String>) -> PgWireError {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataType {
+    Int2,
     Int4,
     Int8,
     Float8,
     Text,
+    BpChar(Option<usize>),
     Json,
     Jsonb,
     Bool,
@@ -70,10 +72,12 @@ pub enum DataType {
 impl DataType {
     pub fn to_pg(&self) -> Type {
         match self {
+            DataType::Int2 => Type::INT2,
             DataType::Int4 => Type::INT4,
             DataType::Int8 => Type::INT8,
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
+            DataType::BpChar(_) => Type::BPCHAR,
             DataType::Json => Type::JSON,
             DataType::Jsonb => Type::JSONB,
             DataType::Bool => Type::BOOL,
@@ -211,6 +215,23 @@ pub fn cast_value_to_type(
     target: &DataType,
     tz: &SessionTimeZone,
 ) -> Result<Value, SqlError> {
+    convert_value_to_type(val, target, tz, false)
+}
+
+pub fn coerce_value_to_type(
+    val: Value,
+    target: &DataType,
+    tz: &SessionTimeZone,
+) -> Result<Value, SqlError> {
+    convert_value_to_type(val, target, tz, true)
+}
+
+fn convert_value_to_type(
+    val: Value,
+    target: &DataType,
+    tz: &SessionTimeZone,
+    assignment: bool,
+) -> Result<Value, SqlError> {
     fn validate_json(input: &str, type_name: &str) -> Result<(), SqlError> {
         serde_json::from_str::<JsonValue>(input).map_err(|e| {
             SqlError::new(
@@ -221,7 +242,59 @@ pub fn cast_value_to_type(
         Ok(())
     }
 
+    fn parse_integer_input(
+        input: &str,
+        min: i128,
+        max: i128,
+        type_name: &str,
+    ) -> Result<i64, SqlError> {
+        let parsed = input.trim().parse::<i128>().map_err(|_| {
+            SqlError::new(
+                "22P02",
+                format!("invalid input syntax for type {type_name}: \"{input}\""),
+            )
+        })?;
+        if parsed < min || parsed > max {
+            return Err(SqlError::new(
+                "22003",
+                format!("value \"{input}\" is out of range for type {type_name}"),
+            ));
+        }
+        Ok(parsed as i64)
+    }
+
+    fn coerce_bpchar(
+        input: String,
+        length: Option<usize>,
+        assignment: bool,
+    ) -> Result<Value, SqlError> {
+        let Some(length) = length else {
+            return Ok(Value::Text(input));
+        };
+        let mut chars = input.chars();
+        let mut output: String = chars.by_ref().take(length).collect();
+        if assignment && chars.any(|c| c != ' ') {
+            return Err(SqlError::new(
+                "22001",
+                format!("value too long for type character({length})"),
+            ));
+        }
+        let padding = length.saturating_sub(output.chars().count());
+        output.extend(std::iter::repeat_n(' ', padding));
+        Ok(Value::Text(output))
+    }
+
     match (target, val) {
+        (DataType::Int2, Value::Int64(v)) => {
+            if v < i16::MIN as i64 || v > i16::MAX as i64 {
+                return Err(SqlError::new("22003", "smallint out of range"));
+            }
+            Ok(Value::Int64(v))
+        }
+        (DataType::Int2, Value::Text(s)) => {
+            parse_integer_input(&s, i16::MIN as i128, i16::MAX as i128, "smallint")
+                .map(Value::Int64)
+        }
         (DataType::Int4, Value::Int64(v)) => {
             if v < i32::MIN as i64 || v > i32::MAX as i64 {
                 return Err(SqlError::new("22003", "value out of range for int4"));
@@ -229,17 +302,11 @@ pub fn cast_value_to_type(
             Ok(Value::Int64(v))
         }
         (DataType::Int4, Value::Text(s)) => {
-            let parsed: i32 = s
-                .parse()
-                .map_err(|e| SqlError::new("22P02", format!("invalid input for int4: {e}")))?;
-            Ok(Value::Int64(parsed as i64))
+            parse_integer_input(&s, i32::MIN as i128, i32::MAX as i128, "integer").map(Value::Int64)
         }
         (DataType::Int8, Value::Int64(v)) => Ok(Value::Int64(v)),
         (DataType::Int8, Value::Text(s)) => {
-            let parsed: i64 = s
-                .parse()
-                .map_err(|e| SqlError::new("22P02", format!("invalid input for int8: {e}")))?;
-            Ok(Value::Int64(parsed))
+            parse_integer_input(&s, i64::MIN as i128, i64::MAX as i128, "bigint").map(Value::Int64)
         }
         (DataType::Float8, Value::Float64Bits(bits)) => Ok(Value::Float64Bits(bits)),
         (DataType::Float8, Value::Int64(v)) => Ok(Value::from_f64(v as f64)),
@@ -274,6 +341,7 @@ pub fn cast_value_to_type(
             let text = format_timestamptz(m, tz).map_err(|e| SqlError::new("22008", e))?;
             Ok(Value::Text(text))
         }
+        (DataType::BpChar(length), Value::Text(s)) => coerce_bpchar(s, *length, assignment),
         (DataType::Json, Value::Text(s)) => {
             validate_json(&s, "json")?;
             Ok(Value::Text(s))

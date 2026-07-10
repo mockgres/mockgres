@@ -1,6 +1,6 @@
 use super::expr::parse_scalar_expr;
 use crate::catalog::SchemaName;
-use crate::engine::{DataType, IdentitySpec, ObjName, ScalarExpr, Value, fe};
+use crate::engine::{DataType, IdentitySpec, ObjName, ScalarExpr, Value, fe, fe_code};
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{AConst, ColumnDef, TypeName};
 use pg_query::{Node, NodeEnum};
@@ -21,11 +21,14 @@ pub(super) fn const_to_value(c: &AConst) -> PgWireResult<Value> {
     let v = c.val.as_ref().unwrap();
     match v {
         Val::Ival(i) => Ok(Value::Int64(i.ival as i64)),
-        Val::Fval(f) => {
-            Ok(Value::from_f64(f.fval.parse::<f64>().map_err(|e| {
-                pgwire::error::PgWireError::ApiError(Box::new(e))
-            })?))
-        }
+        Val::Fval(f) => match f.fval.parse::<i64>() {
+            Ok(value) => Ok(Value::Int64(value)),
+            Err(_) => {
+                Ok(Value::from_f64(f.fval.parse::<f64>().map_err(|e| {
+                    pgwire::error::PgWireError::ApiError(Box::new(e))
+                })?))
+            }
+        },
         Val::Boolval(b) => Ok(Value::Bool(b.boolval)),
         Val::Sval(s) => Ok(Value::Text(s.sval.clone())),
         Val::Bsval(_) => Err(fe("bitstring const not yet supported")),
@@ -77,10 +80,12 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
         DataType::Timestamptz
     } else {
         match last {
+            "smallint" | "int2" => DataType::Int2,
             "int" | "int4" | "integer" => DataType::Int4,
             "bigint" | "int8" => DataType::Int8,
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
+            "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
@@ -96,6 +101,35 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
         }
     };
     Ok(dt)
+}
+
+fn parse_character_length(typ: &TypeName) -> PgWireResult<Option<usize>> {
+    if typ.typmods.is_empty() {
+        return Ok(None);
+    }
+    if typ.typmods.len() != 1 {
+        return Err(fe("character type accepts one length modifier"));
+    }
+    let value = typ.typmods[0]
+        .node
+        .as_ref()
+        .ok_or_else(|| fe("invalid character length"))?;
+    let NodeEnum::AConst(value) = value else {
+        return Err(fe("invalid character length"));
+    };
+    let Some(Val::Ival(length)) = value.val.as_ref() else {
+        return Err(fe("invalid character length"));
+    };
+    if length.ival < 1 {
+        return Err(fe_code("22023", "length for type char must be at least 1"));
+    }
+    if length.ival > 10_485_760 {
+        return Err(fe_code(
+            "22023",
+            "length for type char cannot exceed 10485760",
+        ));
+    }
+    Ok(Some(length.ival as usize))
 }
 
 pub(super) fn parse_column_def(cd: &ColumnDef) -> PgWireResult<ColumnDefSpec> {
@@ -131,8 +165,8 @@ pub(super) fn parse_column_def(cd: &ColumnDef) -> PgWireResult<ColumnDefSpec> {
     };
     let identity = parse_identity_spec(cd)?;
     if let Some(spec) = &identity {
-        if !matches!(dt, DataType::Int4 | DataType::Int8) {
-            return Err(fe("IDENTITY columns must be INT or BIGINT"));
+        if !matches!(dt, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+            return Err(fe("IDENTITY columns must be SMALLINT, INT, or BIGINT"));
         }
         if spec.increment_by == 0 {
             return Err(fe("IDENTITY INCREMENT BY cannot be zero"));

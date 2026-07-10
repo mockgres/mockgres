@@ -660,11 +660,25 @@ pub fn parse_arithmetic_expr(
             .as_ref()
             .and_then(|n| n.node.as_ref())
             .ok_or_else(|| fe("bad unary minus"))?;
+        if let NodeEnum::AConst(value) = rhs
+            && let Some(pg_query::protobuf::a_const::Val::Fval(value)) = value.val.as_ref()
+            && value.fval == "9223372036854775808"
+        {
+            return Ok(ScalarExpr::Literal(Value::Int64(i64::MIN)));
+        }
         let expr = parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut())?;
         return Ok(ScalarExpr::UnaryOp {
             op: ScalarUnaryOp::Negate,
             expr: Box::new(expr),
         });
+    }
+    if ax.lexpr.is_none() && op == "+" {
+        let rhs = ax
+            .rexpr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad unary plus"))?;
+        return parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut());
     }
     let lexpr = ax
         .lexpr

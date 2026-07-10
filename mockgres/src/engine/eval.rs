@@ -249,12 +249,14 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
         ScalarBinaryOp::Add | ScalarBinaryOp::Sub | ScalarBinaryOp::Mul => {
             let (l_val, r_val, use_float) = coerce_numeric_pair(left, right)?;
             if !use_float && let (NumericValue::Int(a), NumericValue::Int(b)) = (&l_val, &r_val) {
-                return Ok(match op {
-                    ScalarBinaryOp::Add => Value::Int64(*a + *b),
-                    ScalarBinaryOp::Sub => Value::Int64(*a - *b),
-                    ScalarBinaryOp::Mul => Value::Int64(*a * *b),
+                let result = match op {
+                    ScalarBinaryOp::Add => a.checked_add(*b),
+                    ScalarBinaryOp::Sub => a.checked_sub(*b),
+                    ScalarBinaryOp::Mul => a.checked_mul(*b),
                     _ => unreachable!(),
-                });
+                }
+                .ok_or_else(|| fe_code("22003", "bigint out of range"))?;
+                return Ok(Value::Int64(result));
             }
             let lf = l_val
                 .to_f64()
@@ -271,21 +273,25 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
             Ok(Value::from_f64(res))
         }
         ScalarBinaryOp::Div => {
-            let right_is_zero = match &right {
-                Value::Int64(0) => true,
-                Value::Float64Bits(bits) => f64::from_bits(*bits) == 0.0,
-                _ => false,
-            };
-            if right_is_zero {
-                return Err(fe_code("22012", "division by zero"));
+            let (l, r, use_float) = coerce_numeric_pair(left, right)?;
+            if !use_float && let (NumericValue::Int(a), NumericValue::Int(b)) = (&l, &r) {
+                if *b == 0 {
+                    return Err(fe_code("22012", "division by zero"));
+                }
+                let result = a
+                    .checked_div(*b)
+                    .ok_or_else(|| fe_code("22003", "bigint out of range"))?;
+                return Ok(Value::Int64(result));
             }
-            let (l, r, _) = coerce_numeric_pair(left, right)?;
             let lf = l
                 .to_f64()
                 .ok_or_else(|| fe("cannot convert lhs to float"))?;
             let rf = r
                 .to_f64()
                 .ok_or_else(|| fe("cannot convert rhs to float"))?;
+            if rf == 0.0 {
+                return Err(fe_code("22012", "division by zero"));
+            }
             Ok(Value::from_f64(lf / rf))
         }
         ScalarBinaryOp::Concat => {
@@ -305,7 +311,10 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
     }
     match op {
         ScalarUnaryOp::Negate => match value {
-            Value::Int64(v) => Ok(Value::Int64(-v)),
+            Value::Int64(v) => v
+                .checked_neg()
+                .map(Value::Int64)
+                .ok_or_else(|| fe_code("22003", "bigint out of range")),
             Value::Float64Bits(bits) => {
                 let f = f64::from_bits(bits);
                 Ok(Value::from_f64(-f))
@@ -382,7 +391,10 @@ fn eval_function(
             Ok(Value::Date(days))
         }
         ScalarFunc::Abs => match args.into_iter().next() {
-            Some(Value::Int64(i)) => Ok(Value::Int64(i.abs())),
+            Some(Value::Int64(i)) => i
+                .checked_abs()
+                .map(Value::Int64)
+                .ok_or_else(|| fe_code("22003", "bigint out of range")),
             Some(Value::Float64Bits(bits)) => Ok(Value::from_f64(f64::from_bits(bits).abs())),
             Some(Value::Null) | None => Ok(Value::Null),
             other => Err(fe(format!("abs() unsupported for {other:?}"))),
@@ -746,6 +758,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Void) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Int2) => {
+                                    enc.encode_field(&Option::<i16>::None)
+                                }
                                 (Value::Null, DataType::Int4) => {
                                     enc.encode_field(&Option::<i32>::None)
                                 }
@@ -756,6 +771,9 @@ pub async fn to_pgwire_stream(
                                     enc.encode_field(&Option::<f64>::None)
                                 }
                                 (Value::Null, DataType::Text) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::BpChar(_)) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
                                 (Value::Null, DataType::Json) => {
@@ -779,6 +797,7 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Bytea) => {
                                     enc.encode_field(&Option::<Vec<u8>>::None)
                                 }
+                                (Value::Int64(i), DataType::Int2) => enc.encode_field(&(i as i16)),
                                 (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
                                 (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
                                 (Value::Int64(i), DataType::Float8) => {
@@ -790,6 +809,7 @@ pub async fn to_pgwire_stream(
                                     enc.encode_field(&f)
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
+                                (Value::Text(s), DataType::BpChar(_)) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Json) => {
                                     let parsed: JsonValue = match serde_json::from_str(&s) {
                                         Ok(v) => v,
@@ -951,7 +971,14 @@ mod tests {
             left: Box::new(lit_int(9)),
             right: Box::new(lit_int(2)),
         };
-        assert_eq!(eval(&div).as_f64().unwrap(), 4.5);
+        assert_eq!(eval(&div), Value::Int64(4));
+
+        let float_div = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Div,
+            left: Box::new(lit_float(9.0)),
+            right: Box::new(lit_int(2)),
+        };
+        assert_eq!(eval(&float_div).as_f64().unwrap(), 4.5);
     }
 
     #[test]
