@@ -36,6 +36,8 @@ The first use case is that of a typical CRUD app. The second use case is for a b
 ## Running
 Set the bind address via CLI options or `MOCKGRES_ADDR`.
 The CLI accepts `--host`, `--port`, or a positional `host:port` string.
+Set the accepted database name with `--database` or `MOCKGRES_DATABASE`.
+For example, use `--database regression` when running PostgreSQL's regression tests.
 You can technically run it by embedding it as a library, all you really need to do is what's specified in `main`.
 
 ## Testing

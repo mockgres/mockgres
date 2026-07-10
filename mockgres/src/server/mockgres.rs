@@ -9,7 +9,10 @@ use parking_lot::RwLock;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, DEFAULT_NAME, ErrorHandler, NoopHandler, PgWireConnectionState,
     PgWireServerHandlers,
-    auth::{StartupHandler, noop::NoopStartupHandler},
+    auth::{
+        DefaultServerParameterProvider, StartupHandler, finish_authentication,
+        protocol_negotiation, save_startup_parameters_to_metadata,
+    },
     cancel::CancelHandler,
     portal::PortalExecutionState,
     query::{ExtendedQueryHandler, SimpleQueryHandler},
@@ -128,35 +131,44 @@ impl Mockgres {
 }
 
 #[async_trait::async_trait]
-impl NoopStartupHandler for Mockgres {
-    async fn post_startup<C>(
+impl StartupHandler for Mockgres {
+    async fn on_startup<C>(
         &self,
         client: &mut C,
         message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let PgWireFrontendMessage::Startup(startup) = &message {
-            let requested = startup
-                .parameters
-                .get("database")
-                .cloned()
-                .filter(|name| !name.is_empty());
-            let effective = requested
-                .clone()
-                .unwrap_or_else(|| self.config.database_name.clone());
-            if effective != self.config.database_name {
-                return Err(fe_code(
-                    "3D000",
-                    format!("database \"{}\" does not exist", effective),
-                ));
-            }
+        let PgWireFrontendMessage::Startup(startup) = &message else {
+            return Ok(());
+        };
+
+        protocol_negotiation(client, startup).await?;
+        save_startup_parameters_to_metadata(client, startup);
+
+        let requested = startup
+            .parameters
+            .get("database")
+            .cloned()
+            .filter(|name| !name.is_empty());
+        let effective = requested.unwrap_or_else(|| self.config.database_name.clone());
+        if effective != self.config.database_name {
+            return Err(fe_code(
+                "3D000",
+                format!("database \"{}\" does not exist", effective),
+            ));
         }
+
         let session = self.init_session(client);
         session.set_database_name(self.config.database_name.clone());
+
+        let mut parameters = DefaultServerParameterProvider::default();
+        parameters.server_version = crate::compat::POSTGRES_COMPAT_VERSION.to_string();
+        finish_authentication(client, &parameters).await?;
+
         Ok(())
     }
 }

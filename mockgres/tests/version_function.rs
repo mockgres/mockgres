@@ -13,7 +13,7 @@ async fn select_version_functions() {
         assert_eq!(rows[0].columns()[0].type_(), &Type::TEXT);
         let v: String = rows[0].get(0);
         assert!(
-            v.starts_with("PostgreSQL 15.0"),
+            v.starts_with(&format!("PostgreSQL {}", mockgres::POSTGRES_COMPAT_VERSION)),
             "unexpected version string: {v}"
         );
     }

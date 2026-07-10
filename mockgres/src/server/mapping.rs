@@ -1,5 +1,9 @@
 use pgwire::api::Type;
 
+use crate::compat::{
+    POSTGRES_COMPAT_VERSION, POSTGRES_COMPAT_VERSION_NUM,
+    server_version_string as compat_server_version_string,
+};
 use crate::engine::DataType;
 
 pub fn map_pg_type_to_datatype(t: &Type) -> Option<DataType> {
@@ -41,12 +45,13 @@ pub fn map_datatype_to_pg_type(dt: &DataType) -> Type {
 
 pub fn lookup_show_value(name: &str) -> Option<String> {
     match name {
-        "server_version" => Some("15.0".to_string()),
+        "server_version" => Some(POSTGRES_COMPAT_VERSION.to_string()),
+        "server_version_num" => Some(POSTGRES_COMPAT_VERSION_NUM.to_string()),
         "standard_conforming_strings" => Some("on".to_string()),
         _ => None,
     }
 }
 
 pub fn server_version_string() -> String {
-    "PostgreSQL 15.0 on mockgres".to_string()
+    compat_server_version_string()
 }

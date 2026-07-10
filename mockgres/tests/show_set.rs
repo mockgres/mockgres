@@ -18,7 +18,21 @@ async fn show_and_set_commands() {
             _ => None,
         })
         .expect("server_version row");
-    assert_eq!(value, "15.0");
+    assert_eq!(value, mockgres::POSTGRES_COMPAT_VERSION);
+
+    let messages = ctx
+        .client
+        .simple_query("show server_version_num")
+        .await
+        .expect("show server_version_num");
+    let value = messages
+        .iter()
+        .find_map(|msg| match msg {
+            SimpleQueryMessage::Row(row) => row.get(0).map(|s| s.to_string()),
+            _ => None,
+        })
+        .expect("server_version_num row");
+    assert_eq!(value, mockgres::POSTGRES_COMPAT_VERSION_NUM);
 
     let search_path = ctx
         .client

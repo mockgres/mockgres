@@ -13,10 +13,13 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
+    let database_name = resolve_database_name(&args)?;
     let addr = resolve_addr(args)?;
 
-    println!("mockgres listening on {addr}");
-    let handler = Arc::new(mockgres::Mockgres::default());
+    println!("mockgres listening on {addr} for database {database_name}");
+    let handler = Arc::new(mockgres::Mockgres::with_config(mockgres::ServerConfig {
+        database_name,
+    }));
 
     handler.serve(addr).await?;
 
@@ -28,6 +31,7 @@ struct CliArgs {
     addr: Option<String>,
     host: Option<String>,
     port: Option<u16>,
+    database: Option<String>,
 }
 
 enum CliCommand {
@@ -66,6 +70,9 @@ fn parse_args_from(args: impl IntoIterator<Item = String>) -> anyhow::Result<Cli
                     .parse::<u16>()
                     .map_err(|_| anyhow::anyhow!("invalid port: {raw}"))?;
                 parsed.port = Some(port);
+            }
+            "--database" => {
+                parsed.database = Some(next_arg_value("--database", &mut args)?);
             }
             _ => {
                 if arg.starts_with("--") {
@@ -114,6 +121,20 @@ fn resolve_addr(args: CliArgs) -> anyhow::Result<SocketAddr> {
         .map_err(|_| anyhow::anyhow!("invalid listen address: {addr_str}"))
 }
 
+fn resolve_database_name(args: &CliArgs) -> anyhow::Result<String> {
+    let database_name = args
+        .database
+        .clone()
+        .or_else(|| std::env::var("MOCKGRES_DATABASE").ok())
+        .unwrap_or_else(|| mockgres::ServerConfig::default().database_name);
+
+    if database_name.is_empty() {
+        return Err(anyhow::anyhow!("database name cannot be empty"));
+    }
+
+    Ok(database_name)
+}
+
 fn print_help() {
     println!(
         "\
@@ -128,11 +149,13 @@ Options:
   --addr <host:port>  Listen address (same as positional host:port)
   --host <host>       Listen host (default: 127.0.0.1)
   --port <port>       Listen port (default: 6543)
+  --database <name>   Accepted database name (default: postgres)
   -h, --help          Show this help and exit
   -V, --version       Show version and exit
 
 Environment:
-  MOCKGRES_ADDR       Listen address when no CLI address options are provided",
+  MOCKGRES_ADDR       Listen address when no CLI address options are provided
+  MOCKGRES_DATABASE   Accepted database name when --database is omitted",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -143,7 +166,7 @@ fn print_version() {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliCommand, parse_args_from, resolve_addr};
+    use super::{CliCommand, parse_args_from, resolve_addr, resolve_database_name};
 
     #[test]
     fn parse_help_flags() {
@@ -183,5 +206,25 @@ mod tests {
         };
         let addr = resolve_addr(args).expect("resolve addr");
         assert_eq!(addr.to_string(), "127.0.0.1:6543");
+    }
+
+    #[test]
+    fn parse_and_resolve_database() {
+        let cmd = parse_args_from(vec!["--database".to_string(), "regression".to_string()])
+            .expect("parse args");
+        let CliCommand::Run(args) = cmd else {
+            panic!("expected run command");
+        };
+        assert_eq!(resolve_database_name(&args).unwrap(), "regression");
+    }
+
+    #[test]
+    fn empty_database_is_rejected() {
+        let cmd =
+            parse_args_from(vec!["--database".to_string(), "".to_string()]).expect("parse args");
+        let CliCommand::Run(args) = cmd else {
+            panic!("expected run command");
+        };
+        assert!(resolve_database_name(&args).is_err());
     }
 }

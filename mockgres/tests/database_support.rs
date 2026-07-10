@@ -22,6 +22,10 @@ async fn database_routing_accepts_only_configured_name() {
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("connect to configured database");
+    assert_eq!(
+        connection.parameter("server_version"),
+        Some(mockgres::POSTGRES_COMPAT_VERSION)
+    );
     let bg = tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("connection error: {e}");
