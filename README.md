@@ -63,7 +63,7 @@ Testing covered pretty much exclusively by integration tests in the `tests` dire
 - Copy-on-write snapshots: global freeze + per-session sandboxes (`mockgres_freeze()`, `mockgres_reset()`)
 - types: int4/int8, float8, text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
 - Constraints/indices: primary key, unique, foreign key (cascade), create/drop index supported but no-op
-- Catalog: schemas, databases (create and drop not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
+- Catalog: schemas, in-memory database creation and routing (drop and alter not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
 - Wire protocol: simple and extended protocol
 
 ## Protocol Support Matrix

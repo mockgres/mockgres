@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io;
 use std::ops::DerefMut;
@@ -87,10 +88,11 @@ fn execution_tag(plan: &Plan, row_count: Option<usize>) -> Tag {
 #[derive(Clone)]
 pub struct Mockgres {
     pub db: Arc<RwLock<Db>>,
+    databases: Arc<RwLock<HashMap<String, Arc<RwLock<Db>>>>>,
     session_manager: Arc<SessionManager>,
     pub txn_manager: Arc<TransactionManager>,
     config: ServerConfig,
-    base_snapshot: Arc<RwLock<Option<Arc<RwLock<Db>>>>>,
+    base_snapshots: Arc<RwLock<HashMap<String, Arc<RwLock<Db>>>>>,
     advisory_locks: Arc<AdvisoryLockRegistry>,
 }
 
@@ -100,12 +102,15 @@ impl Mockgres {
     }
 
     pub fn new_with_config(db: Arc<RwLock<Db>>, config: ServerConfig) -> Self {
+        let mut databases = HashMap::new();
+        databases.insert(config.database_name.clone(), db.clone());
         Self {
             db,
+            databases: Arc::new(RwLock::new(databases)),
             session_manager: Arc::new(SessionManager::new()),
             txn_manager: Arc::new(TransactionManager::new()),
             config,
-            base_snapshot: Arc::new(RwLock::new(None)),
+            base_snapshots: Arc::new(RwLock::new(HashMap::new())),
             advisory_locks: Arc::new(AdvisoryLockRegistry::new()),
         }
     }
@@ -155,15 +160,15 @@ impl StartupHandler for Mockgres {
             .cloned()
             .filter(|name| !name.is_empty());
         let effective = requested.unwrap_or_else(|| self.config.database_name.clone());
-        if effective != self.config.database_name {
+        let database = self.databases.read().get(&effective).cloned();
+        let Some(database) = database else {
             return Err(fe_code(
                 "3D000",
                 format!("database \"{}\" does not exist", effective),
             ));
-        }
+        };
 
-        let session = self.init_session(client);
-        session.set_database_name(self.config.database_name.clone());
+        self.init_session(client, &effective, &database);
 
         let mut parameters = DefaultServerParameterProvider::default();
         parameters.server_version = crate::compat::POSTGRES_COMPAT_VERSION.to_string();
@@ -614,20 +619,41 @@ impl Mockgres {
         plan: &Plan,
         format: FieldFormat,
     ) -> PgWireResult<Option<Response>> {
+        if let Plan::CreateDatabase { name } = plan {
+            if session.current_tx().is_some() {
+                return Err(fe_code(
+                    "25001",
+                    "CREATE DATABASE cannot run inside a transaction block",
+                ));
+            }
+
+            let mut databases = self.databases.write();
+            if databases.contains_key(name) {
+                return Err(fe_code(
+                    "42P04",
+                    format!("database \"{name}\" already exists"),
+                ));
+            }
+            databases.insert(name.clone(), Arc::new(RwLock::new(Db::default())));
+            return Ok(Some(Response::Execution(Tag::new("CREATE DATABASE"))));
+        }
+
         let Plan::CallBuiltin { name, schema, .. } = plan else {
             return Ok(None);
         };
 
         if name == "mockgres_freeze" {
+            let database_name = self.database_name_for_session(session);
+            let shared_db = self.shared_database(&database_name);
+            let cloned = {
+                let db_read = shared_db.read();
+                db_read.clone()
+            };
             {
-                let mut guard = self.base_snapshot.write();
-                if guard.is_none() {
-                    let cloned = {
-                        let db_read = self.db.read();
-                        db_read.clone()
-                    };
-                    *guard = Some(Arc::new(RwLock::new(cloned)));
-                }
+                let mut snapshots = self.base_snapshots.write();
+                snapshots
+                    .entry(database_name)
+                    .or_insert_with(|| Arc::new(RwLock::new(cloned)));
             }
 
             let row = vec![Value::Bool(true)];
@@ -689,8 +715,10 @@ impl Mockgres {
             return override_db;
         }
 
-        // 2. If a frozen base exists, lazily clone it for this session
-        if let Some(base) = self.base_snapshot.read().as_ref() {
+        let database_name = self.database_name_for_session(session);
+
+        // 2. If a frozen base exists for this database, lazily clone it for this session
+        if let Some(base) = self.base_snapshots.read().get(&database_name).cloned() {
             let cloned = {
                 let base_read = base.read();
                 base_read.clone()
@@ -700,8 +728,22 @@ impl Mockgres {
             return arc;
         }
 
-        // 3. Pre-freeze: use shared db
-        self.db.clone()
+        // 3. Pre-freeze: use the database shared by all of its sessions
+        self.shared_database(&database_name)
+    }
+
+    fn database_name_for_session(&self, session: &Session) -> String {
+        session
+            .database_name()
+            .unwrap_or_else(|| self.config.database_name.clone())
+    }
+
+    fn shared_database(&self, name: &str) -> Arc<RwLock<Db>> {
+        self.databases
+            .read()
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| panic!("session references missing database {name}"))
     }
 
     fn session_for_client<C>(&self, client: &C) -> PgWireResult<Arc<Session>>
@@ -714,7 +756,12 @@ impl Mockgres {
             .ok_or_else(|| fe("session not initialized"))
     }
 
-    fn init_session<C>(&self, client: &mut C) -> Arc<Session>
+    fn init_session<C>(
+        &self,
+        client: &mut C,
+        database_name: &str,
+        database: &Arc<RwLock<Db>>,
+    ) -> Arc<Session>
     where
         C: ClientInfo,
     {
@@ -725,8 +772,9 @@ impl Mockgres {
             return existing;
         }
         let session = self.session_manager.create_session();
+        session.set_database_name(database_name.to_string());
         {
-            let db_read = self.db.read();
+            let db_read = database.read();
             if let Some(public_id) = db_read.catalog.schema_id("public") {
                 session.set_search_path(vec![public_id]);
             }

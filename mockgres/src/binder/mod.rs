@@ -1237,10 +1237,7 @@ fn bind_with_search_path(
                 returning_schema,
             })
         }
-        Plan::CreateDatabase { name } => Ok(Plan::UnsupportedDbDDL {
-            kind: DbDdlKind::Create,
-            name,
-        }),
+        Plan::CreateDatabase { .. } => Ok(p),
         Plan::DropDatabase { name } => Ok(Plan::UnsupportedDbDDL {
             kind: DbDdlKind::Drop,
             name,

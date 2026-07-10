@@ -1,5 +1,6 @@
 mod common;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio_postgres::error::SqlState;
@@ -70,17 +71,131 @@ async fn database_routing_accepts_only_configured_name() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn database_ddl_commands_are_rejected() {
+async fn create_database_enables_isolated_connections() {
+    let handler = Arc::new(mockgres::Mockgres::default());
+    let (addr, server_task, shutdown) = common::spawn_server(handler).await;
+    let (admin, admin_bg) = connect_client(addr, "postgres").await;
+
+    admin
+        .batch_execute(
+            "create table database_local(id int primary key);
+             insert into database_local values (1);",
+        )
+        .await
+        .expect("seed bootstrap database");
+
+    let affected = admin
+        .execute(
+            "create database regression
+             template=template0 encoding='UTF8'
+             locale='C' locale_provider='builtin'",
+            &[],
+        )
+        .await
+        .expect("create regression database");
+    assert_eq!(affected, 0);
+
+    let duplicate = admin
+        .execute("create database regression", &[])
+        .await
+        .expect_err("duplicate database should fail");
+    assert_eq!(
+        duplicate.as_db_error().expect("database error").code(),
+        &SqlState::DUPLICATE_DATABASE
+    );
+
+    let (regression, regression_bg) = connect_client(addr, "regression").await;
+    assert_eq!(
+        first_cell(&regression, "select current_database()").await,
+        "regression"
+    );
+
+    let missing_table = regression
+        .query("select id from database_local", &[])
+        .await
+        .expect_err("databases should have isolated catalogs");
+    assert_eq!(
+        missing_table.as_db_error().expect("database error").code(),
+        &SqlState::UNDEFINED_TABLE
+    );
+
+    regression
+        .batch_execute(
+            "create table database_local(id int primary key);
+             insert into database_local values (2);",
+        )
+        .await
+        .expect("seed created database");
+    assert_eq!(
+        first_cell(&admin, "select id from database_local").await,
+        "1"
+    );
+    assert_eq!(
+        first_cell(&regression, "select id from database_local").await,
+        "2"
+    );
+
+    drop(regression);
+    drop(admin);
+    let _ = shutdown.send(());
+    let _ = server_task.await;
+    let _ = regression_bg.await;
+    let _ = admin_bg.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_database_is_rejected_inside_transaction() {
     let ctx = common::start().await;
 
-    expect_feature_not_supported(
-        &ctx.client,
-        "create database foo",
-        "CREATE DATABASE is not supported",
-    )
-    .await;
+    ctx.client.batch_execute("begin").await.expect("begin");
+    let err = ctx
+        .client
+        .execute("create database transacted", &[])
+        .await
+        .expect_err("CREATE DATABASE in a transaction should fail");
+    assert_eq!(
+        err.as_db_error().expect("database error").code(),
+        &SqlState::ACTIVE_SQL_TRANSACTION
+    );
+    ctx.client
+        .batch_execute("rollback")
+        .await
+        .expect("rollback");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_and_alter_database_are_rejected() {
+    let ctx = common::start().await;
+
     expect_feature_not_supported(&ctx.client, "drop database foo", "DROP DATABASE").await;
     expect_feature_not_supported(&ctx.client, "alter database foo", "ALTER DATABASE").await;
+}
+
+async fn connect_client(addr: SocketAddr, database: &str) -> (Client, tokio::task::JoinHandle<()>) {
+    let conn_str = format!(
+        "host={} port={} user=postgres dbname={database}",
+        addr.ip(),
+        addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .unwrap_or_else(|err| panic!("connect to {database}: {err}"));
+    let bg = tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("connection error: {err}");
+        }
+    });
+    (client, bg)
+}
+
+async fn first_cell(client: &Client, sql: &str) -> String {
+    let rows = client.simple_query(sql).await.expect("simple query");
+    rows.iter()
+        .find_map(|message| match message {
+            SimpleQueryMessage::Row(row) => row.get(0).map(str::to_string),
+            _ => None,
+        })
+        .expect("first cell")
 }
 
 async fn expect_feature_not_supported(client: &Client, sql: &str, snippet: &str) {
