@@ -5,9 +5,10 @@ use crate::engine::{
 };
 use pg_query::protobuf::{
     AlterDatabaseSetStmt, AlterDatabaseStmt, AlterTableStmt, AlterTableType, Constraint,
-    CreateSchemaStmt, CreateStmt, CreatedbStmt, DropBehavior, DropStmt, DropdbStmt, IndexStmt,
-    ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt, VariableSetKind,
-    VariableSetStmt, VariableShowStmt,
+    CreateSchemaStmt, CreateStmt, CreateTableSpaceStmt, CreatedbStmt, DropBehavior, DropStmt,
+    DropTableSpaceStmt, DropdbStmt, GrantStmt, GrantTargetType, IndexStmt, ObjectType, RangeVar,
+    RenameStmt, TransactionStmt, TruncateStmt, VacuumStmt, VariableSetKind, VariableSetStmt,
+    VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -346,6 +347,71 @@ pub(super) fn plan_create_schema(stmt: CreateSchemaStmt) -> PgWireResult<Plan> {
     })
 }
 
+pub(super) fn plan_grant(stmt: GrantStmt) -> PgWireResult<Plan> {
+    let target =
+        GrantTargetType::try_from(stmt.targtype).map_err(|_| fe("unknown GRANT target type"))?;
+    let object_type =
+        ObjectType::try_from(stmt.objtype).map_err(|_| fe("unknown GRANT object type"))?;
+    if target != GrantTargetType::AclTargetObject || object_type != ObjectType::ObjectSchema {
+        return Err(fe_code(
+            "0A000",
+            "only GRANT or REVOKE privileges on schemas is supported",
+        ));
+    }
+    if stmt.objects.is_empty() {
+        return Err(fe("GRANT or REVOKE requires at least one schema"));
+    }
+
+    let mut schemas = Vec::with_capacity(stmt.objects.len());
+    for object in stmt.objects {
+        let Some(pg_query::NodeEnum::String(name)) = object.node else {
+            return Err(fe("invalid schema name in GRANT or REVOKE"));
+        };
+        schemas.push(SchemaName::new(name.sval));
+    }
+    Ok(Plan::GrantSchema {
+        schemas,
+        is_grant: stmt.is_grant,
+    })
+}
+
+pub(super) fn plan_create_tablespace(stmt: CreateTableSpaceStmt) -> PgWireResult<Plan> {
+    if stmt.tablespacename.trim().is_empty() {
+        return Err(fe("tablespace name required"));
+    }
+    Ok(Plan::CreateTablespace {
+        name: stmt.tablespacename,
+        location: stmt.location,
+    })
+}
+
+pub(super) fn plan_drop_tablespace(stmt: DropTableSpaceStmt) -> PgWireResult<Plan> {
+    if stmt.tablespacename.trim().is_empty() {
+        return Err(fe("tablespace name required"));
+    }
+    Ok(Plan::DropTablespace {
+        name: stmt.tablespacename,
+        if_exists: stmt.missing_ok,
+    })
+}
+
+pub(super) fn plan_vacuum(stmt: VacuumStmt) -> PgWireResult<Plan> {
+    let mut tables = Vec::with_capacity(stmt.rels.len());
+    for relation in stmt.rels {
+        let Some(pg_query::NodeEnum::VacuumRelation(relation)) = relation.node else {
+            return Err(fe("invalid VACUUM or ANALYZE relation"));
+        };
+        let range_var = relation
+            .relation
+            .ok_or_else(|| fe("VACUUM or ANALYZE requires a relation"))?;
+        tables.push(range_var_to_obj_name(&range_var));
+    }
+    Ok(Plan::Vacuum {
+        tables,
+        is_vacuum: stmt.is_vacuumcmd,
+    })
+}
+
 pub(super) fn plan_create_database(stmt: CreatedbStmt) -> PgWireResult<Plan> {
     let name = require_database_name(&stmt.dbname)?;
     Ok(Plan::CreateDatabase { name })
@@ -453,6 +519,8 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let supported = matches!(
         normalized.as_str(),
         "client_min_messages"
+            | "synchronous_commit"
+            | "allow_in_place_tablespaces"
             | "search_path"
             | "timezone"
             | "time_zone"

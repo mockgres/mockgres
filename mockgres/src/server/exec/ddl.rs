@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -539,6 +540,110 @@ pub(crate) fn build_ddl_executor(
             Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("ALTER SCHEMA".into()),
+                None,
+            ))
+        }
+        Plan::GrantSchema { schemas, is_grant } => {
+            let db_read = db.read();
+            for schema in schemas {
+                if db_read.catalog.schema_entry(schema.as_str()).is_none() {
+                    return Err(fe_code(
+                        "3F000",
+                        format!("schema \"{}\" does not exist", schema.as_str()),
+                    ));
+                }
+            }
+            drop(db_read);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some(if *is_grant { "GRANT" } else { "REVOKE" }.into()),
+                None,
+            ))
+        }
+        Plan::CreateTablespace { name, location } => {
+            if session.current_tx().is_some() {
+                return Err(fe_code(
+                    "25001",
+                    "CREATE TABLESPACE cannot run inside a transaction block",
+                ));
+            }
+            if location.contains('\'') {
+                return Err(fe_code(
+                    "42602",
+                    "tablespace location cannot contain single quotes",
+                ));
+            }
+            let in_place = location.is_empty() && session.allow_in_place_tablespaces();
+            if !in_place && !Path::new(location).is_absolute() {
+                return Err(fe_code(
+                    "42P17",
+                    "tablespace location must be an absolute path",
+                ));
+            }
+            let mut db_write = db.write();
+            if db_write.catalog.tablespace(name).is_some() {
+                return Err(fe_code(
+                    "42710",
+                    format!("tablespace \"{name}\" already exists"),
+                ));
+            }
+            db_write
+                .catalog
+                .insert_tablespace(name.clone(), location.clone());
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("CREATE TABLESPACE".into()),
+                None,
+            ))
+        }
+        Plan::DropTablespace { name, if_exists } => {
+            if session.current_tx().is_some() {
+                return Err(fe_code(
+                    "25001",
+                    "DROP TABLESPACE cannot run inside a transaction block",
+                ));
+            }
+            if matches!(name.as_str(), "pg_default" | "pg_global") {
+                return Err(fe_code(
+                    "42501",
+                    format!("permission denied for tablespace {name}"),
+                ));
+            }
+            let mut db_write = db.write();
+            if db_write.catalog.remove_tablespace(name).is_none() && !if_exists {
+                return Err(fe_code(
+                    "42704",
+                    format!("tablespace \"{name}\" does not exist"),
+                ));
+            }
+            drop(db_write);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some("DROP TABLESPACE".into()),
+                None,
+            ))
+        }
+        Plan::Vacuum { tables, is_vacuum } => {
+            if *is_vacuum && session.current_tx().is_some() {
+                return Err(fe_code(
+                    "25001",
+                    "VACUUM cannot run inside a transaction block",
+                ));
+            }
+            let db_read = db.read();
+            for table in tables {
+                if resolve_table_schema(&db_read, session, table)?.is_none() {
+                    return Err(fe_code(
+                        "42P01",
+                        format!("relation \"{}\" does not exist", table.name),
+                    ));
+                }
+            }
+            drop(db_read);
+            Ok((
+                Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                Some(if *is_vacuum { "VACUUM" } else { "ANALYZE" }.into()),
                 None,
             ))
         }

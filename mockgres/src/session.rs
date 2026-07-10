@@ -150,6 +150,8 @@ pub struct SessionState {
     pub default_txn_isolation: TransactionIsolation,
     pub txn_isolation: Option<TransactionIsolation>,
     pub lock_timeout: Option<Duration>,
+    pub synchronous_commit: String,
+    pub allow_in_place_tablespaces: bool,
 }
 
 impl Default for SessionState {
@@ -170,6 +172,8 @@ impl Default for SessionState {
             default_txn_isolation: TransactionIsolation::ReadCommitted,
             txn_isolation: None,
             lock_timeout: None,
+            synchronous_commit: "on".to_string(),
+            allow_in_place_tablespaces: false,
         }
     }
 }
@@ -337,6 +341,22 @@ impl Session {
 
     pub fn lock_timeout(&self) -> Option<Duration> {
         self.state.lock().lock_timeout
+    }
+
+    pub fn set_synchronous_commit(&self, value: String) {
+        self.state.lock().synchronous_commit = value;
+    }
+
+    pub fn synchronous_commit(&self) -> String {
+        self.state.lock().synchronous_commit.clone()
+    }
+
+    pub fn set_allow_in_place_tablespaces(&self, value: bool) {
+        self.state.lock().allow_in_place_tablespaces = value;
+    }
+
+    pub fn allow_in_place_tablespaces(&self) -> bool {
+        self.state.lock().allow_in_place_tablespaces
     }
 
     pub fn set_statement_time_micros(&self, micros: i64) {

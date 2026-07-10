@@ -73,6 +73,12 @@ pub struct CheckConstraintMeta {
 }
 
 #[derive(Clone, Debug)]
+pub struct TablespaceMeta {
+    pub name: String,
+    pub location: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct TableMeta {
     pub id: TableId,
     pub schema: SchemaName,
@@ -96,15 +102,27 @@ pub struct Catalog {
     pub schemas_by_name: HashMap<String, SchemaId>,
     pub schemas: HashMap<SchemaId, SchemaEntry>,
     pub tables_by_id: HashMap<TableId, TableMeta>,
+    pub tablespaces: HashMap<String, TablespaceMeta>,
     next_schema_id: SchemaId,
 }
 
 impl Default for Catalog {
     fn default() -> Self {
+        let mut tablespaces = HashMap::new();
+        for name in ["pg_default", "pg_global"] {
+            tablespaces.insert(
+                name.to_string(),
+                TablespaceMeta {
+                    name: name.to_string(),
+                    location: String::new(),
+                },
+            );
+        }
         Self {
             schemas_by_name: HashMap::new(),
             schemas: HashMap::new(),
             tables_by_id: HashMap::new(),
+            tablespaces,
             next_schema_id: 1,
         }
     }
@@ -215,5 +233,18 @@ impl Catalog {
             self.schemas_by_name
                 .insert(entry.name.as_str().to_string(), schema_id);
         }
+    }
+
+    pub fn tablespace(&self, name: &str) -> Option<&TablespaceMeta> {
+        self.tablespaces.get(name)
+    }
+
+    pub fn insert_tablespace(&mut self, name: String, location: String) {
+        self.tablespaces
+            .insert(name.clone(), TablespaceMeta { name, location });
+    }
+
+    pub fn remove_tablespace(&mut self, name: &str) -> Option<TablespaceMeta> {
+        self.tablespaces.remove(name)
     }
 }

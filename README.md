@@ -77,6 +77,7 @@ details. The upstream suite uses a fresh shared database and does not invoke
 - types: int4/int8, float8, text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)
 - Constraints/indices: primary key, unique, foreign key (cascade), create/drop index supported but no-op
 - Catalog: schemas, in-memory database creation and routing (drop and alter not supported), table create/drop, ALTER TABLE, `pg_catalog.pg_namespace`, `pg_catalog.pg_type` seeded for builtin types
+- Regression setup utilities: stateful `synchronous_commit` and `allow_in_place_tablespaces`; schema `GRANT`/`REVOKE` accepted as authorization no-ops; tablespace names tracked while physical storage remains a no-op; `VACUUM`/`ANALYZE` validate targets but require no disk maintenance
 - Wire protocol: simple and extended protocol
 
 ## Protocol Support Matrix

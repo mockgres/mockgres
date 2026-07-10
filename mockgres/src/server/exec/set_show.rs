@@ -41,6 +41,14 @@ pub(crate) fn build_set_show_executor(
                 session.default_txn_isolation().as_str().to_string()
             } else if normalized == "lock_timeout" {
                 format_lock_timeout(session.lock_timeout())
+            } else if normalized == "synchronous_commit" {
+                session.synchronous_commit()
+            } else if normalized == "allow_in_place_tablespaces" {
+                if session.allow_in_place_tablespaces() {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
             } else {
                 match lookup_show_value(&normalized) {
                     Some(v) => v,
@@ -88,6 +96,24 @@ pub(crate) fn build_set_show_executor(
                     }
                 };
                 session.set_search_path(schema_ids);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
+            "synchronous_commit" => {
+                let setting = parse_synchronous_commit(value)?;
+                session.set_synchronous_commit(setting);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
+            "allow_in_place_tablespaces" => {
+                let setting = parse_bool_setting(name, value, false)?;
+                session.set_allow_in_place_tablespaces(setting);
                 Ok((
                     Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                     Some("SET".into()),
@@ -163,6 +189,47 @@ pub(crate) fn build_set_show_executor(
             _ => Err(fe_code("0A000", format!("SET {} not supported", name))),
         },
         _ => unreachable!("non set/show plan routed to build_set_show_executor"),
+    }
+}
+
+fn parse_synchronous_commit(value: &Option<Vec<String>>) -> PgWireResult<String> {
+    let Some(values) = value else {
+        return Ok("on".to_string());
+    };
+    if values.len() != 1 {
+        return Err(fe("SET synchronous_commit requires a single value"));
+    }
+    let normalized = values[0].trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "on" | "off" | "local" | "remote_write" | "remote_apply" => Ok(normalized),
+        _ => Err(fe_code(
+            "22023",
+            format!(
+                "invalid value for parameter \"synchronous_commit\": \"{}\"",
+                values[0]
+            ),
+        )),
+    }
+}
+
+fn parse_bool_setting(
+    name: &str,
+    value: &Option<Vec<String>>,
+    default: bool,
+) -> PgWireResult<bool> {
+    let Some(values) = value else {
+        return Ok(default);
+    };
+    if values.len() != 1 {
+        return Err(fe(format!("SET {name} requires a single value")));
+    }
+    match values[0].trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        _ => Err(fe_code(
+            "22023",
+            format!("invalid value for parameter \"{name}\": \"{}\"", values[0]),
+        )),
     }
 }
 

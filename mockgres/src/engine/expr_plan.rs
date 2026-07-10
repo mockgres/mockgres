@@ -488,6 +488,22 @@ pub enum Plan {
         name: SchemaName,
         new_name: SchemaName,
     },
+    GrantSchema {
+        schemas: Vec<SchemaName>,
+        is_grant: bool,
+    },
+    CreateTablespace {
+        name: String,
+        location: String,
+    },
+    DropTablespace {
+        name: String,
+        if_exists: bool,
+    },
+    Vacuum {
+        tables: Vec<ObjName>,
+        is_vacuum: bool,
+    },
     AlterTableRename {
         table: ObjName,
         new_name: String,
@@ -649,6 +665,10 @@ impl Plan {
             | Plan::CreateSchema { .. }
             | Plan::DropSchema { .. }
             | Plan::AlterSchemaRename { .. }
+            | Plan::GrantSchema { .. }
+            | Plan::CreateTablespace { .. }
+            | Plan::DropTablespace { .. }
+            | Plan::Vacuum { .. }
             | Plan::CreateDatabase { .. }
             | Plan::DropDatabase { .. }
             | Plan::AlterDatabase { .. }

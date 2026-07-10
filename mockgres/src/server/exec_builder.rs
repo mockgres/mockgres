@@ -83,6 +83,18 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::CreateSchema { .. } => "CREATE SCHEMA",
         Plan::DropSchema { .. } => "DROP SCHEMA",
         Plan::AlterSchemaRename { .. } => "ALTER SCHEMA",
+        Plan::GrantSchema { is_grant: true, .. } => "GRANT",
+        Plan::GrantSchema {
+            is_grant: false, ..
+        } => "REVOKE",
+        Plan::CreateTablespace { .. } => "CREATE TABLESPACE",
+        Plan::DropTablespace { .. } => "DROP TABLESPACE",
+        Plan::Vacuum {
+            is_vacuum: true, ..
+        } => "VACUUM",
+        Plan::Vacuum {
+            is_vacuum: false, ..
+        } => "ANALYZE",
         Plan::CreateDatabase { .. } => "CREATE DATABASE",
         Plan::DropDatabase { .. } => "DROP DATABASE",
         Plan::AlterDatabase { .. } => "ALTER DATABASE",
@@ -157,6 +169,10 @@ pub fn build_executor(
         | Plan::CreateSchema { .. }
         | Plan::DropSchema { .. }
         | Plan::AlterSchemaRename { .. }
+        | Plan::GrantSchema { .. }
+        | Plan::CreateTablespace { .. }
+        | Plan::DropTablespace { .. }
+        | Plan::Vacuum { .. }
         | Plan::UnsupportedDbDDL { .. }
         | Plan::CreateDatabase { .. }
         | Plan::DropDatabase { .. }
