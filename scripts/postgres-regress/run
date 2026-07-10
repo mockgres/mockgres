@@ -112,7 +112,7 @@ if [ ! -x "$psql_bin" ]; then
   exit 2
 fi
 
-psql_version="$("$psql_bin" --version)"
+psql_version="$("$psql_bin" --version </dev/null)"
 psql_major="$(printf '%s\n' "$psql_version" | awk '{print $3}' | cut -d. -f1)"
 if [ "$psql_major" != "18" ]; then
   if [ "${MOCKGRES_ALLOW_PSQL_VERSION_MISMATCH:-0}" != "1" ]; then
@@ -209,7 +209,7 @@ server_pid=$!
 
 ready=no
 for _ in $(seq 1 200); do
-  if "$psql_bin" -X -d postgres -Atqc 'select 1' >/dev/null 2>&1; then
+  if "$psql_bin" -X -d postgres -Atqc 'select 1' </dev/null >/dev/null 2>&1; then
     ready=yes
     break
   fi
@@ -226,7 +226,7 @@ if [ "$ready" != "yes" ]; then
 fi
 
 create_database_sql="CREATE DATABASE regression TEMPLATE=template0 ENCODING='UTF8' LOCALE='C' LOCALE_PROVIDER='builtin'"
-if ! "$psql_bin" -X -d postgres -v ON_ERROR_STOP=1 -q -c "$create_database_sql" >"$setup_log" 2>&1; then
+if ! "$psql_bin" -X -d postgres -v ON_ERROR_STOP=1 -q -c "$create_database_sql" </dev/null >"$setup_log" 2>&1; then
   echo "failed to create regression database; see $setup_log" >&2
   sed -n '1,120p' "$setup_log" >&2
   exit 2
@@ -310,7 +310,7 @@ while IFS= read -r test_name; do
 
   if ! kill -0 "$server_pid" 2>/dev/null; then
     status=CRASHED
-  elif ! "$psql_bin" -X -d postgres -Atqc 'select 1' >/dev/null 2>&1; then
+  elif ! "$psql_bin" -X -d postgres -Atqc 'select 1' </dev/null >/dev/null 2>&1; then
     status=CRASHED
   elif [ "$psql_exit" -eq 124 ]; then
     status=TIMEOUT

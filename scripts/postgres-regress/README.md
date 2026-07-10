@@ -12,6 +12,18 @@ schedule serially while compatibility work is in progress.
 - `timeout` on Linux or `gtimeout` on macOS when per-test timeouts are desired
 
 Set `MOCKGRES_PSQL=/path/to/psql` when PostgreSQL 18 is not first on `PATH`.
+Alternatively, use the pinned major/minor client from the official Docker image:
+
+```bash
+docker pull postgres:18.4
+MOCKGRES_PSQL=scripts/postgres-regress/psql-docker \
+  scripts/postgres-regress/run test_setup
+```
+
+The wrapper defaults to `postgres:18.4`; override it with
+`MOCKGRES_POSTGRES_IMAGE`. It uses host networking and mounts this repository
+read-only at the same absolute path so psql variables continue to resolve to
+the vendored regression files.
 
 ## Usage
 

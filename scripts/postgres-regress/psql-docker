@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
+image="${MOCKGRES_POSTGRES_IMAGE:-postgres:18.4}"
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker is required to run containerized PostgreSQL psql" >&2
+  exit 127
+fi
+
+docker_args=(
+  run --rm -i
+  --network host
+  --volume "${repo_root}:${repo_root}:ro"
+  --workdir "$repo_root"
+)
+
+for name in \
+  PGHOST PGHOSTADDR PGPORT PGUSER PGDATABASE PGAPPNAME \
+  PGCONNECT_TIMEOUT PGCLIENTENCODING PGOPTIONS PGTZ PGDATESTYLE \
+  PG_ABS_SRCDIR PG_ABS_BUILDDIR LANG LC_MESSAGES; do
+  if [ -n "${!name+x}" ]; then
+    docker_args+=(--env "$name")
+  fi
+done
+
+exec docker "${docker_args[@]}" "$image" \
+  bash -c 'exec psql "$@" 2>&1' bash "$@"
