@@ -47,6 +47,19 @@ You can technically run it by embedding it as a library, all you really need to 
   - `cargo test --workspace`
 Testing covered pretty much exclusively by integration tests in the `tests` directory.
 
+PostgreSQL 18.4's core regression SQL, expected output, and fixture data are
+pinned under `vendor/postgres-18.4`. Run selected tests with:
+
+```bash
+scripts/postgres-regress/run boolean int4
+```
+
+Run the complete schedule by omitting test names. The runner requires a
+PostgreSQL 18 `psql` client and writes results, diffs, status, and server logs
+under `target/postgres-regress`. See `scripts/postgres-regress/README.md` for
+details. The upstream suite uses a fresh shared database and does not invoke
+`mockgres_freeze()` or `mockgres_reset()`.
+
 ## Features
 - Supported SQL surface (SELECT/INSERT/UPDATE/DELETE, joins, ON CONFLICT, etc.).
 - PG wire protocol compatibility expectations.

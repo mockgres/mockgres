@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/postgres-regress/run [test_name ...]
+       scripts/postgres-regress/run --list
+
+With no test names, runs PostgreSQL's complete core parallel_schedule in
+serial order. With names, test_setup is run first and then the requested tests.
+
+Environment:
+  MOCKGRES_BIN                   Server binary (default: target/debug/mockgres)
+  MOCKGRES_PSQL                  PostgreSQL 18 psql binary (default: psql)
+  MOCKGRES_ALLOW_PSQL_VERSION_MISMATCH=1
+                                 Allow a non-18 psql for harness development
+  MOCKGRES_REGRESS_TIMEOUT       Per-test timeout in seconds (default: 60)
+  MOCKGRES_REGRESS_ALLOW_FAILURES=1
+                                 Exit successfully even when tests differ
+  PGPORT                         Server port (default: an ephemeral port)
+  OUTDIR                         Artifact directory (default: target/postgres-regress/...)
+  STOP_AFTER                     Stop after this test name
+  DIFF_PREVIEW_LINES             Failed-diff preview length (default: 40)
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
+postgres_version=18.4
+vendor_root="${repo_root}/vendor/postgres-${postgres_version}"
+regress_root="${vendor_root}/regress"
+sql_dir="${regress_root}/sql"
+expected_dir="${regress_root}/expected"
+schedule="${regress_root}/parallel_schedule"
+reporter="${script_dir}/report.py"
+
+for required in "$sql_dir" "$expected_dir" "$schedule" "$reporter" "${vendor_root}/COPYRIGHT"; do
+  if [ ! -e "$required" ]; then
+    echo "missing PostgreSQL regression asset: $required" >&2
+    exit 2
+  fi
+done
+
+list_schedule() {
+  awk '/^test:/ { for (i = 2; i <= NF; i++) print $i }' "$schedule"
+}
+
+if [ "${1:-}" = "--list" ]; then
+  list_schedule
+  exit 0
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required" >&2
+  exit 2
+fi
+
+tmpbase="${TMPDIR:-/tmp}"
+tmpbase="${tmpbase%/}"
+order_file="$(mktemp "${tmpbase}/mockgres-regress-order.XXXXXX")"
+cleanup_order() {
+  rm -f "$order_file"
+}
+trap cleanup_order EXIT
+
+if [ "$#" -eq 0 ]; then
+  list_schedule >"$order_file"
+else
+  printf '%s\n' test_setup >"$order_file"
+  for test_name in "$@"; do
+    if [ "$test_name" != "test_setup" ]; then
+      printf '%s\n' "$test_name" >>"$order_file"
+    fi
+  done
+fi
+
+deduplicated_order="${order_file}.deduplicated"
+awk '!seen[$0]++' "$order_file" >"$deduplicated_order"
+mv "$deduplicated_order" "$order_file"
+
+while IFS= read -r test_name; do
+  case "$test_name" in
+    ""|*[!A-Za-z0-9_.-]*)
+      echo "invalid regression test name: $test_name" >&2
+      exit 2
+      ;;
+  esac
+  if [ ! -f "${sql_dir}/${test_name}.sql" ]; then
+    echo "unknown regression test: $test_name" >&2
+    exit 2
+  fi
+done <"$order_file"
+
+if [ -n "${MOCKGRES_PSQL:-}" ]; then
+  psql_bin="$MOCKGRES_PSQL"
+elif command -v psql >/dev/null 2>&1; then
+  psql_bin="$(command -v psql)"
+else
+  echo "PostgreSQL 18 psql was not found; set MOCKGRES_PSQL" >&2
+  exit 2
+fi
+
+if [ ! -x "$psql_bin" ]; then
+  echo "psql is not executable: $psql_bin" >&2
+  exit 2
+fi
+
+psql_version="$("$psql_bin" --version)"
+psql_major="$(printf '%s\n' "$psql_version" | awk '{print $3}' | cut -d. -f1)"
+if [ "$psql_major" != "18" ]; then
+  if [ "${MOCKGRES_ALLOW_PSQL_VERSION_MISMATCH:-0}" != "1" ]; then
+    echo "PostgreSQL 18 psql is required, found: $psql_version" >&2
+    echo "set MOCKGRES_PSQL or use MOCKGRES_ALLOW_PSQL_VERSION_MISMATCH=1 for harness development" >&2
+    exit 2
+  fi
+  echo "warning: expected PostgreSQL 18 psql, found: $psql_version" >&2
+fi
+
+if [ -n "${MOCKGRES_BIN:-}" ]; then
+  mockgres_bin="$MOCKGRES_BIN"
+  if [ ! -x "$mockgres_bin" ]; then
+    echo "Mockgres binary is not executable: $mockgres_bin" >&2
+    exit 2
+  fi
+else
+  (cd "$repo_root" && cargo build -p mockgres --bin mockgres)
+  mockgres_bin="${repo_root}/target/debug/mockgres"
+fi
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin="$(command -v timeout)"
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin="$(command -v gtimeout)"
+else
+  timeout_bin=""
+  echo "warning: timeout utility not found; per-test timeouts are disabled" >&2
+fi
+
+if [ -n "${PGPORT:-}" ]; then
+  port="$PGPORT"
+else
+  port="$(python3 - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+)"
+fi
+
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+outdir="${OUTDIR:-${repo_root}/target/postgres-regress/${postgres_version}/${run_id}}"
+results_dir="${outdir}/results"
+diffs_dir="${outdir}/diffs"
+status_file="${outdir}/status.tsv"
+summary_file="${outdir}/summary.json"
+server_log="${outdir}/mockgres.log"
+setup_log="${outdir}/create-database.log"
+mkdir -p "$results_dir" "$diffs_dir"
+printf 'test\tstatus\tdiff_lines\texpected\tpsql_exit\tduration_seconds\n' >"$status_file"
+
+unset PGDATABASE PGSERVICE PGSERVICEFILE PGPASSFILE PGPASSWORD
+unset PGHOSTADDR PGREQUIRESSL PGSSLMODE PGSSLROOTCERT
+export PGHOST=127.0.0.1
+export PGPORT="$port"
+export PGUSER=postgres
+export PGAPPNAME=mockgres_regress
+export PGCONNECT_TIMEOUT=2
+export PGCLIENTENCODING=UTF8
+export PG_ABS_SRCDIR="$regress_root"
+export PG_ABS_BUILDDIR="$outdir"
+export PGTZ="${PGTZ:-America/Los_Angeles}"
+export PGDATESTYLE="${PGDATESTYLE:-Postgres, MDY}"
+export LANG=C
+export LC_MESSAGES=C
+unset LC_ALL LC_COLLATE LC_CTYPE LC_MONETARY LC_NUMERIC LC_TIME LANGUAGE
+export PGOPTIONS="${PGOPTIONS:-} -c intervalstyle=postgres_verbose"
+
+server_pid=""
+cleanup() {
+  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.05
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+      kill -9 "$server_pid" 2>/dev/null || true
+    fi
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  cleanup_order
+}
+trap cleanup EXIT
+
+"$mockgres_bin" --host 127.0.0.1 --port "$port" --database postgres >"$server_log" 2>&1 &
+server_pid=$!
+
+ready=no
+for _ in $(seq 1 200); do
+  if "$psql_bin" -X -d postgres -Atqc 'select 1' >/dev/null 2>&1; then
+    ready=yes
+    break
+  fi
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    echo "Mockgres exited during startup; see $server_log" >&2
+    sed -n '1,120p' "$server_log" >&2
+    exit 2
+  fi
+  sleep 0.05
+done
+if [ "$ready" != "yes" ]; then
+  echo "Mockgres did not become ready; see $server_log" >&2
+  exit 2
+fi
+
+create_database_sql="CREATE DATABASE regression TEMPLATE=template0 ENCODING='UTF8' LOCALE='C' LOCALE_PROVIDER='builtin'"
+if ! "$psql_bin" -X -d postgres -v ON_ERROR_STOP=1 -q -c "$create_database_sql" >"$setup_log" 2>&1; then
+  echo "failed to create regression database; see $setup_log" >&2
+  sed -n '1,120p' "$setup_log" >&2
+  exit 2
+fi
+
+echo "PostgreSQL regression assets: $postgres_version"
+echo "psql client: $psql_version"
+echo "artifacts: $outdir"
+
+test_timeout="${MOCKGRES_REGRESS_TIMEOUT:-60}"
+diff_preview_lines="${DIFF_PREVIEW_LINES:-40}"
+libdir='$libdir'
+dlsuffix='.so'
+aborted=no
+
+while IFS= read -r test_name; do
+  sql_file="${sql_dir}/${test_name}.sql"
+  result_file="${results_dir}/${test_name}.out"
+  diff_file="${diffs_dir}/${test_name}.diff"
+  candidate_diff="${outdir}/.candidate.diff"
+  start_seconds="$(date +%s)"
+
+  set +e
+  if [ -n "$timeout_bin" ]; then
+    "$timeout_bin" "${test_timeout}s" "$psql_bin" \
+      -X -a -q -d regression \
+      -v HIDE_TABLEAM=on \
+      -v HIDE_TOAST_COMPRESSION=on \
+      -v "abs_srcdir=$regress_root" \
+      -v "abs_builddir=$outdir" \
+      -v "libdir=$libdir" \
+      -v "dlsuffix=$dlsuffix" \
+      <"$sql_file" >"$result_file" 2>&1
+  else
+    "$psql_bin" \
+      -X -a -q -d regression \
+      -v HIDE_TABLEAM=on \
+      -v HIDE_TOAST_COMPRESSION=on \
+      -v "abs_srcdir=$regress_root" \
+      -v "abs_builddir=$outdir" \
+      -v "libdir=$libdir" \
+      -v "dlsuffix=$dlsuffix" \
+      <"$sql_file" >"$result_file" 2>&1
+  fi
+  psql_exit=$?
+  set -e
+
+  end_seconds="$(date +%s)"
+  duration_seconds=$((end_seconds - start_seconds))
+  best_expected=""
+  best_diff_lines=999999999
+
+  for expected_file in \
+    "${expected_dir}/${test_name}.out" \
+    "${expected_dir}/${test_name}_"[0-9].out; do
+    if [ ! -f "$expected_file" ]; then
+      continue
+    fi
+    set +e
+    diff -u "$expected_file" "$result_file" >"$candidate_diff"
+    diff_exit=$?
+    set -e
+    if [ "$diff_exit" -eq 0 ]; then
+      candidate_lines=0
+    else
+      candidate_lines="$(wc -l <"$candidate_diff" | tr -d ' ')"
+    fi
+    if [ "$candidate_lines" -lt "$best_diff_lines" ]; then
+      best_expected="$expected_file"
+      best_diff_lines="$candidate_lines"
+      cp "$candidate_diff" "$diff_file"
+    fi
+  done
+  rm -f "$candidate_diff"
+
+  if [ -z "$best_expected" ]; then
+    best_expected="missing"
+    best_diff_lines=-1
+    printf 'No expected output found for %s\n' "$test_name" >"$diff_file"
+  fi
+
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    status=CRASHED
+  elif ! "$psql_bin" -X -d postgres -Atqc 'select 1' >/dev/null 2>&1; then
+    status=CRASHED
+  elif [ "$psql_exit" -eq 124 ]; then
+    status=TIMEOUT
+  elif [ "$psql_exit" -ne 0 ]; then
+    status=PSQL_FAIL
+  elif [ "$best_diff_lines" -eq 0 ]; then
+    status=PASS
+  else
+    status=FAIL
+  fi
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$test_name" "$status" "$best_diff_lines" "$best_expected" \
+    "$psql_exit" "$duration_seconds" | tee -a "$status_file"
+
+  if [ "$status" = "FAIL" ] && [ "$diff_preview_lines" -gt 0 ]; then
+    sed -n "1,${diff_preview_lines}p" "$diff_file" >&2
+  fi
+
+  if [ "$status" = "CRASHED" ] || [ "$status" = "TIMEOUT" ]; then
+    aborted=yes
+    break
+  fi
+  if [ -n "${STOP_AFTER:-}" ] && [ "$STOP_AFTER" = "$test_name" ]; then
+    break
+  fi
+done <"$order_file"
+
+python3 "$reporter" "$status_file" "$summary_file" "$postgres_version"
+
+if [ "$aborted" = "yes" ]; then
+  exit 1
+fi
+if [ "${MOCKGRES_REGRESS_ALLOW_FAILURES:-0}" = "1" ]; then
+  exit 0
+fi
+if awk -F'\t' 'NR > 1 && $2 != "PASS" { failed = 1 } END { exit failed ? 0 : 1 }' "$status_file"; then
+  exit 1
+fi
