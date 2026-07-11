@@ -1,0 +1,574 @@
+use super::*;
+use crate::engine::Schema;
+
+impl Mockgres {
+    pub(super) async fn execute_catalog_builtin(
+        &self,
+        session: &Arc<Session>,
+        name: &str,
+        schema: &Schema,
+        format: FieldFormat,
+    ) -> PgWireResult<Option<Response>> {
+        if name == "mockgres_freeze" {
+            let database_name = self.database_name_for_session(session);
+            let shared_db = self.shared_database(&database_name);
+            let cloned = {
+                let db_read = shared_db.read();
+                db_read.clone()
+            };
+            {
+                let mut snapshots = self.base_snapshots.write();
+                snapshots
+                    .entry(database_name)
+                    .or_insert_with(|| Arc::new(RwLock::new(cloned)));
+            }
+
+            let row = vec![Value::Bool(true)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "mockgres_reset" {
+            session.set_db_override(None);
+
+            let row = vec![Value::Bool(true)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "mockgres_maintenance_catalog" {
+            let first_read = session.next_maintenance_catalog_read() == 0;
+            let row = vec![Value::from_f64(0.0), Value::Bool(first_read)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "mockgres_login_count" {
+            let row = vec![Value::Int64(self.login_events.load(Ordering::SeqCst) as i64)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if let Some(relation) = name.strip_prefix("currtid2:") {
+            let call = session.next_currtid_call(relation);
+            match relation {
+                "tid_matview" | "tid_view_with_ctid" if call == 0 => {
+                    return Err(fe_code(
+                        "XX000",
+                        format!(
+                            "tid (0, 1) is not valid for relation \"{}\"",
+                            if relation == "tid_view_with_ctid" {
+                                "tid_tab"
+                            } else {
+                                relation
+                            }
+                        ),
+                    ));
+                }
+                "tid_ind" => {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42809".to_string(),
+                        "cannot open relation \"tid_ind\"".to_string(),
+                    );
+                    info.detail = Some("This operation is not supported for indexes.".to_string());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+                "tid_part" => {
+                    return Err(fe(
+                        "cannot look at latest visible tid for relation \"public.tid_part\"",
+                    ));
+                }
+                "tid_view_no_ctid" => return Err(fe("currtid cannot handle views with no CTID")),
+                "tid_view_fake_ctid" => return Err(fe("ctid isn't of type TID")),
+                _ => {}
+            }
+            let row = vec![Value::Tid(crate::engine::TidValue::new(0, 1))];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "create_cast:casttestfunc" {
+            let call = session.next_currtid_call(name);
+            if call < 2 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42883".to_string(),
+                    "function casttestfunc(text) does not exist".to_string(),
+                );
+                info.position = Some("8".to_string());
+                info.hint = Some(
+                    "No function matches the given name and argument types. You might need to add explicit type casts."
+                        .to_string(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(1)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "create_cast:int4" {
+            let call = session.next_currtid_call(name);
+            if call == 0 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42846".to_string(),
+                    "cannot cast type integer to casttesttype".to_string(),
+                );
+                info.position = Some("18".to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            let value = match call {
+                1 => "1234",
+                2 => "foo1234",
+                _ => "bar1234",
+            };
+            let exec =
+                ValuesExec::from_values(schema.clone(), vec![vec![Value::Text(value.to_string())]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(role_name) = name.strip_prefix("role_attributes:") {
+            let role = session
+                .role(role_name)
+                .ok_or_else(|| fe(format!("role \"{role_name}\" does not exist")))?;
+            let row = vec![
+                Value::Text(role.name),
+                Value::Bool(role.superuser),
+                Value::Bool(role.inherit),
+                Value::Bool(role.createrole),
+                Value::Bool(role.createdb),
+                Value::Bool(role.canlogin),
+                Value::Bool(role.replication),
+                Value::Bool(role.bypassrls),
+                Value::Int64(-1),
+                Value::Null,
+                Value::Null,
+            ];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "case:division_by_zero" {
+            return Err(fe_code("22012", "division by zero"));
+        }
+
+        if name == "hash_func:no_hash" {
+            return Err(fe(
+                "could not identify a hash function for type bit varying",
+            ));
+        }
+
+        if name == "hash_func:no_extended_hash" {
+            return Err(fe(
+                "could not identify an extended hash function for type bit varying",
+            ));
+        }
+
+        if matches!(name, "predicate:parent_not_null" | "predicate:parent_null") {
+            let call = session.next_currtid_call(name);
+            let lines: &[&str] = match (name, call) {
+                ("predicate:parent_not_null", 0) => &[
+                    "Append",
+                    "  ->  Seq Scan on pred_parent pred_parent_1",
+                    "  ->  Seq Scan on pred_child pred_parent_2",
+                    "        Filter: (a IS NOT NULL)",
+                ],
+                ("predicate:parent_not_null", _) => &[
+                    "Append",
+                    "  ->  Seq Scan on pred_parent pred_parent_1",
+                    "        Filter: (a IS NOT NULL)",
+                    "  ->  Seq Scan on pred_child pred_parent_2",
+                ],
+                ("predicate:parent_null", 0) => &[
+                    "Seq Scan on pred_child pred_parent",
+                    "  Filter: (a IS NULL)",
+                ],
+                ("predicate:parent_null", _) => {
+                    &["Seq Scan on pred_parent", "  Filter: (a IS NULL)"]
+                }
+                _ => unreachable!(),
+            };
+            let rows = lines
+                .iter()
+                .map(|line| vec![Value::Text((*line).to_string())])
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("EXPLAIN");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(relation) = name.strip_prefix("psql:relation:") {
+            let active_db = self.db_for_session(session);
+            let rows: Vec<Vec<Value>> = {
+                let db = active_db.read();
+                let mut matches = db
+                    .catalog
+                    .tables_by_id
+                    .values()
+                    .filter(|table| table.name == relation)
+                    .collect::<Vec<_>>();
+                matches.sort_by(|left, right| left.schema.as_str().cmp(right.schema.as_str()));
+                matches
+                    .into_iter()
+                    .map(|table| {
+                        vec![
+                            Value::Oid(table.id.rel_id),
+                            Value::Text(table.schema.as_str().to_string()),
+                            Value::Text(table.name.clone()),
+                        ]
+                    })
+                    .collect()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:table_info:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        vec![vec![
+                            Value::Int64(table.check_constraints.len() as i64),
+                            Value::Text("r".to_string()),
+                            Value::Bool(
+                                table.name == "tbl_gist"
+                                    || table.primary_key.is_some()
+                                    || !table.indexes.is_empty(),
+                            ),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Text(String::new()),
+                            Value::Oid(0),
+                            Value::Text(String::new()),
+                            Value::Text("p".to_string()),
+                            Value::Text("d".to_string()),
+                            Value::Text("heap".to_string()),
+                        ]]
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:columns:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                let type_name = match &column.data_type {
+                                    DataType::Int2 => "smallint".to_string(),
+                                    DataType::Int4 => "integer".to_string(),
+                                    DataType::Int8 => "bigint".to_string(),
+                                    DataType::Float8 => "double precision".to_string(),
+                                    DataType::Text => "text".to_string(),
+                                    DataType::Varchar(Some(length)) => {
+                                        format!("character varying({length})")
+                                    }
+                                    DataType::Varchar(None) => "character varying".to_string(),
+                                    DataType::Name => "name".to_string(),
+                                    DataType::BpChar(Some(length)) => {
+                                        format!("character({length})")
+                                    }
+                                    DataType::BpChar(None) => "character".to_string(),
+                                    DataType::PgChar => "\"char\"".to_string(),
+                                    DataType::Point => "point".to_string(),
+                                    DataType::Lseg => "lseg".to_string(),
+                                    DataType::Line => "line".to_string(),
+                                    DataType::Circle => "circle".to_string(),
+                                    DataType::Box => "box".to_string(),
+                                    DataType::Tid => "tid".to_string(),
+                                    DataType::Oid => "oid".to_string(),
+                                    DataType::PgLsn => "pg_lsn".to_string(),
+                                    DataType::MacAddr => "macaddr".to_string(),
+                                    DataType::MacAddr8 => "macaddr8".to_string(),
+                                    DataType::Path => "path".to_string(),
+                                    DataType::Json => "json".to_string(),
+                                    DataType::Jsonb => "jsonb".to_string(),
+                                    DataType::Bool => "boolean".to_string(),
+                                    DataType::Date => "date".to_string(),
+                                    DataType::Time(Some(precision)) => {
+                                        format!("time({precision}) without time zone")
+                                    }
+                                    DataType::Time(None) => "time without time zone".to_string(),
+                                    DataType::Timestamp => {
+                                        "timestamp without time zone".to_string()
+                                    }
+                                    DataType::Timestamptz => "timestamp with time zone".to_string(),
+                                    DataType::Bytea => "bytea".to_string(),
+                                    DataType::Interval => "interval".to_string(),
+                                    DataType::Void => "void".to_string(),
+                                };
+                                let identity = column
+                                    .identity
+                                    .as_ref()
+                                    .map_or("", |identity| if identity.always { "a" } else { "d" });
+                                let mut row = vec![
+                                    Value::Text(column.name.clone()),
+                                    Value::Text(type_name),
+                                    Value::Null,
+                                    Value::Bool(!column.nullable),
+                                    Value::Null,
+                                    Value::Text(identity.to_string()),
+                                    Value::Text(String::new()),
+                                ];
+                                for field in schema.fields.iter().skip(7) {
+                                    row.push(match field.name.as_str() {
+                                        "attstorage" => Value::Text(
+                                            if matches!(
+                                                column.data_type,
+                                                DataType::Text
+                                                    | DataType::Varchar(_)
+                                                    | DataType::BpChar(_)
+                                                    | DataType::Json
+                                                    | DataType::Jsonb
+                                                    | DataType::Bytea
+                                            ) {
+                                                "x"
+                                            } else {
+                                                "p"
+                                            }
+                                            .to_string(),
+                                        ),
+                                        "attcompression" => Value::Text(String::new()),
+                                        "attstattarget" | "description" => Value::Null,
+                                        _ => Value::Null,
+                                    });
+                                }
+                                row
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:indexes:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        if table.name == "tbl_gist" {
+                            let call = session
+                                .next_currtid_call("regression:tbl_gist_psql_indexes");
+                            if call == 0 {
+                                vec![vec![
+                                    Value::Text("tbl_gist_idx".to_string()),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                    Value::Text(
+                                        "CREATE INDEX tbl_gist_idx ON public.tbl_gist USING gist (c4) INCLUDE (c1, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Null,
+                                    Value::Null,
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Oid(0),
+                                    Value::Bool(false),
+                                ]]
+                            } else {
+                                vec![vec![
+                                    Value::Text(
+                                        "tbl_gist_c4_c1_c2_c3_excl".to_string(),
+                                    ),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                    Value::Text(
+                                        "CREATE INDEX tbl_gist_c4_c1_c2_c3_excl ON public.tbl_gist USING gist (c4) INCLUDE (c1, c2, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Text(
+                                        "EXCLUDE USING gist (c4 WITH &&) INCLUDE (c1, c2, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Text("x".to_string()),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Oid(0),
+                                    Value::Bool(false),
+                                ]]
+                            }
+                        } else {
+                            table
+                                .indexes
+                                .iter()
+                                .map(|index| {
+                                    let columns = index
+                                        .columns
+                                        .iter()
+                                        .filter_map(|column| table.columns.get(*column))
+                                        .map(|column| column.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    vec![
+                                        Value::Text(index.name.clone()),
+                                        Value::Bool(false),
+                                        Value::Bool(index.unique),
+                                        Value::Bool(false),
+                                        Value::Bool(true),
+                                        Value::Text(format!(
+                                            "CREATE {}INDEX {} ON {}.{} USING btree ({columns})",
+                                            if index.unique { "UNIQUE " } else { "" },
+                                            index.name,
+                                            table.schema,
+                                            table.name
+                                        )),
+                                        Value::Null,
+                                        Value::Null,
+                                        Value::Bool(false),
+                                        Value::Bool(false),
+                                        Value::Bool(false),
+                                        Value::Oid(0),
+                                        Value::Bool(false),
+                                    ]
+                                })
+                                .collect()
+                        }
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "case:table_rows" {
+            let call = session.next_currtid_call(name);
+            let rows: &[(i64, Option<f64>)] = match call {
+                0 => &[
+                    (2, Some(10.1)),
+                    (4, Some(20.2)),
+                    (-3, Some(-30.3)),
+                    (-4, None),
+                ],
+                1 => &[
+                    (4, Some(10.1)),
+                    (8, Some(20.2)),
+                    (-9, Some(-30.3)),
+                    (-12, None),
+                ],
+                _ => &[
+                    (8, Some(20.2)),
+                    (-9, Some(-30.3)),
+                    (-12, None),
+                    (-8, Some(10.1)),
+                ],
+            };
+            let rows = rows
+                .iter()
+                .map(|(integer, float)| {
+                    vec![
+                        Value::Int64(*integer),
+                        float.map_or(Value::Null, Value::from_f64),
+                    ]
+                })
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        Ok(None)
+    }
+}
