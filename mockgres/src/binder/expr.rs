@@ -4,7 +4,7 @@ use crate::engine::{
     BoolExpr, ColumnRefName, DataType, Field, ScalarBinaryOp, ScalarExpr, ScalarFunc, Schema,
     Value, fe, fe_code,
 };
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::{BindTimeContext, bind_time_scalar_func, current_schema_name, schema_names_for_path};
 
@@ -220,6 +220,7 @@ fn bind_scalar_expr_inner(
                         schema: None,
                         relation: None,
                         column: colref.column.clone(),
+                        location: colref.location,
                     },
                 )?;
                 ScalarExpr::ExcludedIdx(idx)
@@ -490,6 +491,26 @@ pub(crate) fn resolve_column_reference(
         .enumerate()
         .filter(|(_, field)| column_ref_matches(field, colref));
     let Some((idx, _)) = matches.next() else {
+        if let Some(relation) = &colref.relation
+            && let Some(alias) = schema.fields.iter().find_map(|field| {
+                field.origin.as_ref().and_then(|origin| {
+                    (origin.table.as_ref() == Some(relation))
+                        .then(|| origin.alias.clone())
+                        .flatten()
+                })
+            })
+        {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42P01".to_string(),
+                format!("invalid reference to FROM-clause entry for table \"{relation}\""),
+            );
+            info.hint = Some(format!(
+                "Perhaps you meant to reference the table alias \"{alias}\"."
+            ));
+            info.position = colref.location.map(|location| (location + 1).to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
         return Err(fe_code("42703", format!("unknown column: {colref}")));
     };
     if matches.next().is_some() {
@@ -524,7 +545,7 @@ pub(crate) fn column_ref_matches(field: &Field, colref: &ColumnRefName) -> bool 
         if origin.alias.as_ref() == Some(rel_name) {
             return true;
         }
-        if origin.table.as_ref() == Some(rel_name) {
+        if origin.alias.is_none() && origin.table.as_ref() == Some(rel_name) {
             return true;
         }
         return false;
@@ -562,7 +583,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarBinaryOp::Add
             | ScalarBinaryOp::Sub
             | ScalarBinaryOp::Mul
-            | ScalarBinaryOp::Div => {
+            | ScalarBinaryOp::Div
+            | ScalarBinaryOp::Modulo => {
                 let l = scalar_expr_type(left.as_ref(), schema);
                 let r = scalar_expr_type(right.as_ref(), schema);
                 if matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
@@ -611,6 +633,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
         ScalarExpr::Func { func, args } => match func {
             ScalarFunc::Upper
             | ScalarFunc::Lower
+            | ScalarFunc::Repeat
             | ScalarFunc::CurrentSchema
             | ScalarFunc::CurrentDatabase => Some(DataType::Text),
             ScalarFunc::CurrentSchemas => Some(DataType::Text),
@@ -623,8 +646,14 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::PgNotify => Some(DataType::Void),
             ScalarFunc::PgNotificationQueueUsage => Some(DataType::Float8),
             ScalarFunc::Md5 => Some(DataType::Text),
+            ScalarFunc::RegexpReplace => Some(DataType::Text),
+            ScalarFunc::InfiniteRecurse => Some(DataType::Int4),
             ScalarFunc::PgRelationSize => Some(DataType::Int8),
             ScalarFunc::Length => Some(DataType::Int4),
+            ScalarFunc::CharLength => Some(DataType::Int4),
+            ScalarFunc::Decode | ScalarFunc::TestPglzCompress | ScalarFunc::TestPglzDecompress => {
+                Some(DataType::Bytea)
+            }
             ScalarFunc::Now
             | ScalarFunc::CurrentTimestamp
             | ScalarFunc::StatementTimestamp

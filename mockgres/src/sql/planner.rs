@@ -109,6 +109,29 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::TruncateStmt(trunc) => ddl::plan_truncate(trunc),
         NodeEnum::CopyStmt(copy) => copy::plan_copy(*copy),
         NodeEnum::CreateTableAsStmt(stmt) => create_table_as::plan_create_table_as(*stmt),
+        NodeEnum::LoadStmt(_) => Ok(Plan::UtilityNoOp { tag: "LOAD" }),
+        NodeEnum::CreateFunctionStmt(stmt) => ddl::plan_create_function(*stmt),
+        NodeEnum::DefineStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE" }),
+        NodeEnum::CreateOpClassStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CREATE OPERATOR CLASS",
+        }),
+        NodeEnum::CreateDomainStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CREATE DOMAIN",
+        }),
+        NodeEnum::CreateEnumStmt(_) | NodeEnum::CreateRangeStmt(_) => {
+            Ok(Plan::UtilityNoOp { tag: "CREATE TYPE" })
+        }
+        NodeEnum::ViewStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE VIEW" }),
+        NodeEnum::SecLabelStmt(stmt) => {
+            if stmt.provider.is_empty() {
+                Err(fe("no security label providers have been loaded"))
+            } else {
+                Err(fe(format!(
+                    "security label provider \"{}\" is not loaded",
+                    stmt.provider
+                )))
+            }
+        }
         NodeEnum::DoStmt(_) => Ok(Plan::UtilityNoOp { tag: "DO" }),
         NodeEnum::NotifyStmt(_) => Ok(Plan::UtilityNoOp { tag: "NOTIFY" }),
         NodeEnum::ListenStmt(_) => Ok(Plan::UtilityNoOp { tag: "LISTEN" }),

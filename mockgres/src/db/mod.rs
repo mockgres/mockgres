@@ -702,7 +702,12 @@ impl Db {
 
         let mut out_rows = Vec::new();
         let mut row_ids = Vec::new();
-        for (key, versions) in table.scan_all() {
+        let mut stored_rows = table.scan_all().collect::<Vec<_>>();
+        stored_rows.sort_by_key(|(key, _)| match key {
+            RowKey::RowId(row_id) => *row_id,
+            RowKey::Primary(_) => u64::MAX,
+        });
+        for (key, versions) in stored_rows {
             if let Some(version) = select_visible_version(versions, visibility) {
                 out_rows.push(positions.iter().map(|i| version.data[*i].clone()).collect());
                 let row_id = row_key_to_row_id(key)?;

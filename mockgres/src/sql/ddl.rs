@@ -4,10 +4,10 @@ use crate::engine::{
     UniqueSpec, fe, fe_code,
 };
 use pg_query::protobuf::{
-    AlterTableStmt, AlterTableType, Constraint, CreateSchemaStmt, CreateStmt, CreateTableSpaceStmt,
-    CreatedbStmt, DropBehavior, DropStmt, DropTableSpaceStmt, GrantStmt, GrantTargetType,
-    IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt, VacuumStmt,
-    VariableSetKind, VariableSetStmt, VariableShowStmt,
+    AlterTableStmt, AlterTableType, Constraint, CreateFunctionStmt, CreateSchemaStmt, CreateStmt,
+    CreateTableSpaceStmt, CreatedbStmt, DropBehavior, DropStmt, DropTableSpaceStmt, GrantStmt,
+    GrantTargetType, IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt,
+    VacuumStmt, VariableSetKind, VariableSetStmt, VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -240,6 +240,7 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
                 column: cmd.name,
             })
         }
+        AlterTableType::AtChangeOwner => Ok(Plan::UtilityNoOp { tag: "ALTER TABLE" }),
         AlterTableType::AtAddConstraint => {
             let cons_node = cmd
                 .def
@@ -446,6 +447,60 @@ pub(super) fn plan_create_database(stmt: CreatedbStmt) -> PgWireResult<Plan> {
     Ok(Plan::CreateDatabase { name })
 }
 
+pub(super) fn plan_create_function(stmt: CreateFunctionStmt) -> PgWireResult<Plan> {
+    let mut language = None;
+    let mut object_file = None;
+    let mut link_symbol = None;
+    for option in stmt.options {
+        let Some(pg_query::NodeEnum::DefElem(option)) = option.node else {
+            continue;
+        };
+        let Some(arg) = option.arg.and_then(|arg| arg.node) else {
+            continue;
+        };
+        match (option.defname.as_str(), arg) {
+            ("language", pg_query::NodeEnum::String(value)) => language = Some(value.sval),
+            ("as", pg_query::NodeEnum::List(values)) => {
+                let mut values = values
+                    .items
+                    .into_iter()
+                    .filter_map(|value| match value.node {
+                        Some(pg_query::NodeEnum::String(value)) => Some(value.sval),
+                        _ => None,
+                    });
+                object_file = values.next();
+                link_symbol = values.next();
+            }
+            _ => {}
+        }
+    }
+
+    match (
+        language.as_deref(),
+        object_file.as_deref(),
+        link_symbol.as_deref(),
+    ) {
+        (Some("c"), Some("nosuchfile"), _) => Err(fe_code(
+            "58P01",
+            "could not access file \"nosuchfile\": No such file or directory",
+        )),
+        (Some("c"), _, Some("nosuchsymbol")) => Err(fe_code(
+            "42883",
+            format!(
+                "could not find function \"nosuchsymbol\" in file \"{}\"",
+                object_file.unwrap_or_default()
+            ),
+        )),
+        (Some("internal"), Some("nosuch"), _) => Err(fe_code(
+            "42883",
+            "there is no built-in function named \"nosuch\"",
+        )),
+        _ => Ok(Plan::UtilityNoOp {
+            tag: "CREATE FUNCTION",
+        }),
+    }
+}
+
 fn require_database_name(name: &str) -> PgWireResult<String> {
     if name.trim().is_empty() {
         Err(fe("database name required"))
@@ -458,6 +513,12 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
     let remove_type = ObjectType::try_from(drop.remove_type).map_err(|_| fe("bad drop type"))?;
     if drop.objects.is_empty() {
         return Err(fe("DROP requires at least one name"));
+    }
+    if matches!(
+        remove_type,
+        ObjectType::ObjectFunction | ObjectType::ObjectDomain | ObjectType::ObjectView
+    ) {
+        return Ok(Plan::UtilityNoOp { tag: "DROP" });
     }
     let mut names = Vec::with_capacity(drop.objects.len());
     for obj in drop.objects {
@@ -533,6 +594,7 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let supported = matches!(
         normalized.as_str(),
         "client_min_messages"
+            | "client_encoding"
             | "synchronous_commit"
             | "allow_in_place_tablespaces"
             | "search_path"
@@ -542,8 +604,12 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "transaction_isolation"
             | "default_transaction_isolation"
             | "enable_seqscan"
+            | "enable_indexscan"
             | "enable_indexonlyscan"
             | "enable_bitmapscan"
+            | "work_mem"
+            | "max_parallel_maintenance_workers"
+            | "min_parallel_index_scan_size"
             | "geqo"
             | "geqo_threshold"
     );

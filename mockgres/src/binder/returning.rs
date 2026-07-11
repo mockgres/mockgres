@@ -26,6 +26,7 @@ pub(crate) fn bind_returning_clause(
                             schema: None,
                             relation: None,
                             column: field.name.clone(),
+                            location: None,
                         }),
                         alias: field.name.clone(),
                     });

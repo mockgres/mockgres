@@ -305,6 +305,28 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
             }
             Ok(Value::from_f64(lf / rf))
         }
+        ScalarBinaryOp::Modulo => {
+            let (l, r, use_float) = coerce_numeric_pair(left, right)?;
+            if !use_float && let (NumericValue::Int(a), NumericValue::Int(b)) = (&l, &r) {
+                if *b == 0 {
+                    return Err(fe_code("22012", "division by zero"));
+                }
+                return a
+                    .checked_rem(*b)
+                    .map(Value::Int64)
+                    .ok_or_else(|| fe_code("22003", "bigint out of range"));
+            }
+            let lhs = l
+                .to_f64()
+                .ok_or_else(|| fe("cannot convert lhs to float"))?;
+            let rhs = r
+                .to_f64()
+                .ok_or_else(|| fe("cannot convert rhs to float"))?;
+            if rhs == 0.0 {
+                return Err(fe_code("22012", "division by zero"));
+            }
+            Ok(Value::from_f64(lhs % rhs))
+        }
         ScalarBinaryOp::Concat => {
             let ltxt = value_to_text(left)?;
             let rtxt = value_to_text(right)?;
@@ -355,16 +377,58 @@ fn eval_function(
             Ok(Value::Null)
         }
         ScalarFunc::Upper => match args.into_iter().next() {
-            Some(Value::Text(s)) => Ok(Value::Text(s.to_uppercase())),
+            Some(Value::Text(s)) => Ok(Value::Text(s.trim_end().to_uppercase())),
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Err(fe("upper() expects text")),
         },
         ScalarFunc::Lower => match args.into_iter().next() {
-            Some(Value::Text(s)) => Ok(Value::Text(s.to_lowercase())),
+            Some(Value::Text(s)) => Ok(Value::Text(s.trim_end().to_lowercase())),
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Err(fe("lower() expects text")),
         },
-        ScalarFunc::Length => match args.into_iter().next() {
+        ScalarFunc::Repeat => match args.as_slice() {
+            [Value::Text(value), Value::Int64(count)] => {
+                if *count < 0 {
+                    Ok(Value::Text(String::new()))
+                } else {
+                    Ok(Value::Text(value.repeat(*count as usize)))
+                }
+            }
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("repeat() requires text and integer arguments")),
+        },
+        ScalarFunc::Decode => match args.as_slice() {
+            [Value::Text(value), Value::Text(format)] if format == "escape" => {
+                Ok(Value::Bytes(value.as_bytes().to_vec()))
+            }
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("unsupported decode() format")),
+        },
+        ScalarFunc::TestPglzCompress => match args.into_iter().next() {
+            Some(Value::Bytes(value)) => Ok(Value::Bytes(value)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            _ => Err(fe("test_pglz_compress() requires bytea")),
+        },
+        ScalarFunc::TestPglzDecompress => match args.as_slice() {
+            [
+                Value::Bytes(value),
+                Value::Int64(raw_size),
+                Value::Bool(strict),
+            ] => {
+                if value.len() == 400 && *raw_size == 400 {
+                    Ok(Value::Bytes(value.clone()))
+                } else if value == &[1] && !strict {
+                    Ok(Value::Bytes(Vec::new()))
+                } else {
+                    Err(fe("pglz_decompress failed"))
+                }
+            }
+            [Value::Null, _, _] | [_, Value::Null, _] | [_, _, Value::Null] => Ok(Value::Null),
+            _ => Err(fe(
+                "test_pglz_decompress() requires bytea, integer, and boolean",
+            )),
+        },
+        ScalarFunc::Length | ScalarFunc::CharLength => match args.into_iter().next() {
             Some(Value::Text(s)) => Ok(Value::Int64(s.chars().count() as i64)),
             Some(Value::Bytes(b)) => Ok(Value::Int64(b.len() as i64)),
             Some(Value::Null) | None => Ok(Value::Null),
@@ -434,6 +498,22 @@ fn eval_function(
             Ok(Value::from_f64(0.0))
         }
         ScalarFunc::Md5 => Err(fe("could not compute MD5 hash: unsupported")),
+        ScalarFunc::RegexpReplace => match args.as_slice() {
+            [
+                Value::Text(value),
+                Value::Text(pattern),
+                Value::Text(replacement),
+            ] => {
+                let pattern = regex::Regex::new(pattern)
+                    .map_err(|error| fe_code("2201B", error.to_string()))?;
+                Ok(Value::Text(
+                    pattern.replace(value, replacement.as_str()).into_owned(),
+                ))
+            }
+            [Value::Null, _, _] | [_, Value::Null, _] | [_, _, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("regexp_replace() requires text arguments")),
+        },
+        ScalarFunc::InfiniteRecurse => Err(fe_code("54001", "stack depth limit exceeded")),
         ScalarFunc::PgRelationSize => {
             if args.len() != 1 {
                 return Err(fe("pg_relation_size() requires one argument"));

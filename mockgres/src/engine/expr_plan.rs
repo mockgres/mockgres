@@ -23,11 +23,20 @@ pub enum Expr {
     Scalar(ScalarExpr),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ColumnRefName {
     pub schema: Option<String>,
     pub relation: Option<String>,
     pub column: String,
+    pub location: Option<i32>,
+}
+
+impl PartialEq for ColumnRefName {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema
+            && self.relation == other.relation
+            && self.column == other.column
+    }
 }
 
 impl fmt::Display for ColumnRefName {
@@ -142,6 +151,7 @@ pub enum ScalarBinaryOp {
     Sub,
     Mul,
     Div,
+    Modulo,
     Concat,
 }
 
@@ -156,6 +166,11 @@ pub enum ScalarFunc {
     Upper,
     Lower,
     Length,
+    CharLength,
+    Repeat,
+    Decode,
+    TestPglzCompress,
+    TestPglzDecompress,
     CurrentSchema,
     CurrentSchemas,
     CurrentDatabase,
@@ -178,6 +193,8 @@ pub enum ScalarFunc {
     PgNotify,
     PgNotificationQueueUsage,
     Md5,
+    RegexpReplace,
+    InfiniteRecurse,
     PgRelationSize,
     PgTableIsVisible,
     PgAdvisoryLock,
@@ -531,6 +548,7 @@ pub enum Plan {
         table: ObjName,
         columns: Option<Vec<String>>,
         filename: String,
+        encoding: Option<String>,
     },
     AlterTableRename {
         table: ObjName,

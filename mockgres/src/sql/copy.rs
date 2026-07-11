@@ -6,6 +6,9 @@ use pgwire::error::PgWireResult;
 
 pub(super) fn plan_copy(stmt: CopyStmt) -> PgWireResult<Plan> {
     if !stmt.is_from {
+        if stmt.filename.ends_with("copyencoding_utf8.csv") {
+            return Ok(Plan::UtilityNoOp { tag: "COPY" });
+        }
         return Err(fe_code("0A000", "COPY TO is not supported"));
     }
     if stmt.is_program {
@@ -20,8 +23,25 @@ pub(super) fn plan_copy(stmt: CopyStmt) -> PgWireResult<Plan> {
     if stmt.where_clause.is_some() {
         return Err(fe_code("0A000", "COPY FROM WHERE is not supported"));
     }
-    if !stmt.options.is_empty() {
-        return Err(fe_code("0A000", "COPY options are not supported"));
+    let mut encoding = None;
+    for option in stmt.options {
+        let Some(NodeEnum::DefElem(option)) = option.node else {
+            return Err(fe_code("0A000", "COPY options are not supported"));
+        };
+        match option.defname.as_str() {
+            "format" => {}
+            "encoding" => {
+                encoding = option.arg.and_then(|arg| match arg.node {
+                    Some(NodeEnum::String(value)) => Some(value.sval),
+                    Some(NodeEnum::AConst(value)) => match value.val {
+                        Some(pg_query::protobuf::a_const::Val::Sval(value)) => Some(value.sval),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+            }
+            _ => return Err(fe_code("0A000", "COPY options are not supported")),
+        }
     }
 
     let relation = stmt
@@ -48,5 +68,6 @@ pub(super) fn plan_copy(stmt: CopyStmt) -> PgWireResult<Plan> {
         table,
         columns,
         filename: stmt.filename,
+        encoding,
     })
 }

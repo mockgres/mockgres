@@ -60,10 +60,28 @@ pub(crate) fn build_set_show_executor(
             Ok((Box::new(exec), Some("SHOW".into()), Some(1)))
         }
         Plan::SetVariable { name, value } => match name.as_str() {
+            "client_encoding" => {
+                let encoding = value
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .cloned()
+                    .unwrap_or_else(|| "UTF8".to_string())
+                    .to_ascii_uppercase();
+                session.set_client_encoding(encoding);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
             "client_min_messages"
             | "enable_seqscan"
+            | "enable_indexscan"
             | "enable_indexonlyscan"
             | "enable_bitmapscan"
+            | "work_mem"
+            | "max_parallel_maintenance_workers"
+            | "min_parallel_index_scan_size"
             | "geqo"
             | "geqo_threshold" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),

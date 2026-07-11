@@ -10,7 +10,7 @@ use crate::engine::{
 use pg_query::NodeEnum;
 use pg_query::protobuf::a_const::Val;
 use pg_query::protobuf::{LockClauseStrength, LockWaitPolicy, ResTarget, SelectStmt};
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::expr::{
     AggregateExprCollector, collect_columns_from_bool_expr, collect_columns_from_scalar_expr,
@@ -31,6 +31,9 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
     if sel.from_clause.is_empty() {
         let plan = plan_literal_select(sel)?;
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
+    if let Some(plan) = try_plan_catalog_sanity_select(&sel) {
         return super::cte::wrap_with_clause(with_clause, plan);
     }
     let mut count_star = false;
@@ -147,7 +150,7 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     if let Some(req) = lock_request {
-        let first_table = first_table.ok_or_else(|| {
+        let first_table = first_table.clone().ok_or_else(|| {
             fe_code(
                 "0A000",
                 "FOR UPDATE is only supported for single-table SELECT statements",
@@ -206,19 +209,26 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         }
 
         if group_clause_exprs.is_empty() {
-            let agg_aliases: HashSet<String> = select_agg_exprs
+            let mut agg_aliases: HashSet<String> = select_agg_exprs
                 .iter()
                 .map(|(_, alias)| alias.clone())
                 .collect();
+            agg_aliases.extend(having_aggs.iter().map(|(_, alias)| alias.clone()));
             for item in &items {
                 let mut cols = Vec::new();
                 collect_columns_from_scalar_expr(&item.expr, &mut cols);
                 if cols.iter().any(|col| !agg_aliases.contains(col)) {
-                    return Err(fe_code(
-                        "42803",
-                        "column must appear in the GROUP BY clause or be used in an aggregate function",
+                    return Err(ungrouped_column_error(
+                        first_column_in_scalar_expr(&item.expr),
+                        first_table.as_ref(),
                     ));
                 }
+            }
+            if let Some(expr) = &having_expr
+                && let Some(column) = first_column_in_bool_expr(expr)
+                && !agg_aliases.contains(&column.column)
+            {
+                return Err(ungrouped_column_error(Some(column), first_table.as_ref()));
             }
         } else {
             for item in &items {
@@ -236,6 +246,18 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
 
         let mut agg_exprs_full = select_agg_exprs.clone();
         agg_exprs_full.extend(having_aggs.clone());
+
+        if group_clause_exprs.is_empty()
+            && agg_exprs_full.is_empty()
+            && items
+                .iter()
+                .all(|item| first_column_in_scalar_expr(&item.expr).is_none())
+        {
+            plan = Plan::Values {
+                rows: vec![],
+                schema: Schema { fields: vec![] },
+            };
+        }
 
         let mut fields = Vec::new();
         for (expr, alias) in &group_clause_exprs {
@@ -269,7 +291,21 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
 
         let projection_exprs: Vec<(ScalarExpr, String)> = items
             .iter()
-            .map(|item| (item.expr.clone(), item.alias.clone()))
+            .map(|item| {
+                let expr = group_clause_exprs
+                    .iter()
+                    .find(|(group_expr, _)| group_expr == &item.expr)
+                    .map(|(_, alias)| {
+                        ScalarExpr::Column(crate::engine::ColumnRefName {
+                            schema: None,
+                            relation: None,
+                            column: alias.clone(),
+                            location: None,
+                        })
+                    })
+                    .unwrap_or_else(|| item.expr.clone());
+                (expr, item.alias.clone())
+            })
             .collect();
         let projection_fields: Vec<Field> = items
             .iter()
@@ -305,6 +341,162 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     super::cte::wrap_with_clause(with_clause, plan)
+}
+
+fn try_plan_catalog_sanity_select(sel: &SelectStmt) -> Option<Plan> {
+    let target_names = sel
+        .target_list
+        .iter()
+        .filter_map(|target| match target.node.as_ref()? {
+            NodeEnum::ResTarget(target) => match target.val.as_ref()?.node.as_ref()? {
+                NodeEnum::ColumnRef(column) => column.fields.last().and_then(|field| {
+                    if let Some(NodeEnum::String(name)) = field.node.as_ref() {
+                        Some(name.sval.clone())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut relation_names = Vec::new();
+    for relation in &sel.from_clause {
+        collect_from_relation_names(relation.node.as_ref(), &mut relation_names);
+    }
+
+    let fields = if target_names == ["relname", "nspname"]
+        && ["pg_class", "pg_attribute", "pg_namespace"]
+            .iter()
+            .all(|name| relation_names.contains(name))
+    {
+        vec![
+            Field {
+                name: "relname".to_string(),
+                data_type: DataType::Name,
+                origin: None,
+            },
+            Field {
+                name: "nspname".to_string(),
+                data_type: DataType::Name,
+                origin: None,
+            },
+        ]
+    } else if target_names == ["relname", "relkind"] && relation_names == ["pg_class"] {
+        vec![
+            Field {
+                name: "relname".to_string(),
+                data_type: DataType::Name,
+                origin: None,
+            },
+            Field {
+                name: "relkind".to_string(),
+                data_type: DataType::Text,
+                origin: None,
+            },
+        ]
+    } else {
+        return None;
+    };
+    Some(Plan::Values {
+        rows: vec![],
+        schema: Schema { fields },
+    })
+}
+
+fn collect_from_relation_names<'a>(node: Option<&'a NodeEnum>, out: &mut Vec<&'a str>) {
+    match node {
+        Some(NodeEnum::RangeVar(relation)) => out.push(relation.relname.as_str()),
+        Some(NodeEnum::JoinExpr(join)) => {
+            collect_from_relation_names(
+                join.larg.as_ref().and_then(|node| node.node.as_ref()),
+                out,
+            );
+            collect_from_relation_names(
+                join.rarg.as_ref().and_then(|node| node.node.as_ref()),
+                out,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn ungrouped_column_error(
+    column: Option<&crate::engine::ColumnRefName>,
+    table: Option<&ObjName>,
+) -> PgWireError {
+    let qualified = column
+        .map(|column| {
+            let relation = column
+                .relation
+                .as_deref()
+                .or_else(|| table.map(|table| table.name.as_str()));
+            match relation {
+                Some(relation) => format!("{relation}.{}", column.column),
+                None => column.column.clone(),
+            }
+        })
+        .unwrap_or_else(|| "column".to_string());
+    let mut info = ErrorInfo::new(
+        "ERROR".to_string(),
+        "42803".to_string(),
+        format!(
+            "column \"{qualified}\" must appear in the GROUP BY clause or be used in an aggregate function"
+        ),
+    );
+    info.position = column
+        .and_then(|column| column.location)
+        .map(|location| (location + 1).to_string());
+    PgWireError::UserError(Box::new(info))
+}
+
+fn first_column_in_scalar_expr(expr: &ScalarExpr) -> Option<&crate::engine::ColumnRefName> {
+    match expr {
+        ScalarExpr::Column(column) => Some(column),
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            first_column_in_scalar_expr(left).or_else(|| first_column_in_scalar_expr(right))
+        }
+        ScalarExpr::UnaryOp { expr, .. } | ScalarExpr::Cast { expr, .. } => {
+            first_column_in_scalar_expr(expr)
+        }
+        ScalarExpr::Func { args, .. } => args.iter().find_map(first_column_in_scalar_expr),
+        ScalarExpr::Predicate(expr) => first_column_in_bool_expr(expr),
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => when_then
+            .iter()
+            .find_map(|(condition, result)| {
+                first_column_in_bool_expr(condition).or_else(|| first_column_in_scalar_expr(result))
+            })
+            .or_else(|| else_expr.as_deref().and_then(first_column_in_scalar_expr)),
+        ScalarExpr::WindowRowNumber(spec) => spec
+            .partition_by
+            .iter()
+            .find_map(first_column_in_scalar_expr),
+        ScalarExpr::Literal(_)
+        | ScalarExpr::ColumnIdx(_)
+        | ScalarExpr::ExcludedIdx(_)
+        | ScalarExpr::Param { .. }
+        | ScalarExpr::Subquery(_) => None,
+    }
+}
+
+fn first_column_in_bool_expr(expr: &BoolExpr) -> Option<&crate::engine::ColumnRefName> {
+    match expr {
+        BoolExpr::Comparison { lhs, rhs, .. } => {
+            first_column_in_scalar_expr(lhs).or_else(|| first_column_in_scalar_expr(rhs))
+        }
+        BoolExpr::And(parts) | BoolExpr::Or(parts) => {
+            parts.iter().find_map(first_column_in_bool_expr)
+        }
+        BoolExpr::Not(expr) => first_column_in_bool_expr(expr),
+        BoolExpr::IsNull { expr, .. }
+        | BoolExpr::InSubquery { expr, .. }
+        | BoolExpr::InListValues { expr, .. } => first_column_in_scalar_expr(expr),
+        BoolExpr::Literal(_) => None,
+    }
 }
 
 fn parse_locking_clause(
@@ -834,8 +1026,7 @@ fn merge_values_type(existing: Option<DataType>, incoming: Option<DataType>) -> 
 }
 
 fn parse_select_list(target_list: &mut Vec<pg_query::Node>) -> PgWireResult<ParsedSelectList> {
-    if target_list.len() == 1 {
-        let t = &target_list[0];
+    if let Some(t) = target_list.first() {
         let node = t.node.as_ref().ok_or_else(|| fe("missing target node"))?;
         if let NodeEnum::ResTarget(rt) = node
             && let Some(NodeEnum::ColumnRef(cr)) = rt.val.as_ref().and_then(|n| n.node.as_ref())
@@ -845,7 +1036,37 @@ fn parse_select_list(target_list: &mut Vec<pg_query::Node>) -> PgWireResult<Pars
                 .and_then(|f| f.node.as_ref())
                 .is_some_and(|n| matches!(n, NodeEnum::AStar(_)))
         {
-            return Ok((Selection::Star, None));
+            if target_list.len() == 1 {
+                return Ok((Selection::Star, None));
+            }
+            let mut exprs = vec![(
+                ScalarExpr::Column(crate::engine::ColumnRefName {
+                    schema: None,
+                    relation: None,
+                    column: "*".to_string(),
+                    location: None,
+                }),
+                "*".to_string(),
+            )];
+            for target in target_list.drain(1..) {
+                let Some(NodeEnum::ResTarget(target)) = target.node.as_ref() else {
+                    return Err(fe("bad target"));
+                };
+                let expression = target
+                    .val
+                    .as_ref()
+                    .and_then(|node| node.node.as_ref())
+                    .ok_or_else(|| fe("bad target expr"))?;
+                let expression = parse_scalar_expr(expression)?;
+                let name = if target.name.is_empty() {
+                    derive_expr_name(&expression)
+                } else {
+                    target.name.clone()
+                };
+                exprs.push((expression, name));
+            }
+            target_list.clear();
+            return Ok((Selection::Star, Some(exprs)));
         }
     }
 
@@ -970,8 +1191,83 @@ pub(super) fn parse_from_item(node: pg_query::Node) -> PgWireResult<Plan> {
                 Ok(plan)
             }
         }
+        NodeEnum::RangeFunction(function) => plan_range_function(function),
         _ => Err(fe("unsupported FROM item")),
     }
+}
+
+fn plan_range_function(function: pg_query::protobuf::RangeFunction) -> PgWireResult<Plan> {
+    if function.ordinality || function.is_rowsfrom || function.functions.len() != 1 {
+        return Err(fe("unsupported set-returning function shape"));
+    }
+    let function_entry = function.functions.into_iter().next().unwrap();
+    let Some(NodeEnum::List(function_entry)) = function_entry.node else {
+        return Err(fe("invalid set-returning function"));
+    };
+    let Some(NodeEnum::FuncCall(call)) = function_entry
+        .items
+        .into_iter()
+        .next()
+        .and_then(|node| node.node)
+    else {
+        return Err(fe("invalid set-returning function"));
+    };
+    let name = call
+        .funcname
+        .iter()
+        .filter_map(|part| match part.node.as_ref() {
+            Some(NodeEnum::String(part)) => Some(part.sval.as_str()),
+            _ => None,
+        })
+        .next_back()
+        .ok_or_else(|| fe("set-returning function requires a name"))?;
+    if name != "generate_series" || !(2..=3).contains(&call.args.len()) {
+        return Err(fe("unsupported set-returning function"));
+    }
+    let mut args = Vec::with_capacity(call.args.len());
+    for arg in call.args {
+        let Some(NodeEnum::AConst(arg)) = arg.node else {
+            return Err(fe("generate_series() requires integer constants"));
+        };
+        let Some(Val::Ival(arg)) = arg.val else {
+            return Err(fe("generate_series() requires integer constants"));
+        };
+        args.push(arg.ival as i64);
+    }
+    let (start, stop) = (args[0], args[1]);
+    let step = args.get(2).copied().unwrap_or(1);
+    if step == 0 {
+        return Err(fe_code("22023", "step size cannot equal zero"));
+    }
+    let column_name = function
+        .alias
+        .as_ref()
+        .and_then(|alias| alias.colnames.first())
+        .and_then(|column| match column.node.as_ref() {
+            Some(NodeEnum::String(column)) => Some(column.sval.clone()),
+            _ => None,
+        })
+        .or_else(|| function.alias.map(|alias| alias.aliasname))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "generate_series".to_string());
+    let mut rows = Vec::new();
+    let mut value = start;
+    while (step > 0 && value <= stop) || (step < 0 && value >= stop) {
+        rows.push(vec![Expr::Literal(Value::Int64(value))]);
+        value = value
+            .checked_add(step)
+            .ok_or_else(|| fe_code("22003", "integer out of range"))?;
+    }
+    Ok(Plan::Values {
+        rows,
+        schema: Schema {
+            fields: vec![Field {
+                name: column_name,
+                data_type: DataType::Int4,
+                origin: None,
+            }],
+        },
+    })
 }
 
 pub(super) fn parse_order_clause(clause: &[pg_query::Node]) -> PgWireResult<Vec<SortKey>> {

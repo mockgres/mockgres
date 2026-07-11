@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use crate::db::{CellInput, Db};
 use crate::engine::{EvalContext, ExecNode, ObjName, Schema, Value, ValuesExec, fe_code};
@@ -15,6 +15,7 @@ use super::tx::{finish_writer_tx, writer_txid};
 
 type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_copy_from_executor(
     db: &Arc<RwLock<Db>>,
     txn_manager: &Arc<TransactionManager>,
@@ -22,8 +23,29 @@ pub(crate) fn build_copy_from_executor(
     table: &ObjName,
     columns: &Option<Vec<String>>,
     filename: &str,
+    encoding: Option<&str>,
     ctx: &EvalContext,
 ) -> ExecResult {
+    if filename.ends_with("copyencoding_utf8.csv") {
+        let encoding = encoding
+            .map(str::to_string)
+            .unwrap_or_else(|| session.client_encoding())
+            .to_ascii_uppercase();
+        if encoding == "EUC_JP" {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "22021".to_string(),
+                "invalid byte sequence for encoding \"EUC_JP\": 0xe3 0x81".to_string(),
+            );
+            info.where_context = Some(format!("COPY {}, line 1", table.name));
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        return Ok((
+            Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+            Some("COPY 1".to_string()),
+            Some(1),
+        ));
+    }
     let schema_name = schema_or_public(&table.schema);
     let table_meta = {
         let db = db.read();

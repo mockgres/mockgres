@@ -152,6 +152,7 @@ pub struct SessionState {
     pub lock_timeout: Option<Duration>,
     pub synchronous_commit: String,
     pub allow_in_place_tablespaces: bool,
+    pub client_encoding: String,
 }
 
 impl Default for SessionState {
@@ -174,6 +175,7 @@ impl Default for SessionState {
             lock_timeout: None,
             synchronous_commit: "on".to_string(),
             allow_in_place_tablespaces: false,
+            client_encoding: "UTF8".to_string(),
         }
     }
 }
@@ -357,6 +359,14 @@ impl Session {
 
     pub fn allow_in_place_tablespaces(&self) -> bool {
         self.state.lock().allow_in_place_tablespaces
+    }
+
+    pub fn set_client_encoding(&self, value: String) {
+        self.state.lock().client_encoding = value;
+    }
+
+    pub fn client_encoding(&self) -> String {
+        self.state.lock().client_encoding.clone()
     }
 
     pub fn set_statement_time_micros(&self, micros: i64) {

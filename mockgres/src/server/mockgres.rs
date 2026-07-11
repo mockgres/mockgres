@@ -24,7 +24,7 @@ use pgwire::api::{
     },
     store::PortalStore,
 };
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::NoData;
 use pgwire::messages::extendedquery::Execute;
 use pgwire::messages::startup::SecretKey;
@@ -194,6 +194,60 @@ impl SimpleQueryHandler for Mockgres {
     {
         let plans = Planner::plan_sql_batch(query)?;
         let session = self.session_for_client(client)?;
+        for plan in &plans {
+            let Plan::CreateTable { parents, .. } = plan else {
+                continue;
+            };
+            if parents.len() < 2 {
+                continue;
+            }
+            let duplicate_columns = {
+                let db = self.db_for_session(&session);
+                let db = db.read();
+                let mut parent_columns = Vec::new();
+                for parent in parents {
+                    let schema = parent
+                        .schema
+                        .as_ref()
+                        .map(|schema| schema.as_str())
+                        .unwrap_or("public");
+                    if let Some(table) = db.catalog.get_table(schema, &parent.name) {
+                        parent_columns.push(
+                            table
+                                .columns
+                                .iter()
+                                .map(|column| column.name.clone())
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                parent_columns
+                    .first()
+                    .map(|first| {
+                        first
+                            .iter()
+                            .filter(|column| {
+                                parent_columns
+                                    .iter()
+                                    .skip(1)
+                                    .any(|columns| columns.contains(column))
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            for column in duplicate_columns {
+                let info = ErrorInfo::new(
+                    "NOTICE".to_string(),
+                    "00000".to_string(),
+                    format!("merging multiple inherited definitions of column \"{column}\""),
+                );
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                    .await?;
+            }
+        }
         let non_empty = plans
             .iter()
             .filter(|plan| !matches!(plan, Plan::Empty))

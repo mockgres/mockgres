@@ -626,6 +626,7 @@ impl AggregateExprCollector {
             schema: None,
             relation: None,
             column: alias,
+            location: None,
         }))
     }
 
@@ -698,6 +699,7 @@ pub fn parse_arithmetic_expr(
         "-" => ScalarBinaryOp::Sub,
         "*" => ScalarBinaryOp::Mul,
         "/" => ScalarBinaryOp::Div,
+        "%" => ScalarBinaryOp::Modulo,
         "||" => ScalarBinaryOp::Concat,
         other => return Err(fe(format!("unsupported operator: {other}"))),
     };
@@ -776,7 +778,12 @@ fn parse_function_call(
         "coalesce" => ScalarFunc::Coalesce,
         "upper" => ScalarFunc::Upper,
         "lower" => ScalarFunc::Lower,
-        "length" | "char_length" => ScalarFunc::Length,
+        "length" => ScalarFunc::Length,
+        "char_length" => ScalarFunc::CharLength,
+        "repeat" => ScalarFunc::Repeat,
+        "decode" => ScalarFunc::Decode,
+        "test_pglz_compress" => ScalarFunc::TestPglzCompress,
+        "test_pglz_decompress" => ScalarFunc::TestPglzDecompress,
         "current_schema" => ScalarFunc::CurrentSchema,
         "current_schemas" => ScalarFunc::CurrentSchemas,
         "current_database" => ScalarFunc::CurrentDatabase,
@@ -798,6 +805,8 @@ fn parse_function_call(
         "pg_notify" => ScalarFunc::PgNotify,
         "pg_notification_queue_usage" => ScalarFunc::PgNotificationQueueUsage,
         "md5" => ScalarFunc::Md5,
+        "regexp_replace" => ScalarFunc::RegexpReplace,
+        "infinite_recurse" => ScalarFunc::InfiniteRecurse,
         "pg_relation_size" => ScalarFunc::PgRelationSize,
         "pg_table_is_visible" => ScalarFunc::PgTableIsVisible,
         "pg_advisory_lock" => ScalarFunc::PgAdvisoryLock,
@@ -810,9 +819,29 @@ fn parse_function_call(
                 return Err(fe("coalesce requires at least one argument"));
             }
         }
-        ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length => {
+        ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length | ScalarFunc::CharLength => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::Repeat => {
+            if args.len() != 2 {
+                return Err(fe("repeat() requires two arguments"));
+            }
+        }
+        ScalarFunc::Decode => {
+            if args.len() != 2 {
+                return Err(fe("decode() requires two arguments"));
+            }
+        }
+        ScalarFunc::TestPglzCompress => {
+            if args.len() != 1 {
+                return Err(fe("test_pglz_compress() requires one argument"));
+            }
+        }
+        ScalarFunc::TestPglzDecompress => {
+            if args.len() != 3 {
+                return Err(fe("test_pglz_decompress() requires three arguments"));
             }
         }
         ScalarFunc::CurrentSchema => {
@@ -853,6 +882,11 @@ fn parse_function_call(
                 return Err(fe("md5() requires one argument"));
             }
         }
+        ScalarFunc::RegexpReplace => {
+            if args.len() != 3 {
+                return Err(fe("regexp_replace() requires three arguments"));
+            }
+        }
         ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
@@ -872,7 +906,8 @@ fn parse_function_call(
         | ScalarFunc::Version
         | ScalarFunc::PgNumaAvailable
         | ScalarFunc::GetDatabaseEncoding
-        | ScalarFunc::PgNotificationQueueUsage => {
+        | ScalarFunc::PgNotificationQueueUsage
+        | ScalarFunc::InfiniteRecurse => {
             if !args.is_empty() {
                 return Err(fe("function takes no arguments"));
             }
@@ -986,6 +1021,11 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::Upper => "upper",
             ScalarFunc::Lower => "lower",
             ScalarFunc::Length => "length",
+            ScalarFunc::CharLength => "char_length",
+            ScalarFunc::Repeat => "repeat",
+            ScalarFunc::Decode => "decode",
+            ScalarFunc::TestPglzCompress => "test_pglz_compress",
+            ScalarFunc::TestPglzDecompress => "test_pglz_decompress",
             ScalarFunc::CurrentSchema => "current_schema",
             ScalarFunc::CurrentSchemas => "current_schemas",
             ScalarFunc::CurrentDatabase => "current_database",
@@ -1008,6 +1048,8 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::PgNotify => "pg_notify",
             ScalarFunc::PgNotificationQueueUsage => "pg_notification_queue_usage",
             ScalarFunc::Md5 => "md5",
+            ScalarFunc::RegexpReplace => "regexp_replace",
+            ScalarFunc::InfiniteRecurse => "infinite_recurse",
             ScalarFunc::PgRelationSize => "pg_relation_size",
             ScalarFunc::PgTableIsVisible => "pg_table_is_visible",
             ScalarFunc::PgAdvisoryLock => "pg_advisory_lock",
@@ -1043,6 +1085,7 @@ pub fn parse_column_ref(cr: &ColumnRef) -> PgWireResult<ColumnRefName> {
         schema,
         relation,
         column,
+        location: (cr.location >= 0).then_some(cr.location),
     })
 }
 

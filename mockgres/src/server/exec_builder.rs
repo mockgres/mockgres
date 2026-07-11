@@ -245,7 +245,17 @@ pub fn build_executor(
             table,
             columns,
             filename,
-        } => build_copy_from_executor(db, txn_manager, session, table, columns, filename, ctx),
+            encoding,
+        } => build_copy_from_executor(
+            db,
+            txn_manager,
+            session,
+            table,
+            columns,
+            filename,
+            encoding.as_deref(),
+            ctx,
+        ),
         Plan::CreateTableAs {
             table,
             column_names,

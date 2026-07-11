@@ -81,8 +81,9 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
     } else {
         match last {
             "smallint" | "int2" => DataType::Int2,
-            "int" | "int4" | "integer" => DataType::Int4,
-            "bigint" | "int8" => DataType::Int8,
+            "int" | "int4" | "integer" | "serial" | "serial4" => DataType::Int4,
+            "bigint" | "int8" | "bigserial" | "serial8" => DataType::Int8,
+            "smallserial" | "serial2" => DataType::Int2,
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
             "name" => DataType::Name,
@@ -136,6 +137,18 @@ fn parse_character_length(typ: &TypeName) -> PgWireResult<Option<usize>> {
 }
 
 pub(super) fn parse_column_def(cd: &ColumnDef) -> PgWireResult<ColumnDefSpec> {
+    let serial = cd.type_name.as_ref().is_some_and(|typ| {
+        typ.names.iter().any(|name| {
+            matches!(
+                name.node.as_ref(),
+                Some(NodeEnum::String(name))
+                    if matches!(
+                        name.sval.to_ascii_lowercase().as_str(),
+                        "serial" | "serial2" | "serial4" | "serial8" | "smallserial" | "bigserial"
+                    )
+            )
+        })
+    });
     let dt = map_type(cd)?;
     let default_node = cd
         .raw_default
@@ -166,7 +179,15 @@ pub(super) fn parse_column_def(cd: &ColumnDef) -> PgWireResult<ColumnDefSpec> {
         }
         None => None,
     };
-    let identity = parse_identity_spec(cd)?;
+    let identity = if serial {
+        Some(IdentitySpec {
+            always: false,
+            start_with: 1,
+            increment_by: 1,
+        })
+    } else {
+        parse_identity_spec(cd)?
+    };
     if let Some(spec) = &identity {
         if !matches!(dt, DataType::Int2 | DataType::Int4 | DataType::Int8) {
             return Err(fe("IDENTITY columns must be SMALLINT, INT, or BIGINT"));

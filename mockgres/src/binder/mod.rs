@@ -509,6 +509,19 @@ fn bind_with_search_path(
             let mut bound_exprs = Vec::with_capacity(exprs.len());
             let mut fields = Vec::with_capacity(exprs.len());
             for (idx, (expr, name)) in exprs.into_iter().enumerate() {
+                if matches!(
+                    &expr,
+                    ScalarExpr::Column(column)
+                        if column.schema.is_none()
+                            && column.relation.is_none()
+                            && column.column == "*"
+                ) {
+                    for (column_index, field) in child.schema().fields.iter().enumerate() {
+                        fields.push(field.clone());
+                        bound_exprs.push((ScalarExpr::ColumnIdx(column_index), field.name.clone()));
+                    }
+                    continue;
+                }
                 let bound = if let Some((_, col_idx)) = window_expr_indexes
                     .iter()
                     .find(|(expr_idx, _)| *expr_idx == idx)
@@ -1305,6 +1318,7 @@ fn bind_with_search_path(
             mut table,
             columns,
             filename,
+            encoding,
         } => {
             let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
             if table.schema.is_none() {
@@ -1325,6 +1339,7 @@ fn bind_with_search_path(
                 table,
                 columns,
                 filename,
+                encoding,
             })
         }
         Plan::CreateDatabase { .. } => Ok(p),
