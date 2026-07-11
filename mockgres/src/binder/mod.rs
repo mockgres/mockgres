@@ -1084,6 +1084,7 @@ fn bind_with_search_path(
                                 | DataType::Name
                                 | DataType::BpChar(_)
                                 | DataType::Point
+                                | DataType::Path
                                 | DataType::Bool
                                 | DataType::Date
                                 | DataType::Timestamp

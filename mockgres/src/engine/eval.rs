@@ -20,8 +20,8 @@ use std::sync::Arc;
 use super::exec::ExecNode;
 use super::types::format_interval_micros;
 use super::{
-    BoolExpr, CmpOp, DataType, PointValue, ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp,
-    Value, cast_value_to_type, fe, fe_code, format_point_text,
+    BoolExpr, CmpOp, DataType, PathValue, PointValue, ScalarBinaryOp, ScalarExpr, ScalarFunc,
+    ScalarUnaryOp, Value, cast_value_to_type, fe, fe_code, format_path_text, format_point_text,
 };
 
 #[derive(Clone)]
@@ -588,6 +588,7 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
         Value::Null => None,
         Value::Text(s) => Some(s),
         Value::Point(point) => Some(format_point_text(point)),
+        Value::Path(path) => Some(format_path_text(&path)),
         Value::Int64(i) => Some(i.to_string()),
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
         Value::Bool(b) => Some(if b { "t" } else { "f" }.into()),
@@ -628,6 +629,43 @@ impl ToSqlText for PointOutput {
         _format_options: &FormatOptions,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         out.put_slice(format_point_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+#[derive(Debug)]
+struct PathOutput(PathValue);
+
+impl ToSql for PathOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_u8(u8::from(self.0.is_closed()));
+        out.put_i32(self.0.points().len() as i32);
+        for point in self.0.points() {
+            out.put_f64(point.x());
+            out.put_f64(point.y());
+        }
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::PATH
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for PathOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_path_text(&self.0).as_bytes());
         Ok(IsNull::No)
     }
 }
@@ -819,6 +857,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Point) => {
                                     enc.encode_field(&Option::<PointOutput>::None)
                                 }
+                                (Value::Null, DataType::Path) => {
+                                    enc.encode_field(&Option::<PathOutput>::None)
+                                }
                                 (Value::Null, DataType::Json) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
@@ -856,6 +897,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Text(s), DataType::BpChar(_)) => enc.encode_field(&s),
                                 (Value::Point(point), DataType::Point) => {
                                     enc.encode_field(&PointOutput(point))
+                                }
+                                (Value::Path(path), DataType::Path) => {
+                                    enc.encode_field(&PathOutput(path))
                                 }
                                 (Value::Text(s), DataType::Json) => {
                                     let parsed: JsonValue = match serde_json::from_str(&s) {

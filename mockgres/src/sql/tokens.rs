@@ -88,6 +88,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "name" => DataType::Name,
             "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),
             "point" => DataType::Point,
+            "path" => DataType::Path,
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
@@ -416,6 +417,7 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         Value::Null => Err(fe("minus over null")),
                         Value::Text(_)
                         | Value::Point(_)
+                        | Value::Path(_)
                         | Value::Bool(_)
                         | Value::Date(_)
                         | Value::TimestampMicros(_)

@@ -707,6 +707,9 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
         DataType::Point => crate::engine::parse_point_text(s)
             .map(Value::Point)
             .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Path => crate::engine::parse_path_text(s)
+            .map(Value::Path)
+            .map_err(|error| fe_code(error.code, error.message)),
         DataType::Json => Ok(Value::Text(s.to_string())),
         DataType::Jsonb => Ok(Value::Text(s.to_string())),
         DataType::Bool => {
@@ -802,6 +805,45 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
             let x = f64::from_be_bytes(bytes[..8].try_into().expect("point x width checked"));
             let y = f64::from_be_bytes(bytes[8..].try_into().expect("point y width checked"));
             Ok(Value::Point(crate::engine::PointValue::new(x, y)))
+        }
+        DataType::Path => {
+            if bytes.len() < 5 {
+                return Err(fe("binary path must contain a header"));
+            }
+            let closed = match bytes[0] {
+                0 => false,
+                1 => true,
+                _ => return Err(fe("binary path has an invalid closed flag")),
+            };
+            let point_count = i32::from_be_bytes(
+                bytes[1..5]
+                    .try_into()
+                    .expect("binary path count width checked"),
+            );
+            if point_count <= 0 {
+                return Err(fe("binary path must contain at least one point"));
+            }
+            let point_count = point_count as usize;
+            let expected_len = point_count
+                .checked_mul(16)
+                .and_then(|coordinate_bytes| coordinate_bytes.checked_add(5))
+                .ok_or_else(|| fe("binary path point count is too large"))?;
+            if bytes.len() != expected_len {
+                return Err(fe("binary path length does not match its point count"));
+            }
+            let points = bytes[5..]
+                .chunks_exact(16)
+                .map(|point| {
+                    let x = f64::from_be_bytes(
+                        point[..8].try_into().expect("binary path x width checked"),
+                    );
+                    let y = f64::from_be_bytes(
+                        point[8..].try_into().expect("binary path y width checked"),
+                    );
+                    crate::engine::PointValue::new(x, y)
+                })
+                .collect();
+            Ok(Value::Path(crate::engine::PathValue::new(closed, points)))
         }
         DataType::Json => {
             let s = std::str::from_utf8(bytes)

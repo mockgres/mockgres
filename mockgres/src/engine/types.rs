@@ -60,6 +60,7 @@ pub enum DataType {
     Name,
     BpChar(Option<usize>),
     Point,
+    Path,
     Json,
     Jsonb,
     Bool,
@@ -82,6 +83,7 @@ impl DataType {
             DataType::Name => Type::NAME,
             DataType::BpChar(_) => Type::BPCHAR,
             DataType::Point => Type::POINT,
+            DataType::Path => Type::PATH,
             DataType::Json => Type::JSON,
             DataType::Jsonb => Type::JSONB,
             DataType::Bool => Type::BOOL,
@@ -136,6 +138,26 @@ pub struct PointValue {
     y_bits: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PathValue {
+    closed: bool,
+    points: Vec<PointValue>,
+}
+
+impl PathValue {
+    pub fn new(closed: bool, points: Vec<PointValue>) -> Self {
+        Self { closed, points }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    pub fn points(&self) -> &[PointValue] {
+        &self.points
+    }
+}
+
 impl PointValue {
     pub fn new(x: f64, y: f64) -> Self {
         Self {
@@ -169,6 +191,7 @@ pub enum Value {
     Float64Bits(u64),
     Text(String),
     Point(PointValue),
+    Path(PathValue),
     Bool(bool),
     Date(i32),
     TimestampMicros(i64),
@@ -186,6 +209,7 @@ impl PartialEq for Value {
             (Float64Bits(a), Float64Bits(b)) => a == b,
             (Text(a), Text(b)) => a == b,
             (Point(a), Point(b)) => a == b,
+            (Path(a), Path(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
             (TimestampMicros(a), TimestampMicros(b)) => a == b,
@@ -209,6 +233,7 @@ impl Hash for Value {
             Float64Bits(v) => v.hash(state),
             Text(s) => s.hash(state),
             Point(point) => point.hash(state),
+            Path(path) => path.hash(state),
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
             TimestampMicros(t) => t.hash(state),
@@ -256,28 +281,6 @@ pub fn parse_point_text(input: &str) -> Result<PointValue, SqlError> {
         )
     }
 
-    fn parse_coordinate(value: &str, input: &str) -> Result<f64, SqlError> {
-        let trimmed = value.trim();
-        let normalized = match trimmed.to_ascii_lowercase().as_str() {
-            "inf" | "+inf" | "infinity" | "+infinity" => "inf",
-            "-inf" | "-infinity" => "-inf",
-            "nan" | "+nan" | "-nan" => "NaN",
-            _ => trimmed,
-        };
-        let coordinate = normalized.parse::<f64>().map_err(|_| invalid(input))?;
-        let explicitly_infinite = matches!(
-            trimmed.to_ascii_lowercase().as_str(),
-            "inf" | "+inf" | "infinity" | "+infinity" | "-inf" | "-infinity"
-        );
-        if coordinate.is_infinite() && !explicitly_infinite {
-            return Err(SqlError::new(
-                "22003",
-                format!("\"{trimmed}\" is out of range for type double precision"),
-            ));
-        }
-        Ok(coordinate)
-    }
-
     let trimmed = input.trim();
     let coordinates = if let Some(inner) = trimmed
         .strip_prefix('(')
@@ -296,36 +299,196 @@ pub fn parse_point_text(input: &str) -> Result<PointValue, SqlError> {
         return Err(invalid(input));
     }
     Ok(PointValue::new(
-        parse_coordinate(x, input)?,
-        parse_coordinate(y, input)?,
+        parse_geometry_coordinate(x, input, "point")?,
+        parse_geometry_coordinate(y, input, "point")?,
     ))
 }
 
 pub fn format_point_text(point: PointValue) -> String {
-    fn coordinate(value: f64) -> String {
-        if value.is_nan() {
-            return "NaN".to_string();
-        }
-        if value == f64::INFINITY {
-            return "Infinity".to_string();
-        }
-        if value == f64::NEG_INFINITY {
-            return "-Infinity".to_string();
-        }
-        let mut buffer = ryu::Buffer::new();
-        let mut formatted = buffer.format(value).to_string();
-        if formatted.ends_with(".0") {
-            formatted.truncate(formatted.len() - 2);
-        }
-        if let Some(exponent) = formatted.find('e')
-            && !matches!(formatted.as_bytes().get(exponent + 1), Some(b'+' | b'-'))
-        {
-            formatted.insert(exponent + 1, '+');
-        }
-        formatted
+    format!(
+        "({},{})",
+        format_geometry_coordinate(point.x()),
+        format_geometry_coordinate(point.y())
+    )
+}
+
+pub fn parse_path_text(input: &str) -> Result<PathValue, SqlError> {
+    fn invalid(input: &str) -> SqlError {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type path: \"{input}\""),
+        )
     }
 
-    format!("({},{})", coordinate(point.x()), coordinate(point.y()))
+    fn matching_close(input: &str) -> Option<usize> {
+        let mut depth = 0_usize;
+        for (index, ch) in input.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    fn parse_points(mut inner: &str, input: &str) -> Result<Vec<PointValue>, SqlError> {
+        let mut points = Vec::new();
+        loop {
+            inner = inner.trim_start();
+            let (x, y, rest, needs_separator, allows_end) =
+                if let Some(rest) = inner.strip_prefix('(') {
+                    let Some(close) = rest.find(')') else {
+                        return Err(invalid(input));
+                    };
+                    let coordinates = &rest[..close];
+                    if coordinates.contains(['(', ')', '[', ']']) {
+                        return Err(invalid(input));
+                    }
+                    let mut pair = coordinates.split(',');
+                    let x = pair.next().ok_or_else(|| invalid(input))?;
+                    let y = pair.next().ok_or_else(|| invalid(input))?;
+                    if pair.next().is_some() {
+                        return Err(invalid(input));
+                    }
+                    (x, y, &rest[close + 1..], true, true)
+                } else {
+                    let Some((x, rest)) = inner.split_once(',') else {
+                        return Err(invalid(input));
+                    };
+                    if let Some((y, rest)) = rest.split_once(',') {
+                        (x, y, rest, false, false)
+                    } else {
+                        (x, rest, "", false, true)
+                    }
+                };
+            if x.trim().is_empty() || y.trim().is_empty() {
+                return Err(invalid(input));
+            }
+            points.push(PointValue::new(
+                parse_geometry_coordinate(x, input, "path")?,
+                parse_geometry_coordinate(y, input, "path")?,
+            ));
+
+            inner = rest.trim_start();
+            if inner.is_empty() {
+                return if allows_end {
+                    Ok(points)
+                } else {
+                    Err(invalid(input))
+                };
+            }
+            if needs_separator {
+                let Some(rest) = inner.strip_prefix(',') else {
+                    return Err(invalid(input));
+                };
+                inner = rest;
+            }
+            if inner.trim().is_empty() {
+                return Err(invalid(input));
+            }
+        }
+    }
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(invalid(input));
+    }
+
+    let (closed, inner) = if let Some(rest) = trimmed.strip_prefix('[') {
+        let Some(inner) = rest.strip_suffix(']') else {
+            return Err(invalid(input));
+        };
+        (false, inner)
+    } else if trimmed.starts_with('(') {
+        let Some(close) = matching_close(trimmed) else {
+            return Err(invalid(input));
+        };
+        if close == trimmed.len() - 1 {
+            (true, &trimmed[1..trimmed.len() - 1])
+        } else {
+            (true, trimmed)
+        }
+    } else {
+        (true, trimmed)
+    };
+
+    let inner = inner.trim();
+    if inner.is_empty() || inner.contains(['[', ']']) {
+        return Err(invalid(input));
+    }
+    let points = parse_points(inner, input)?;
+    Ok(PathValue::new(closed, points))
+}
+
+pub fn format_path_text(path: &PathValue) -> String {
+    let points = path
+        .points()
+        .iter()
+        .copied()
+        .map(format_point_text)
+        .collect::<Vec<_>>()
+        .join(",");
+    if path.is_closed() {
+        format!("({points})")
+    } else {
+        format!("[{points}]")
+    }
+}
+
+fn parse_geometry_coordinate(value: &str, input: &str, type_name: &str) -> Result<f64, SqlError> {
+    let trimmed = value.trim();
+    let normalized = match trimmed.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => "inf",
+        "-inf" | "-infinity" => "-inf",
+        "nan" | "+nan" | "-nan" => "NaN",
+        _ => trimmed,
+    };
+    let coordinate = normalized.parse::<f64>().map_err(|_| {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type {type_name}: \"{input}\""),
+        )
+    })?;
+    let explicitly_infinite = matches!(
+        trimmed.to_ascii_lowercase().as_str(),
+        "inf" | "+inf" | "infinity" | "+infinity" | "-inf" | "-infinity"
+    );
+    if coordinate.is_infinite() && !explicitly_infinite {
+        return Err(SqlError::new(
+            "22003",
+            format!("\"{trimmed}\" is out of range for type double precision"),
+        ));
+    }
+    Ok(coordinate)
+}
+
+fn format_geometry_coordinate(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value == f64::INFINITY {
+        return "Infinity".to_string();
+    }
+    if value == f64::NEG_INFINITY {
+        return "-Infinity".to_string();
+    }
+    let mut buffer = ryu::Buffer::new();
+    let mut formatted = buffer.format(value).to_string();
+    if formatted.ends_with(".0") {
+        formatted.truncate(formatted.len() - 2);
+    }
+    if let Some(exponent) = formatted.find('e')
+        && !matches!(formatted.as_bytes().get(exponent + 1), Some(b'+' | b'-'))
+    {
+        formatted.insert(exponent + 1, '+');
+    }
+    formatted
 }
 
 pub fn coerce_value_to_type(
@@ -469,6 +632,9 @@ fn convert_value_to_type(
         (DataType::Point, Value::Point(point)) => Ok(Value::Point(point)),
         (DataType::Point, Value::Text(value)) => parse_point_text(&value).map(Value::Point),
         (DataType::Text, Value::Point(point)) => Ok(Value::Text(format_point_text(point))),
+        (DataType::Path, Value::Path(path)) => Ok(Value::Path(path)),
+        (DataType::Path, Value::Text(value)) => parse_path_text(&value).map(Value::Path),
+        (DataType::Text, Value::Path(path)) => Ok(Value::Text(format_path_text(&path))),
         (DataType::Json, Value::Text(s)) => {
             validate_json(&s, "json")?;
             Ok(Value::Text(s))
