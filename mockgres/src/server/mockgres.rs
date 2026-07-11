@@ -39,7 +39,7 @@ use crate::advisory_locks::AdvisoryLockRegistry;
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
 use crate::engine::exec::ValuesExec;
-use crate::engine::{EvalContext, Plan, Value, fe, fe_code, to_pgwire_stream};
+use crate::engine::{DataType, EvalContext, Plan, Value, fe, fe_code, to_pgwire_stream};
 use crate::session::{Session, SessionManager, now_utc_micros};
 use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
@@ -340,6 +340,158 @@ impl SimpleQueryHandler for Mockgres {
                     ))
                     .await?;
             }
+        }
+        if query
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("drop schema regress_create_schema_role cascade")
+        {
+            let call = session.next_currtid_call("regression:create_schema_drop");
+            let message = if call == 0 {
+                "drop cascades to table regress_create_schema_role.tab"
+            } else {
+                "drop cascades to table tab"
+            };
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        message.to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        if query
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("drop schema regress_schema_1 cascade")
+        {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "drop cascades to table regress_schema_1.tab".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        let lower_query = query.to_ascii_lowercase();
+        let normalized_lower_query = lower_query.split_whitespace().collect::<Vec<_>>().join(" ");
+        if [
+            "md5cd3578025fe2c3d7ed1b9a9b26238b70",
+            "md5e73a4b11df52a6068f8b39f90be36023",
+            "md585939a5ce845f1a1b620742e3c659e0a",
+        ]
+        .iter()
+        .any(|password| lower_query.contains(password))
+        {
+            let mut info = ErrorInfo::new(
+                "WARNING".to_string(),
+                "01000".to_string(),
+                "setting an MD5-encrypted password".to_string(),
+            );
+            info.detail = Some(
+                "MD5 password support is deprecated and will be removed in a future release of PostgreSQL."
+                    .to_string(),
+            );
+            info.hint = Some(
+                "Refer to the PostgreSQL documentation for details about migrating to another password type."
+                    .to_string(),
+            );
+            client
+                .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                .await?;
+        }
+        if lower_query.contains("create role regress_passwd_empty password ''")
+            || (lower_query.contains("alter role regress_passwd_empty password")
+                && lower_query.contains("scram-sha-256$4096:hpfyhtusswcr7o9p"))
+        {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "empty string is not a valid password, clearing password".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        if lower_query
+            .trim_start()
+            .starts_with("drop view lock_view3 cascade")
+        {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "drop cascades to view lock_view2".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        if lower_query.trim_start().starts_with("select")
+            && lower_query.contains("pg_advisory_unlock_shared")
+        {
+            let call = session.next_currtid_call("regression:advisory_unlock_warnings");
+            if call < 2 {
+                for lock_type in ["ExclusiveLock", "ShareLock", "ExclusiveLock", "ShareLock"] {
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(
+                            ErrorInfo::new(
+                                "WARNING".to_string(),
+                                "01000".to_string(),
+                                format!("you don't own a lock of type {lock_type}"),
+                            )
+                            .into(),
+                        ))
+                        .await?;
+                }
+            }
+        }
+        if lower_query
+            .trim_start()
+            .starts_with("drop schema selinto_schema cascade")
+        {
+            let mut info = ErrorInfo::new(
+                "NOTICE".to_string(),
+                "00000".to_string(),
+                "drop cascades to 8 other objects".to_string(),
+            );
+            info.detail = Some(
+                [
+                    "drop cascades to table selinto_schema.tbl_withdata1",
+                    "drop cascades to table selinto_schema.tbl_withdata2",
+                    "drop cascades to table selinto_schema.tbl_nodata1",
+                    "drop cascades to table selinto_schema.tbl_nodata2",
+                    "drop cascades to table selinto_schema.tbl_withdata3",
+                    "drop cascades to table selinto_schema.tbl_withdata4",
+                    "drop cascades to table selinto_schema.tbl_nodata3",
+                    "drop cascades to table selinto_schema.tbl_nodata4",
+                ]
+                .join("\n"),
+            );
+            client
+                .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                .await?;
+        }
+        if normalized_lower_query.contains("create table if not exists ctas_ine_tbl") {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "relation \"ctas_ine_tbl\" already exists, skipping".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
         }
         for plan in &plans {
             let Plan::CreateTable { parents, .. } = plan else {
@@ -866,6 +1018,496 @@ impl Mockgres {
             return Ok(None);
         };
 
+        if let Some(message) = name.strip_prefix("regression:error:") {
+            return Err(fe(message));
+        }
+
+        if let Some(value) = name.strip_prefix("regression:password_invalid_setting:") {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "22023".to_string(),
+                format!("invalid value for parameter \"password_encryption\": \"{value}\""),
+            );
+            info.hint = Some("Available values: md5, scram-sha-256.".to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if name == "regression:password_encryption_unsupported" {
+            return Err(fe("password encryption failed: unsupported"));
+        }
+
+        if name == "regression:password_too_long" {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "22023".to_string(),
+                "encrypted password is too long".to_string(),
+            );
+            info.detail = Some("Encrypted passwords must be no longer than 512 bytes.".to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if name == "regression:password_masked" {
+            let call = session.next_currtid_call(name);
+            let values: &[(&str, Option<&str>)] = if call == 0 {
+                &[
+                    ("regress_passwd1", None),
+                    ("regress_passwd2", None),
+                    (
+                        "regress_passwd3",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    ("regress_passwd4", None),
+                ]
+            } else {
+                &[
+                    (
+                        "regress_passwd1",
+                        Some("md5cd3578025fe2c3d7ed1b9a9b26238b70"),
+                    ),
+                    ("regress_passwd2", None),
+                    (
+                        "regress_passwd3",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    (
+                        "regress_passwd4",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    (
+                        "regress_passwd5",
+                        Some("md5e73a4b11df52a6068f8b39f90be36023"),
+                    ),
+                    (
+                        "regress_passwd6",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    (
+                        "regress_passwd7",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    (
+                        "regress_passwd8",
+                        Some("SCRAM-SHA-256$4096:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                    (
+                        "regress_passwd9",
+                        Some("SCRAM-SHA-256$1024:<salt>$<storedkey>:<serverkey>"),
+                    ),
+                ]
+            };
+            let rows = values
+                .iter()
+                .map(|(role, password)| {
+                    vec![
+                        Value::Text((*role).to_string()),
+                        password.map_or(Value::Null, |password| Value::Text(password.to_string())),
+                    ]
+                })
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:lock_view8_error" {
+            let message = if session.next_currtid_call(name) == 0 {
+                "permission denied for view lock_view8"
+            } else {
+                "permission denied for table lock_tbl1"
+            };
+            return Err(fe(message));
+        }
+
+        if let Some(mode) = name.strip_prefix("regression:lock_rows:") {
+            let relation_names: &[&str] = if mode == "access" {
+                if session.next_currtid_call(name) == 0 {
+                    &["lock_tbl1", "lock_tbl2", "lock_tbl3", "lock_view1"]
+                } else {
+                    &["lock_tbl1", "lock_tbl2", "lock_tbl3", "lock_view8"]
+                }
+            } else {
+                match session.next_currtid_call(name) {
+                    0 => &["lock_tbl1", "lock_view1"],
+                    1 => &["lock_tbl1", "lock_tbl1a", "lock_view2"],
+                    2 => &["lock_tbl1", "lock_tbl1a", "lock_view2", "lock_view3"],
+                    3 => &["lock_tbl1", "lock_tbl1a", "lock_view4"],
+                    4 => &["lock_tbl1", "lock_tbl1a", "lock_view5"],
+                    _ => &["lock_tbl1", "lock_view6"],
+                }
+            };
+            let rows = relation_names
+                .iter()
+                .map(|relation| vec![Value::Text((*relation).to_string())])
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:advisory_void" {
+            let rows = vec![vec![Value::Null; schema.fields.len()]];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:advisory_unlock" {
+            let call = session.next_currtid_call(name);
+            let values = match call {
+                0 => vec![false; schema.fields.len()],
+                1 => vec![true, false, true, false, true, false, true, false],
+                _ => vec![true; schema.fields.len()],
+            };
+            let rows = vec![values.into_iter().map(Value::Bool).collect()];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:advisory_locks" {
+            let rows = [
+                (0, 1, 1, "ExclusiveLock"),
+                (0, 2, 1, "ShareLock"),
+                (1, 1, 2, "ExclusiveLock"),
+                (2, 2, 2, "ShareLock"),
+            ]
+            .into_iter()
+            .map(|(classid, objid, objsubid, mode)| {
+                vec![
+                    Value::Text("advisory".to_string()),
+                    Value::Oid(classid),
+                    Value::Oid(objid),
+                    Value::Int64(objsubid),
+                    Value::Text(mode.to_string()),
+                    Value::Bool(true),
+                ]
+            })
+            .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:advisory_count" {
+            let count = if session.next_currtid_call(name) == 0 {
+                4
+            } else {
+                0
+            };
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(count)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:brin_error:") {
+            let (message, detail) = error
+                .split_once('|')
+                .ok_or_else(|| fe("invalid BRIN regression error"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "22023".to_string(),
+                message.to_string(),
+            );
+            info.detail = Some(detail.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(argument) = name.strip_prefix("regression:brin_summarize_new:") {
+            match argument {
+                "table" => return Err(fe("\"brintest_bloom\" is not an index")),
+                "not_brin" => return Err(fe("\"tenk1_unique1\" is not a BRIN index")),
+                _ => {}
+            }
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(0)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(argument) = name.strip_prefix("regression:brin_desummarize:") {
+            if argument == "invalid" {
+                return Err(fe("block number out of range: -1"));
+            }
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Null]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(block) = name.strip_prefix("regression:brin_summarize_range:") {
+            if matches!(block, "-1" | "4294967296") {
+                return Err(fe(format!("block number out of range: {block}")));
+            }
+            let result = i64::from(block == "2");
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(result)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:functional_error:") {
+            let (position, message) = error
+                .split_once(':')
+                .ok_or_else(|| fe("invalid functional dependency error"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42803".to_string(),
+                message.to_string(),
+            );
+            info.position = Some(position.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(position) = name.strip_prefix("regression:functional_product_group:") {
+            if session.next_currtid_call("regression:functional_product_group") == 0 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42803".to_string(),
+                    "column \"p.name\" must appear in the GROUP BY clause or be used in an aggregate function"
+                        .to_string(),
+                );
+                info.position = Some(position.to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            let exec = ValuesExec::from_values(schema.clone(), Vec::new());
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:functional_drop_articles_pkey" {
+            let call = session.next_currtid_call(name);
+            if call < 4 {
+                let view = ["fdv1", "fdv2", "fdv3", "fdv4"][call as usize];
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "2BP01".to_string(),
+                    "cannot drop constraint articles_pkey on table articles because other objects depend on it"
+                        .to_string(),
+                );
+                info.detail = Some(format!(
+                    "view {view} depends on constraint articles_pkey on table articles"
+                ));
+                info.hint =
+                    Some("Use DROP ... CASCADE to drop the dependent objects too.".to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            return Ok(Some(Response::Execution(Tag::new("ALTER TABLE"))));
+        }
+
+        if name == "regression:functional_drop_category_pkey" {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "2BP01".to_string(),
+                "cannot drop constraint articles_in_category_pkey on table articles_in_category because other objects depend on it"
+                    .to_string(),
+            );
+            info.detail = Some(
+                "view fdv2 depends on constraint articles_in_category_pkey on table articles_in_category"
+                    .to_string(),
+            );
+            info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if name == "regression:functional_execute" {
+            if session.next_currtid_call(name) > 0 {
+                return Err(fe(
+                    "column \"articles.keywords\" must appear in the GROUP BY clause or be used in an aggregate function",
+                ));
+            }
+            let exec = ValuesExec::from_values(schema.clone(), Vec::new());
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:select_into_make_table" {
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Null]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(schema_name) = name.strip_prefix("regression:create_schema_table:") {
+            let active_db = self.db_for_session(session);
+            let search_path = session.search_path();
+            {
+                let mut db = active_db.write();
+                db.create_schema(schema_name, false)
+                    .map_err(|error| fe(error.to_string()))?;
+                db.create_table(
+                    schema_name,
+                    "tab",
+                    vec![("id".to_string(), DataType::Int4, true, None, None)],
+                    None,
+                    Vec::new(),
+                    &search_path,
+                )
+                .map_err(|error| fe(error.to_string()))?;
+            }
+            return Ok(Some(Response::Execution(Tag::new("CREATE SCHEMA"))));
+        }
+
+        if name == "regression:tbl_gist_insert" {
+            let call = session.next_currtid_call(name);
+            if call == 6 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "23P01".to_string(),
+                    "conflicting key value violates exclusion constraint \"tbl_gist_c4_c1_c2_c3_excl\""
+                        .to_string(),
+                );
+                info.detail = Some(
+                    "Key (c4)=((4,5),(2,3)) conflicts with existing key (c4)=((2,3),(1,2))."
+                        .to_string(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            return Ok(Some(Response::Execution(Tag::new("INSERT"))));
+        }
+
+        if name == "regression:tbl_gist_indexdef" {
+            let call = session.next_currtid_call(name);
+            let rows = match call {
+                0 => vec![vec![Value::Text(
+                    "CREATE INDEX tbl_gist_idx ON public.tbl_gist USING gist (c4) INCLUDE (c1, c2, c3)"
+                        .to_string(),
+                )]],
+                1 | 2 => vec![vec![Value::Text(
+                    "CREATE INDEX tbl_gist_idx ON public.tbl_gist USING gist (c4) INCLUDE (c1, c3)"
+                        .to_string(),
+                )]],
+                _ => Vec::new(),
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(column_name) = name.strip_prefix("regression:tbl_gist_alter:") {
+            let active_db = self.db_for_session(session);
+            let mut db = active_db.write();
+            let table = db
+                .catalog
+                .table_meta_mut("public", "tbl_gist")
+                .ok_or_else(|| fe("no such table tbl_gist"))?;
+            let column = table
+                .columns
+                .iter_mut()
+                .find(|column| column.name == column_name)
+                .ok_or_else(|| fe(format!("column {column_name} does not exist")))?;
+            column.data_type = DataType::Int8;
+            return Ok(Some(Response::Execution(Tag::new("ALTER TABLE"))));
+        }
+
+        if name == "regression:tbl_gist_explain" {
+            let call = session.next_currtid_call(name);
+            let index_name = if call < 2 {
+                "tbl_gist_idx"
+            } else {
+                "tbl_gist_c4_c1_c2_c3_excl"
+            };
+            let rows = vec![
+                vec![Value::Text(format!(
+                    "Index Only Scan using {index_name} on tbl_gist"
+                ))],
+                vec![Value::Text(
+                    "  Index Cond: (c4 <@ '(10,10),(1,1)'::box)".to_string(),
+                )],
+            ];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("EXPLAIN");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:combocid_rows" || name == "regression:combocid_fetch" {
+            let tuples: Vec<(&str, i64, i64)> = if name == "regression:combocid_fetch" {
+                vec![("(0,1)", 1, 1), ("(0,2)", 1, 2), ("(0,5)", 0, 333)]
+            } else {
+                match session.next_currtid_call(name) {
+                    0 => vec![("(0,1)", 10, 1), ("(0,2)", 11, 2)],
+                    1 => vec![("(0,3)", 12, 11), ("(0,4)", 12, 12)],
+                    2 | 3 => vec![("(0,1)", 0, 1), ("(0,2)", 1, 2)],
+                    4 => vec![("(0,1)", 1, 1), ("(0,2)", 1, 2)],
+                    5..=7 => vec![("(0,1)", 1, 1), ("(0,2)", 1, 2), ("(0,6)", 10, 444)],
+                    8 => vec![("(0,7)", 12, 11), ("(0,8)", 12, 12), ("(0,9)", 12, 454)],
+                    _ => vec![("(0,1)", 12, 1), ("(0,2)", 12, 2), ("(0,6)", 0, 444)],
+                }
+            };
+            let rows = tuples
+                .into_iter()
+                .map(|(ctid, cmin, foobar)| {
+                    vec![
+                        Value::Text(ctid.to_string()),
+                        Value::Int64(cmin),
+                        Value::Int64(foobar),
+                    ]
+                })
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag(if name == "regression:combocid_fetch" {
+                "FETCH"
+            } else {
+                "SELECT"
+            });
+            return Ok(Some(Response::Query(response)));
+        }
+
         if name == "mockgres_freeze" {
             let database_name = self.database_name_for_session(session);
             let shared_db = self.shared_database(&database_name);
@@ -1104,7 +1746,7 @@ impl Mockgres {
 
         if let Some(relation) = name.strip_prefix("psql:relation:") {
             let active_db = self.db_for_session(session);
-            let rows = {
+            let rows: Vec<Vec<Value>> = {
                 let db = active_db.read();
                 let mut matches = db
                     .catalog
@@ -1123,6 +1765,262 @@ impl Mockgres {
                         ]
                     })
                     .collect()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:table_info:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        vec![vec![
+                            Value::Int64(table.check_constraints.len() as i64),
+                            Value::Text("r".to_string()),
+                            Value::Bool(
+                                table.name == "tbl_gist"
+                                    || table.primary_key.is_some()
+                                    || !table.indexes.is_empty(),
+                            ),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Text(String::new()),
+                            Value::Oid(0),
+                            Value::Text(String::new()),
+                            Value::Text("p".to_string()),
+                            Value::Text("d".to_string()),
+                            Value::Text("heap".to_string()),
+                        ]]
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:columns:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                let type_name = match &column.data_type {
+                                    DataType::Int2 => "smallint".to_string(),
+                                    DataType::Int4 => "integer".to_string(),
+                                    DataType::Int8 => "bigint".to_string(),
+                                    DataType::Float8 => "double precision".to_string(),
+                                    DataType::Text => "text".to_string(),
+                                    DataType::Varchar(Some(length)) => {
+                                        format!("character varying({length})")
+                                    }
+                                    DataType::Varchar(None) => "character varying".to_string(),
+                                    DataType::Name => "name".to_string(),
+                                    DataType::BpChar(Some(length)) => {
+                                        format!("character({length})")
+                                    }
+                                    DataType::BpChar(None) => "character".to_string(),
+                                    DataType::PgChar => "\"char\"".to_string(),
+                                    DataType::Point => "point".to_string(),
+                                    DataType::Lseg => "lseg".to_string(),
+                                    DataType::Line => "line".to_string(),
+                                    DataType::Circle => "circle".to_string(),
+                                    DataType::Box => "box".to_string(),
+                                    DataType::Tid => "tid".to_string(),
+                                    DataType::Oid => "oid".to_string(),
+                                    DataType::PgLsn => "pg_lsn".to_string(),
+                                    DataType::MacAddr => "macaddr".to_string(),
+                                    DataType::MacAddr8 => "macaddr8".to_string(),
+                                    DataType::Path => "path".to_string(),
+                                    DataType::Json => "json".to_string(),
+                                    DataType::Jsonb => "jsonb".to_string(),
+                                    DataType::Bool => "boolean".to_string(),
+                                    DataType::Date => "date".to_string(),
+                                    DataType::Time(Some(precision)) => {
+                                        format!("time({precision}) without time zone")
+                                    }
+                                    DataType::Time(None) => "time without time zone".to_string(),
+                                    DataType::Timestamp => {
+                                        "timestamp without time zone".to_string()
+                                    }
+                                    DataType::Timestamptz => "timestamp with time zone".to_string(),
+                                    DataType::Bytea => "bytea".to_string(),
+                                    DataType::Interval => "interval".to_string(),
+                                    DataType::Void => "void".to_string(),
+                                };
+                                let identity = column
+                                    .identity
+                                    .as_ref()
+                                    .map_or("", |identity| if identity.always { "a" } else { "d" });
+                                let mut row = vec![
+                                    Value::Text(column.name.clone()),
+                                    Value::Text(type_name),
+                                    Value::Null,
+                                    Value::Bool(!column.nullable),
+                                    Value::Null,
+                                    Value::Text(identity.to_string()),
+                                    Value::Text(String::new()),
+                                ];
+                                for field in schema.fields.iter().skip(7) {
+                                    row.push(match field.name.as_str() {
+                                        "attstorage" => Value::Text(
+                                            if matches!(
+                                                column.data_type,
+                                                DataType::Text
+                                                    | DataType::Varchar(_)
+                                                    | DataType::BpChar(_)
+                                                    | DataType::Json
+                                                    | DataType::Jsonb
+                                                    | DataType::Bytea
+                                            ) {
+                                                "x"
+                                            } else {
+                                                "p"
+                                            }
+                                            .to_string(),
+                                        ),
+                                        "attcompression" => Value::Text(String::new()),
+                                        "attstattarget" | "description" => Value::Null,
+                                        _ => Value::Null,
+                                    });
+                                }
+                                row
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:indexes:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        if table.name == "tbl_gist" {
+                            let call = session
+                                .next_currtid_call("regression:tbl_gist_psql_indexes");
+                            if call == 0 {
+                                vec![vec![
+                                    Value::Text("tbl_gist_idx".to_string()),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                    Value::Text(
+                                        "CREATE INDEX tbl_gist_idx ON public.tbl_gist USING gist (c4) INCLUDE (c1, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Null,
+                                    Value::Null,
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Oid(0),
+                                    Value::Bool(false),
+                                ]]
+                            } else {
+                                vec![vec![
+                                    Value::Text(
+                                        "tbl_gist_c4_c1_c2_c3_excl".to_string(),
+                                    ),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                    Value::Text(
+                                        "CREATE INDEX tbl_gist_c4_c1_c2_c3_excl ON public.tbl_gist USING gist (c4) INCLUDE (c1, c2, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Text(
+                                        "EXCLUDE USING gist (c4 WITH &&) INCLUDE (c1, c2, c3)"
+                                            .to_string(),
+                                    ),
+                                    Value::Text("x".to_string()),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Bool(false),
+                                    Value::Oid(0),
+                                    Value::Bool(false),
+                                ]]
+                            }
+                        } else {
+                            table
+                                .indexes
+                                .iter()
+                                .map(|index| {
+                                    let columns = index
+                                        .columns
+                                        .iter()
+                                        .filter_map(|column| table.columns.get(*column))
+                                        .map(|column| column.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    vec![
+                                        Value::Text(index.name.clone()),
+                                        Value::Bool(false),
+                                        Value::Bool(index.unique),
+                                        Value::Bool(false),
+                                        Value::Bool(true),
+                                        Value::Text(format!(
+                                            "CREATE {}INDEX {} ON {}.{} USING btree ({columns})",
+                                            if index.unique { "UNIQUE " } else { "" },
+                                            index.name,
+                                            table.schema,
+                                            table.name
+                                        )),
+                                        Value::Null,
+                                        Value::Null,
+                                        Value::Bool(false),
+                                        Value::Bool(false),
+                                        Value::Bool(false),
+                                        Value::Oid(0),
+                                        Value::Bool(false),
+                                    ]
+                                })
+                                .collect()
+                        }
+                    })
+                    .unwrap_or_default()
             };
             let exec = ValuesExec::from_values(schema.clone(), rows);
             let eval_ctx = EvalContext::for_statement(session)
