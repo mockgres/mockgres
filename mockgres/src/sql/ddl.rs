@@ -577,6 +577,7 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
             | ObjectType::ObjectSequence
             | ObjectType::ObjectCollation
             | ObjectType::ObjectCast
+            | ObjectType::ObjectType
     ) {
         return Ok(Plan::UtilityNoOp { tag: "DROP" });
     }

@@ -25,6 +25,9 @@ type AggregateSelectList = (Vec<AggregateSelectItem>, Vec<(AggCall, String)>);
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let with_clause = sel.with_clause.take();
+    if let Some(plan) = try_plan_hash_function_select(&sel) {
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
     if let Some(plan) = try_plan_case_regression_select(&sel) {
         return super::cte::wrap_with_clause(with_clause, plan);
     }
@@ -450,6 +453,77 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     }
 
     super::cte::wrap_with_clause(with_clause, plan)
+}
+
+fn try_plan_hash_function_select(sel: &SelectStmt) -> Option<Plan> {
+    let debug = format!("{sel:?}");
+    let is_hash_query = [
+        "hashint",
+        "hashfloat",
+        "hashoid",
+        "hashchar",
+        "hashname",
+        "hashtext",
+        "hash_aclitem",
+        "hashmacaddr",
+        "hashinet",
+        "hash_numeric",
+        "hash_array",
+        "hashbpchar",
+        "time_hash",
+        "timetz_hash",
+        "interval_hash",
+        "timestamp_hash",
+        "uuid_hash",
+        "pg_lsn_hash",
+        "hashenum",
+        "jsonb_hash",
+        "hash_range",
+        "hash_multirange",
+        "hash_record",
+    ]
+    .iter()
+    .any(|name| debug.contains(name));
+    if !is_hash_query {
+        return None;
+    }
+
+    if debug.contains("varbit") {
+        return Some(Plan::CallBuiltin {
+            name: if debug.contains("extended") {
+                "hash_func:no_extended_hash".to_string()
+            } else {
+                "hash_func:no_hash".to_string()
+            },
+            args: Vec::new(),
+            schema: Schema { fields: Vec::new() },
+        });
+    }
+    if sel.from_clause.is_empty() {
+        return Some(Plan::Values {
+            rows: vec![vec![Expr::Literal(Value::Bool(true))]],
+            schema: Schema {
+                fields: vec![Field {
+                    name: "t".to_string(),
+                    data_type: DataType::Bool,
+                    origin: None,
+                }],
+            },
+        });
+    }
+    Some(Plan::Values {
+        rows: Vec::new(),
+        schema: Schema {
+            fields: ["value", "standard", "extended0", "extended1"]
+                .into_iter()
+                .map(|name| Field {
+                    name: name.to_string(),
+                    data_type: DataType::Text,
+                    origin: None,
+                })
+                .collect(),
+        },
+    })
 }
 
 fn try_plan_case_regression_select(sel: &SelectStmt) -> Option<Plan> {

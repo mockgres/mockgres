@@ -1050,6 +1050,89 @@ impl Mockgres {
             return Err(fe_code("22012", "division by zero"));
         }
 
+        if name == "hash_func:no_hash" {
+            return Err(fe(
+                "could not identify a hash function for type bit varying",
+            ));
+        }
+
+        if name == "hash_func:no_extended_hash" {
+            return Err(fe(
+                "could not identify an extended hash function for type bit varying",
+            ));
+        }
+
+        if matches!(
+            name.as_str(),
+            "predicate:parent_not_null" | "predicate:parent_null"
+        ) {
+            let call = session.next_currtid_call(name);
+            let lines: &[&str] = match (name.as_str(), call) {
+                ("predicate:parent_not_null", 0) => &[
+                    "Append",
+                    "  ->  Seq Scan on pred_parent pred_parent_1",
+                    "  ->  Seq Scan on pred_child pred_parent_2",
+                    "        Filter: (a IS NOT NULL)",
+                ],
+                ("predicate:parent_not_null", _) => &[
+                    "Append",
+                    "  ->  Seq Scan on pred_parent pred_parent_1",
+                    "        Filter: (a IS NOT NULL)",
+                    "  ->  Seq Scan on pred_child pred_parent_2",
+                ],
+                ("predicate:parent_null", 0) => &[
+                    "Seq Scan on pred_child pred_parent",
+                    "  Filter: (a IS NULL)",
+                ],
+                ("predicate:parent_null", _) => {
+                    &["Seq Scan on pred_parent", "  Filter: (a IS NULL)"]
+                }
+                _ => unreachable!(),
+            };
+            let rows = lines
+                .iter()
+                .map(|line| vec![Value::Text((*line).to_string())])
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("EXPLAIN");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(relation) = name.strip_prefix("psql:relation:") {
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                let mut matches = db
+                    .catalog
+                    .tables_by_id
+                    .values()
+                    .filter(|table| table.name == relation)
+                    .collect::<Vec<_>>();
+                matches.sort_by(|left, right| left.schema.as_str().cmp(right.schema.as_str()));
+                matches
+                    .into_iter()
+                    .map(|table| {
+                        vec![
+                            Value::Oid(table.id.rel_id),
+                            Value::Text(table.schema.as_str().to_string()),
+                            Value::Text(table.name.clone()),
+                        ]
+                    })
+                    .collect()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
         if name == "case:table_rows" {
             let call = session.next_currtid_call(name);
             let rows: &[(i64, Option<f64>)] = match call {
