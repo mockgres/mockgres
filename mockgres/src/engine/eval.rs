@@ -24,7 +24,7 @@ use super::{
     BoolExpr, BoxValue, CircleValue, CmpOp, DataType, LineValue, LsegValue, PathValue, PointValue,
     ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, TidValue, Value, cast_value_to_type, fe,
     fe_code, format_box_text, format_circle_text, format_line_text, format_lseg_text,
-    format_path_text, format_point_text, format_tid_text, line_from_points,
+    format_path_text, format_pg_lsn, format_point_text, format_tid_text, line_from_points,
 };
 
 #[derive(Clone)]
@@ -228,6 +228,73 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
     }
     if let ScalarBinaryOp::Add | ScalarBinaryOp::Sub = op {
         match (&left, &right) {
+            (Value::PgLsn(left), Value::PgLsn(right)) if matches!(op, ScalarBinaryOp::Sub) => {
+                let difference = i128::from(*left) - i128::from(*right);
+                if let Ok(difference) = i64::try_from(difference) {
+                    return Ok(Value::Int64(difference));
+                }
+                return Ok(Value::from_f64(difference as f64));
+            }
+            (Value::PgLsn(lsn), Value::Int64(offset)) => {
+                let offset = i128::from(*offset);
+                let result = if matches!(op, ScalarBinaryOp::Add) {
+                    i128::from(*lsn) + offset
+                } else {
+                    i128::from(*lsn) - offset
+                };
+                if !(0..=i128::from(u64::MAX)).contains(&result) {
+                    return Err(fe("pg_lsn out of range"));
+                }
+                return Ok(Value::PgLsn(result as u64));
+            }
+            (Value::PgLsn(lsn), Value::Float64Bits(offset)) => {
+                let offset = f64::from_bits(*offset);
+                if offset.is_nan() {
+                    return Err(fe(if matches!(op, ScalarBinaryOp::Add) {
+                        "cannot add NaN to pg_lsn"
+                    } else {
+                        "cannot subtract NaN from pg_lsn"
+                    }));
+                }
+                if !offset.is_finite() || offset.fract() != 0.0 {
+                    return Err(fe("pg_lsn offset must be an integer"));
+                }
+                let result = if matches!(op, ScalarBinaryOp::Add) {
+                    i128::from(*lsn) + offset as i128
+                } else {
+                    i128::from(*lsn) - offset as i128
+                };
+                if !(0..=i128::from(u64::MAX)).contains(&result) {
+                    return Err(fe("pg_lsn out of range"));
+                }
+                return Ok(Value::PgLsn(result as u64));
+            }
+            (Value::Int64(offset), Value::PgLsn(lsn)) if matches!(op, ScalarBinaryOp::Add) => {
+                let result = i128::from(*lsn) + i128::from(*offset);
+                if !(0..=i128::from(u64::MAX)).contains(&result) {
+                    return Err(fe("pg_lsn out of range"));
+                }
+                return Ok(Value::PgLsn(result as u64));
+            }
+            (Value::Float64Bits(offset), Value::PgLsn(lsn))
+                if matches!(op, ScalarBinaryOp::Add) =>
+            {
+                let offset = f64::from_bits(*offset);
+                if offset.is_nan() {
+                    return Err(fe("cannot add NaN to pg_lsn"));
+                }
+                if !offset.is_finite() || offset.fract() != 0.0 {
+                    return Err(fe("pg_lsn offset must be an integer"));
+                }
+                let result = i128::from(*lsn) + offset as i128;
+                if !(0..=i128::from(u64::MAX)).contains(&result) {
+                    return Err(fe("pg_lsn out of range"));
+                }
+                return Ok(Value::PgLsn(result as u64));
+            }
+            _ => {}
+        }
+        match (&left, &right) {
             (Value::TimestamptzMicros(l), Value::IntervalMicros(r)) => {
                 let res = if matches!(op, ScalarBinaryOp::Add) {
                     l.checked_add(*r)
@@ -336,6 +403,42 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
             }
             Ok(Value::from_f64(lhs % rhs))
         }
+        ScalarBinaryOp::BitAnd | ScalarBinaryOp::BitOr => {
+            let combine = |left: u8, right: u8| {
+                if matches!(op, ScalarBinaryOp::BitAnd) {
+                    left & right
+                } else {
+                    left | right
+                }
+            };
+            match (left, right) {
+                (Value::MacAddr(left), Value::MacAddr(right)) => {
+                    Ok(Value::MacAddr(std::array::from_fn(|index| {
+                        combine(left[index], right[index])
+                    })))
+                }
+                (Value::MacAddr(left), Value::Text(right)) => {
+                    let right = crate::engine::parse_macaddr_text(&right)
+                        .map_err(|error| fe_code(error.code, error.message))?;
+                    Ok(Value::MacAddr(std::array::from_fn(|index| {
+                        combine(left[index], right[index])
+                    })))
+                }
+                (Value::MacAddr8(left), Value::MacAddr8(right)) => {
+                    Ok(Value::MacAddr8(std::array::from_fn(|index| {
+                        combine(left[index], right[index])
+                    })))
+                }
+                (Value::MacAddr8(left), Value::Text(right)) => {
+                    let right = crate::engine::parse_macaddr8_text(&right)
+                        .map_err(|error| fe_code(error.code, error.message))?;
+                    Ok(Value::MacAddr8(std::array::from_fn(|index| {
+                        combine(left[index], right[index])
+                    })))
+                }
+                _ => Err(fe("bitwise operators require matching MAC addresses")),
+            }
+        }
         ScalarBinaryOp::Concat => {
             let ltxt = value_to_text(left)?;
             let rtxt = value_to_text(right)?;
@@ -376,6 +479,13 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
                 .map(Value::IntervalMicros)
                 .ok_or_else(|| fe_code("22015", "interval out of range")),
             other => Err(fe(format!("cannot negate value {:?}", other))),
+        },
+        ScalarUnaryOp::BitNot => match value {
+            Value::MacAddr(value) => Ok(Value::MacAddr(std::array::from_fn(|index| !value[index]))),
+            Value::MacAddr8(value) => {
+                Ok(Value::MacAddr8(std::array::from_fn(|index| !value[index])))
+            }
+            other => Err(fe(format!("cannot apply bitwise not to {other:?}"))),
         },
     }
 }
@@ -523,6 +633,23 @@ fn eval_function(
             Some(Value::Text(s)) => Ok(Value::Text(s.trim_end().to_lowercase())),
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Err(fe("lower() expects text")),
+        },
+        ScalarFunc::Trunc => match args.as_slice() {
+            [Value::MacAddr(value)] => Ok(Value::MacAddr([value[0], value[1], value[2], 0, 0, 0])),
+            [Value::MacAddr8(value)] => Ok(Value::MacAddr8([
+                value[0], value[1], value[2], 0, 0, 0, 0, 0,
+            ])),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("trunc() expects a MAC address")),
+        },
+        ScalarFunc::MacAddr8Set7Bit => match args.as_slice() {
+            [Value::MacAddr8(value)] => {
+                let mut value = *value;
+                value[0] |= 2;
+                Ok(Value::MacAddr8(value))
+            }
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("macaddr8_set7bit() expects macaddr8")),
         },
         ScalarFunc::Substring => match args.as_slice() {
             [Value::Text(value), Value::Int64(start), Value::Int64(count)] => {
@@ -741,6 +868,28 @@ fn eval_function(
             [Value::Text(value), Value::Text(data_type)] if data_type == "tid" => {
                 Ok(Value::Bool(crate::engine::parse_tid_text(value).is_ok()))
             }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "pg_lsn" => {
+                Ok(Value::Bool(crate::engine::parse_pg_lsn_text(value).is_ok()))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "oid" => {
+                Ok(Value::Bool(crate::engine::parse_oid_text(value).is_ok()))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "oidvector" => {
+                Ok(Value::Bool(
+                    value
+                        .split_whitespace()
+                        .all(|part| crate::engine::parse_oid_text(part).is_ok()),
+                ))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "macaddr" => Ok(
+                Value::Bool(crate::engine::parse_macaddr_text(value).is_ok()),
+            ),
+            [Value::Text(value), Value::Text(data_type)] if data_type == "macaddr8" => Ok(
+                Value::Bool(crate::engine::parse_macaddr8_text(value).is_ok()),
+            ),
+            [Value::Text(value), Value::Text(data_type)] if data_type == "time" => Ok(Value::Bool(
+                crate::engine::parse_time_text(value, None).is_ok(),
+            )),
             [Value::Text(value), Value::Text(data_type)] if data_type.starts_with("varchar(") => {
                 Ok(Value::Bool(
                     crate::engine::validate_varchar_input(value, data_type).is_ok(),
@@ -845,6 +994,19 @@ fn eval_function(
             // Mockgres indexes and physical storage are intentionally no-ops.
             Ok(Value::Int64(0))
         }
+        ScalarFunc::PgSizePretty => match args.as_slice() {
+            [Value::Int64(value)] => Ok(Value::Text(format_size_pretty_int(*value))),
+            [Value::Float64Bits(value)] => {
+                Ok(Value::Text(format_size_pretty(f64::from_bits(*value))))
+            }
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("pg_size_pretty() requires a numeric argument")),
+        },
+        ScalarFunc::PgSizeBytes => match args.as_slice() {
+            [Value::Text(value)] => parse_size_bytes(value).map(Value::Int64),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("pg_size_bytes() requires text")),
+        },
         ScalarFunc::Now | ScalarFunc::CurrentTimestamp | ScalarFunc::StatementTimestamp => {
             ensure_no_args(&func, &args)?;
             Ok(Value::TimestamptzMicros(statement_timestamp(ctx)?))
@@ -938,11 +1100,43 @@ fn eval_function(
             }
             Ok(best.unwrap_or(Value::Null))
         }
-        ScalarFunc::ExtractEpoch => match args.into_iter().next() {
+        ScalarFunc::ExtractEpoch | ScalarFunc::DatePartEpoch => match args.into_iter().next() {
             Some(Value::TimestamptzMicros(m)) => Ok(Value::from_f64(m as f64 / 1_000_000f64)),
             Some(Value::TimestampMicros(m)) => Ok(Value::from_f64(m as f64 / 1_000_000f64)),
+            Some(Value::TimeMicros(m)) => Ok(Value::from_f64(m as f64 / 1_000_000f64)),
             Some(Value::Null) | None => Ok(Value::Null),
             other => Err(fe(format!("extract(epoch ...) unsupported for {other:?}"))),
+        },
+        ScalarFunc::ExtractMicrosecond
+        | ScalarFunc::ExtractMillisecond
+        | ScalarFunc::ExtractSecond
+        | ScalarFunc::ExtractMinute
+        | ScalarFunc::ExtractHour
+        | ScalarFunc::DatePartMicrosecond
+        | ScalarFunc::DatePartMillisecond
+        | ScalarFunc::DatePartSecond => match args.into_iter().next() {
+            Some(Value::TimeMicros(micros)) => {
+                let seconds_in_minute = (micros % 60_000_000) as f64 / 1_000_000.0;
+                let value = match func {
+                    ScalarFunc::ExtractMicrosecond | ScalarFunc::DatePartMicrosecond => {
+                        seconds_in_minute * 1_000_000.0
+                    }
+                    ScalarFunc::ExtractMillisecond | ScalarFunc::DatePartMillisecond => {
+                        return Ok(Value::Text(format!(
+                            "{}.{:03}",
+                            micros % 60_000_000 / 1_000,
+                            micros % 1_000
+                        )));
+                    }
+                    ScalarFunc::ExtractSecond | ScalarFunc::DatePartSecond => seconds_in_minute,
+                    ScalarFunc::ExtractMinute => ((micros / 60_000_000) % 60) as f64,
+                    ScalarFunc::ExtractHour => (micros / 3_600_000_000) as f64,
+                    _ => unreachable!(),
+                };
+                Ok(Value::from_f64(value))
+            }
+            Some(Value::Null) | None => Ok(Value::Null),
+            other => Err(fe(format!("extract from time unsupported for {other:?}"))),
         },
         ScalarFunc::PgAdvisoryLock => {
             if args.len() != 1 {
@@ -976,6 +1170,88 @@ fn eval_function(
             Ok(Value::Bool(registry.unlock(key, session_id)))
         }
     }
+}
+
+fn format_size_pretty_int(value: i64) -> String {
+    const UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+    let value = i128::from(value);
+    let mut unit = 0;
+    let mut divisor = 1_i128;
+    while unit < UNITS.len() - 1 && value.abs() >= 10_240_i128 * divisor - divisor / 2 {
+        unit += 1;
+        divisor *= 1024;
+    }
+    let rounded = if unit == 0 {
+        value
+    } else if value >= 0 {
+        (value + divisor / 2) / divisor
+    } else {
+        (value - divisor / 2) / divisor
+    };
+    format!("{rounded} {}", UNITS[unit])
+}
+
+fn format_size_pretty(value: f64) -> String {
+    const UNITS: [&str; 6] = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+    let mut unit = 0;
+    let mut divisor = 1.0;
+    while unit < UNITS.len() - 1 && value.abs() >= 10_239.5 * divisor {
+        unit += 1;
+        divisor *= 1024.0;
+    }
+    if unit == 0 && value.fract() != 0.0 {
+        let mut buffer = ryu::Buffer::new();
+        format!("{} bytes", buffer.format(value))
+    } else {
+        format!("{:.0} {}", (value / divisor).round(), UNITS[unit])
+    }
+}
+
+fn parse_size_bytes(input: &str) -> PgWireResult<i64> {
+    let trimmed = input.trim();
+    let number_pattern = regex::Regex::new(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
+        .expect("static size regex");
+    let Some(number_match) = number_pattern.find(trimmed) else {
+        return Err(fe(format!("invalid size: \"{input}\"")));
+    };
+    let number_text = number_match.as_str();
+    let unit_text = trimmed[number_match.end()..].trim();
+    let multiplier = match unit_text.to_ascii_lowercase().as_str() {
+        "" | "bytes" | "b" => 1.0,
+        "kb" => 1024.0,
+        "mb" => 1024.0_f64.powi(2),
+        "gb" => 1024.0_f64.powi(3),
+        "tb" => 1024.0_f64.powi(4),
+        "pb" => 1024.0_f64.powi(5),
+        _ => {
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "22023".to_string(),
+                format!("invalid size: \"{input}\""),
+            );
+            info.detail = Some(format!("Invalid size unit: \"{unit_text}\"."));
+            info.hint = Some(
+                "Valid units are \"bytes\", \"B\", \"kB\", \"MB\", \"GB\", \"TB\", and \"PB\"."
+                    .to_string(),
+            );
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+    };
+    if number_text
+        .split(['e', 'E'])
+        .nth(1)
+        .is_some_and(|exponent| exponent.trim_start_matches(['+', '-']).len() > 9)
+    {
+        return Err(fe("value overflows numeric format"));
+    }
+    let number = number_text
+        .parse::<f64>()
+        .map_err(|_| fe(format!("invalid size: \"{input}\"")))?;
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes >= 9_223_372_036_854_775_808.0 || bytes < i64::MIN as f64 {
+        return Err(fe("bigint out of range"));
+    }
+    Ok(bytes.round() as i64)
 }
 
 fn ensure_no_args(func: &ScalarFunc, args: &[Value]) -> PgWireResult<()> {
@@ -1067,6 +1343,10 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
         Value::Circle(circle) => Some(format_circle_text(circle)),
         Value::Box(value) => Some(format_box_text(value)),
         Value::Tid(tid) => Some(format_tid_text(tid)),
+        Value::Oid(value) => Some(value.to_string()),
+        Value::PgLsn(value) => Some(format_pg_lsn(value)),
+        Value::MacAddr(value) => Some(crate::engine::format_macaddr(&value)),
+        Value::MacAddr8(value) => Some(crate::engine::format_macaddr(&value)),
         Value::Path(path) => Some(format_path_text(&path)),
         Value::Int64(i) => Some(i.to_string()),
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
@@ -1076,6 +1356,7 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
         Value::Date(_) | Value::TimestampMicros(_) | Value::TimestamptzMicros(_) => {
             return Err(fe("text conversion not supported for date/timestamp"));
         }
+        Value::TimeMicros(value) => Some(crate::engine::format_time(value)),
     })
 }
 
@@ -1098,12 +1379,182 @@ struct BoxOutput(BoxValue);
 struct TidOutput(TidValue);
 
 #[derive(Debug)]
+struct OidOutput(u32);
+
+#[derive(Debug)]
+struct PgLsnOutput(u64);
+
+#[derive(Debug)]
+struct MacAddrOutput([u8; 6]);
+
+#[derive(Debug)]
+struct MacAddr8Output([u8; 8]);
+
+#[derive(Debug)]
+struct TimeOutput(u64);
+
+impl ToSql for TimeOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_i64(self.0 as i64);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TIME
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for TimeOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(crate::engine::format_time(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+macro_rules! impl_mac_output {
+    ($type:ty, $pg_type:expr) => {
+        impl ToSql for $type {
+            fn to_sql(
+                &self,
+                _ty: &Type,
+                out: &mut BytesMut,
+            ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+                out.put_slice(&self.0);
+                Ok(IsNull::No)
+            }
+
+            fn accepts(ty: &Type) -> bool {
+                *ty == $pg_type
+            }
+
+            postgres_types::to_sql_checked!();
+        }
+
+        impl ToSqlText for $type {
+            fn to_sql_text(
+                &self,
+                _ty: &Type,
+                out: &mut BytesMut,
+                _format_options: &FormatOptions,
+            ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+                out.put_slice(crate::engine::format_macaddr(&self.0).as_bytes());
+                Ok(IsNull::No)
+            }
+        }
+    };
+}
+
+impl_mac_output!(MacAddrOutput, Type::MACADDR);
+impl_mac_output!(MacAddr8Output, Type::MACADDR8);
+
+impl ToSql for OidOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_u32(self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::OID
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for OidOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(self.0.to_string().as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for PgLsnOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_u64(self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::PG_LSN
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for PgLsnOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_pg_lsn(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+#[derive(Debug)]
 struct PgCharOutput(u8);
 
 #[derive(Debug)]
 struct FloatOutput {
     value: f64,
     extra_float_digits: i32,
+}
+
+#[derive(Debug)]
+struct FloatTextOutput<'a>(&'a str);
+
+impl ToSql for FloatTextOutput<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.parse::<f64>()?);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::FLOAT8
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for FloatTextOutput<'_> {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
 }
 
 impl ToSql for FloatOutput {
@@ -1553,6 +2004,44 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
             }
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Oid(a), Value::Oid(b)) => a.cmp(b),
+        (Value::Oid(a), Value::Int64(b)) => u64::from(*a).cmp(&(*b as u64)),
+        (Value::Int64(a), Value::Oid(b)) => (*a as u64).cmp(&u64::from(*b)),
+        (Value::Oid(a), Value::Text(b)) => {
+            let b = crate::engine::parse_oid_text(b).ok()?;
+            a.cmp(&b)
+        }
+        (Value::Text(a), Value::Oid(b)) => {
+            let a = crate::engine::parse_oid_text(a).ok()?;
+            a.cmp(b)
+        }
+        (Value::PgLsn(a), Value::PgLsn(b)) => a.cmp(b),
+        (Value::MacAddr(a), Value::MacAddr(b)) => a.cmp(b),
+        (Value::MacAddr8(a), Value::MacAddr8(b)) => a.cmp(b),
+        (Value::MacAddr(a), Value::Text(b)) => {
+            let b = crate::engine::parse_macaddr_text(b).ok()?;
+            a.cmp(&b)
+        }
+        (Value::Text(a), Value::MacAddr(b)) => {
+            let a = crate::engine::parse_macaddr_text(a).ok()?;
+            a.cmp(b)
+        }
+        (Value::MacAddr8(a), Value::Text(b)) => {
+            let b = crate::engine::parse_macaddr8_text(b).ok()?;
+            a.cmp(&b)
+        }
+        (Value::Text(a), Value::MacAddr8(b)) => {
+            let a = crate::engine::parse_macaddr8_text(a).ok()?;
+            a.cmp(b)
+        }
+        (Value::PgLsn(a), Value::Text(b)) => {
+            let b = crate::engine::parse_pg_lsn_text(b).ok()?;
+            a.cmp(&b)
+        }
+        (Value::Text(a), Value::PgLsn(b)) => {
+            let a = crate::engine::parse_pg_lsn_text(a).ok()?;
+            a.cmp(b)
+        }
         (Value::Line(a), Value::Line(b)) => {
             if a == b {
                 Ordering::Equal
@@ -1571,6 +2060,15 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
         }
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::TimeMicros(a), Value::TimeMicros(b)) => a.cmp(b),
+        (Value::TimeMicros(a), Value::Text(b)) => {
+            let b = crate::engine::parse_time_text(b, None).ok()?;
+            a.cmp(&b)
+        }
+        (Value::Text(a), Value::TimeMicros(b)) => {
+            let a = crate::engine::parse_time_text(a, None).ok()?;
+            a.cmp(b)
+        }
         (Value::TimestampMicros(a), Value::TimestampMicros(b)) => a.cmp(b),
         (Value::TimestamptzMicros(a), Value::TimestamptzMicros(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
@@ -1660,6 +2158,18 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Tid) => {
                                     enc.encode_field(&Option::<TidOutput>::None)
                                 }
+                                (Value::Null, DataType::Oid) => {
+                                    enc.encode_field(&Option::<OidOutput>::None)
+                                }
+                                (Value::Null, DataType::PgLsn) => {
+                                    enc.encode_field(&Option::<PgLsnOutput>::None)
+                                }
+                                (Value::Null, DataType::MacAddr) => {
+                                    enc.encode_field(&Option::<MacAddrOutput>::None)
+                                }
+                                (Value::Null, DataType::MacAddr8) => {
+                                    enc.encode_field(&Option::<MacAddr8Output>::None)
+                                }
                                 (Value::Null, DataType::Path) => {
                                     enc.encode_field(&Option::<PathOutput>::None)
                                 }
@@ -1674,6 +2184,9 @@ pub async fn to_pgwire_stream(
                                 }
                                 (Value::Null, DataType::Date) => {
                                     enc.encode_field(&Option::<String>::None)
+                                }
+                                (Value::Null, DataType::Time(_)) => {
+                                    enc.encode_field(&Option::<TimeOutput>::None)
                                 }
                                 (Value::Null, DataType::Timestamp) => {
                                     enc.encode_field(&Option::<String>::None)
@@ -1699,6 +2212,9 @@ pub async fn to_pgwire_stream(
                                         extra_float_digits: ctx.extra_float_digits,
                                     })
                                 }
+                                (Value::Text(s), DataType::Float8) => {
+                                    enc.encode_field(&FloatTextOutput(&s))
+                                }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Varchar(_)) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Name) => enc.encode_field(&s),
@@ -1723,6 +2239,18 @@ pub async fn to_pgwire_stream(
                                 }
                                 (Value::Tid(tid), DataType::Tid) => {
                                     enc.encode_field(&TidOutput(tid))
+                                }
+                                (Value::Oid(value), DataType::Oid) => {
+                                    enc.encode_field(&OidOutput(value))
+                                }
+                                (Value::PgLsn(value), DataType::PgLsn) => {
+                                    enc.encode_field(&PgLsnOutput(value))
+                                }
+                                (Value::MacAddr(value), DataType::MacAddr) => {
+                                    enc.encode_field(&MacAddrOutput(value))
+                                }
+                                (Value::MacAddr8(value), DataType::MacAddr8) => {
+                                    enc.encode_field(&MacAddr8Output(value))
                                 }
                                 (Value::Path(path), DataType::Path) => {
                                     enc.encode_field(&PathOutput(path))
@@ -1765,6 +2293,9 @@ pub async fn to_pgwire_stream(
                                         };
                                         enc.encode_field(&text)
                                     }
+                                }
+                                (Value::TimeMicros(value), DataType::Time(_)) => {
+                                    enc.encode_field(&TimeOutput(value))
                                 }
                                 (Value::TimestampMicros(micros), DataType::Timestamp) => {
                                     if fmt == FieldFormat::Binary {

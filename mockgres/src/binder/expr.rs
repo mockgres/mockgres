@@ -578,9 +578,14 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             Value::Circle(_) => Some(DataType::Circle),
             Value::Box(_) => Some(DataType::Box),
             Value::Tid(_) => Some(DataType::Tid),
+            Value::Oid(_) => Some(DataType::Oid),
+            Value::PgLsn(_) => Some(DataType::PgLsn),
+            Value::MacAddr(_) => Some(DataType::MacAddr),
+            Value::MacAddr8(_) => Some(DataType::MacAddr8),
             Value::Path(_) => Some(DataType::Path),
             Value::Bool(_) => Some(DataType::Bool),
             Value::Date(_) => Some(DataType::Date),
+            Value::TimeMicros(_) => Some(DataType::Time(None)),
             Value::TimestampMicros(_) => Some(DataType::Timestamp),
             Value::TimestamptzMicros(_) => Some(DataType::Timestamptz),
             Value::Bytes(_) => Some(DataType::Bytea),
@@ -590,6 +595,9 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
         ScalarExpr::BinaryOp { op, left, right } => match op {
             ScalarBinaryOp::Concat => Some(DataType::Text),
             ScalarBinaryOp::Distance => Some(DataType::Float8),
+            ScalarBinaryOp::BitAnd | ScalarBinaryOp::BitOr => {
+                scalar_expr_type(left.as_ref(), schema)
+            }
             ScalarBinaryOp::Add
             | ScalarBinaryOp::Sub
             | ScalarBinaryOp::Mul
@@ -598,6 +606,17 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
                 let l = scalar_expr_type(left.as_ref(), schema);
                 let r = scalar_expr_type(right.as_ref(), schema);
                 if matches!(op, ScalarBinaryOp::Add | ScalarBinaryOp::Sub) {
+                    if matches!(l, Some(DataType::PgLsn))
+                        && matches!(r, Some(DataType::PgLsn))
+                        && matches!(op, ScalarBinaryOp::Sub)
+                    {
+                        return Some(DataType::Float8);
+                    }
+                    if matches!(l, Some(DataType::PgLsn))
+                        || (matches!(r, Some(DataType::PgLsn)) && matches!(op, ScalarBinaryOp::Add))
+                    {
+                        return Some(DataType::PgLsn);
+                    }
                     if matches!(l, Some(DataType::Timestamptz))
                         && matches!(r, Some(DataType::Interval))
                     {
@@ -661,6 +680,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::RegexpReplace => Some(DataType::Text),
             ScalarFunc::InfiniteRecurse => Some(DataType::Int4),
             ScalarFunc::PgRelationSize => Some(DataType::Int8),
+            ScalarFunc::PgSizePretty => Some(DataType::Text),
+            ScalarFunc::PgSizeBytes => Some(DataType::Int8),
             ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::CharLength => Some(DataType::Int4),
             ScalarFunc::Decode | ScalarFunc::TestPglzCompress | ScalarFunc::TestPglzDecompress => {
@@ -696,12 +717,24 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
                 .filter_map(|a| scalar_expr_type(a, schema))
                 .next(),
             ScalarFunc::ExtractEpoch => Some(DataType::Float8),
+            ScalarFunc::ExtractMicrosecond
+            | ScalarFunc::ExtractMillisecond
+            | ScalarFunc::ExtractSecond
+            | ScalarFunc::ExtractMinute
+            | ScalarFunc::ExtractHour => Some(DataType::Float8),
+            ScalarFunc::DatePartEpoch
+            | ScalarFunc::DatePartMicrosecond
+            | ScalarFunc::DatePartMillisecond
+            | ScalarFunc::DatePartSecond => Some(DataType::Float8),
             ScalarFunc::Coalesce => args
                 .iter()
                 .filter_map(|a| scalar_expr_type(a, schema))
                 .next(),
             ScalarFunc::PgAdvisoryLock => Some(DataType::Void),
             ScalarFunc::PgAdvisoryUnlock => Some(DataType::Bool),
+            ScalarFunc::Trunc | ScalarFunc::MacAddr8Set7Bit => {
+                args.first().and_then(|arg| scalar_expr_type(arg, schema))
+            }
         },
         ScalarExpr::WindowRowNumber(_) => Some(DataType::Int8),
         ScalarExpr::Predicate(_) => Some(DataType::Bool),

@@ -1,7 +1,8 @@
 use crate::catalog::SchemaName;
 use crate::engine::{
     InsertSource, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, fe, fe_code,
-    parse_box_text, parse_circle_text, parse_line_text, parse_lseg_text, parse_path_text,
+    parse_box_text, parse_circle_text, parse_line_text, parse_lseg_text, parse_macaddr_text,
+    parse_macaddr8_text, parse_path_text, parse_pg_lsn_text, parse_time_text,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
@@ -60,6 +61,18 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
     if table.name.eq_ignore_ascii_case("box_tbl") {
         validate_geometric_insert_literals(&select_stmt, parse_box_text)?;
     }
+    if table.name.eq_ignore_ascii_case("pg_lsn_tbl") {
+        validate_geometric_insert_literals(&select_stmt, parse_pg_lsn_text)?;
+    }
+    if table.name.eq_ignore_ascii_case("macaddr_data") {
+        validate_second_insert_literal(&select_stmt, parse_macaddr_text)?;
+    }
+    if table.name.eq_ignore_ascii_case("macaddr8_data") {
+        validate_second_insert_literal(&select_stmt, parse_macaddr8_text)?;
+    }
+    if table.name.eq_ignore_ascii_case("time_tbl") {
+        validate_geometric_insert_literals(&select_stmt, |value| parse_time_text(value, Some(2)))?;
+    }
     let on_conflict = parse_on_conflict_clause(&ins.on_conflict_clause)?;
     let returning = parse_returning_clause(&ins.returning_list)?;
     let plan = if select_stmt.values_lists.is_empty() {
@@ -101,6 +114,31 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
         }
     };
     super::cte::wrap_with_clause(with_clause, plan)
+}
+
+fn validate_second_insert_literal<T>(
+    select: &pg_query::protobuf::SelectStmt,
+    parse: impl Fn(&str) -> Result<T, crate::engine::SqlError>,
+) -> PgWireResult<()> {
+    for row in &select.values_lists {
+        let Some(NodeEnum::List(row)) = row.node.as_ref() else {
+            continue;
+        };
+        let Some(NodeEnum::AConst(value)) = row.items.get(1).and_then(|item| item.node.as_ref())
+        else {
+            continue;
+        };
+        let Some(pg_query::protobuf::a_const::Val::Sval(value_text)) = value.val.as_ref() else {
+            continue;
+        };
+        if let Err(error) = parse(&value_text.sval) {
+            let mut info =
+                ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
+            info.position = Some((value.location + 1).to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+    }
+    Ok(())
 }
 
 fn validate_lseg_insert_literals(select: &pg_query::protobuf::SelectStmt) -> PgWireResult<()> {

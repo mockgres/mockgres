@@ -738,6 +738,18 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
         DataType::Tid => crate::engine::parse_tid_text(s)
             .map(Value::Tid)
             .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Oid => crate::engine::parse_oid_text(s)
+            .map(Value::Oid)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::PgLsn => crate::engine::parse_pg_lsn_text(s)
+            .map(Value::PgLsn)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::MacAddr => crate::engine::parse_macaddr_text(s)
+            .map(Value::MacAddr)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::MacAddr8 => crate::engine::parse_macaddr8_text(s)
+            .map(Value::MacAddr8)
+            .map_err(|error| fe_code(error.code, error.message)),
         DataType::Path => crate::engine::parse_path_text(s)
             .map(Value::Path)
             .map_err(|error| fe_code(error.code, error.message)),
@@ -755,6 +767,9 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             let days = parse_date_str(s).map_err(fe)?;
             Ok(Value::Date(days))
         }
+        DataType::Time(precision) => crate::engine::parse_time_text(s, *precision)
+            .map(Value::TimeMicros)
+            .map_err(|error| fe_code(error.code, error.message)),
         DataType::Timestamp => {
             let micros = parse_timestamp_str(s).map_err(fe)?;
             Ok(Value::TimestampMicros(micros))
@@ -935,6 +950,38 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
                 ),
             )))
         }
+        DataType::Oid => {
+            if bytes.len() != 4 {
+                return Err(fe("binary oid must be 4 bytes"));
+            }
+            Ok(Value::Oid(u32::from_be_bytes(
+                bytes.try_into().expect("binary oid width checked"),
+            )))
+        }
+        DataType::PgLsn => {
+            if bytes.len() != 8 {
+                return Err(fe("binary pg_lsn must be 8 bytes"));
+            }
+            Ok(Value::PgLsn(u64::from_be_bytes(
+                bytes.try_into().expect("binary pg_lsn width checked"),
+            )))
+        }
+        DataType::MacAddr => {
+            if bytes.len() != 6 {
+                return Err(fe("binary macaddr must be 6 bytes"));
+            }
+            Ok(Value::MacAddr(
+                bytes.try_into().expect("binary macaddr width checked"),
+            ))
+        }
+        DataType::MacAddr8 => {
+            if bytes.len() != 8 {
+                return Err(fe("binary macaddr8 must be 8 bytes"));
+            }
+            Ok(Value::MacAddr8(
+                bytes.try_into().expect("binary macaddr8 width checked"),
+            ))
+        }
         DataType::Path => {
             if bytes.len() < 5 {
                 return Err(fe("binary path must contain a header"));
@@ -992,6 +1039,14 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
             let pg_days = i32::from_be_bytes(arr);
             let days = postgres_days_to_date(pg_days);
             Ok(Value::Date(days))
+        }
+        DataType::Time(_) => {
+            if bytes.len() != 8 {
+                return Err(fe("binary time must be 8 bytes"));
+            }
+            Ok(Value::TimeMicros(u64::from_be_bytes(
+                bytes.try_into().expect("binary time width checked"),
+            )))
         }
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes

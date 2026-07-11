@@ -67,11 +67,16 @@ pub enum DataType {
     Circle,
     Box,
     Tid,
+    Oid,
+    PgLsn,
+    MacAddr,
+    MacAddr8,
     Path,
     Json,
     Jsonb,
     Bool,
     Date,
+    Time(Option<usize>),
     Timestamp,
     Timestamptz,
     Bytea,
@@ -97,11 +102,16 @@ impl DataType {
             DataType::Circle => Type::CIRCLE,
             DataType::Box => Type::BOX,
             DataType::Tid => Type::TID,
+            DataType::Oid => Type::OID,
+            DataType::PgLsn => Type::PG_LSN,
+            DataType::MacAddr => Type::MACADDR,
+            DataType::MacAddr8 => Type::MACADDR8,
             DataType::Path => Type::PATH,
             DataType::Json => Type::JSON,
             DataType::Jsonb => Type::JSONB,
             DataType::Bool => Type::BOOL,
             DataType::Date => Type::DATE,
+            DataType::Time(_) => Type::TIME,
             DataType::Timestamp => Type::TIMESTAMP,
             DataType::Timestamptz => Type::TIMESTAMPTZ,
             DataType::Bytea => Type::BYTEA,
@@ -326,9 +336,14 @@ pub enum Value {
     Circle(CircleValue),
     Box(BoxValue),
     Tid(TidValue),
+    Oid(u32),
+    PgLsn(u64),
+    MacAddr([u8; 6]),
+    MacAddr8([u8; 8]),
     Path(PathValue),
     Bool(bool),
     Date(i32),
+    TimeMicros(u64),
     TimestampMicros(i64),
     TimestamptzMicros(i64),
     Bytes(Vec<u8>),
@@ -350,9 +365,14 @@ impl PartialEq for Value {
             (Circle(a), Circle(b)) => a == b,
             (Box(a), Box(b)) => a == b,
             (Tid(a), Tid(b)) => a == b,
+            (Oid(a), Oid(b)) => a == b,
+            (PgLsn(a), PgLsn(b)) => a == b,
+            (MacAddr(a), MacAddr(b)) => a == b,
+            (MacAddr8(a), MacAddr8(b)) => a == b,
             (Path(a), Path(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
+            (TimeMicros(a), TimeMicros(b)) => a == b,
             (TimestampMicros(a), TimestampMicros(b)) => a == b,
             (TimestamptzMicros(a), TimestamptzMicros(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
@@ -380,9 +400,14 @@ impl Hash for Value {
             Circle(circle) => circle.hash(state),
             Box(value) => value.hash(state),
             Tid(tid) => tid.hash(state),
+            Oid(value) => value.hash(state),
+            PgLsn(value) => value.hash(state),
+            MacAddr(value) => value.hash(state),
+            MacAddr8(value) => value.hash(state),
             Path(path) => path.hash(state),
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
+            TimeMicros(value) => value.hash(state),
             TimestampMicros(t) => t.hash(state),
             TimestamptzMicros(t) => t.hash(state),
             Bytes(b) => b.hash(state),
@@ -418,6 +443,229 @@ pub fn cast_value_to_type(
     tz: &SessionTimeZone,
 ) -> Result<Value, SqlError> {
     convert_value_to_type(val, target, tz, false)
+}
+
+pub fn parse_pg_lsn_text(input: &str) -> Result<u64, SqlError> {
+    fn invalid(input: &str) -> SqlError {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type pg_lsn: \"{input}\""),
+        )
+    }
+    if input.trim() != input {
+        return Err(invalid(input));
+    }
+    let (high, low) = input.split_once('/').ok_or_else(|| invalid(input))?;
+    if high.is_empty() || low.is_empty() || high.contains('/') || low.contains('/') {
+        return Err(invalid(input));
+    }
+    let high = u32::from_str_radix(high, 16).map_err(|_| invalid(input))?;
+    let low = u32::from_str_radix(low, 16).map_err(|_| invalid(input))?;
+    Ok((u64::from(high) << 32) | u64::from(low))
+}
+
+pub fn parse_oid_text(input: &str) -> Result<u32, SqlError> {
+    let trimmed = input.trim();
+    let parsed = trimmed.parse::<i128>().map_err(|_| {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type oid: \"{input}\""),
+        )
+    })?;
+    if parsed < i32::MIN as i128 || parsed > u32::MAX as i128 {
+        return Err(SqlError::new(
+            "22003",
+            format!("value \"{input}\" is out of range for type oid"),
+        ));
+    }
+    Ok(parsed as u32)
+}
+
+pub fn format_pg_lsn(value: u64) -> String {
+    format!("{:X}/{:X}", value >> 32, value & u64::from(u32::MAX))
+}
+
+pub fn parse_macaddr_text(input: &str) -> Result<[u8; 6], SqlError> {
+    let trimmed = input.trim();
+    let compact = if trimmed.len() == 12 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        trimmed.to_string()
+    } else {
+        let separator = if trimmed.contains(':') {
+            ':'
+        } else if trimmed.contains('-') {
+            '-'
+        } else if trimmed.contains('.') {
+            '.'
+        } else {
+            '\0'
+        };
+        let groups = trimmed.split(separator).collect::<Vec<_>>();
+        let valid = (matches!(separator, ':' | '-')
+            && ((groups.len() == 6 && groups.iter().all(|group| group.len() == 2))
+                || (groups.len() == 2 && groups.iter().all(|group| group.len() == 6))))
+            || (matches!(separator, '.' | '-')
+                && groups.len() == 3
+                && groups.iter().all(|group| group.len() == 4));
+        if !valid {
+            return Err(invalid_macaddr(input, "macaddr"));
+        }
+        groups.concat()
+    };
+    parse_mac_bytes::<6>(&compact).map_err(|_| invalid_macaddr(input, "macaddr"))
+}
+
+pub fn parse_macaddr8_text(input: &str) -> Result<[u8; 8], SqlError> {
+    let trimmed = input.trim();
+    if let Ok(mac) = parse_macaddr_text(trimmed) {
+        return Ok([mac[0], mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]);
+    }
+    {
+        let compact = trimmed.replace([':', '-', '.'], "");
+        if compact.len() == 12
+            && compact.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && ((trimmed.matches(':').count() == 2
+                && trimmed.split(':').all(|group| group.len() == 4))
+                || (trimmed.matches('-').count() == 2
+                    && trimmed.split('-').all(|group| group.len() == 4)))
+        {
+            let mac =
+                parse_mac_bytes::<6>(&compact).map_err(|_| invalid_macaddr(input, "macaddr8"))?;
+            return Ok([mac[0], mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]]);
+        }
+    }
+    let compact = trimmed.replace([':', '-', '.'], "");
+    let shape_valid = (trimmed.len() == 23
+        && (trimmed.matches(':').count() == 7 || trimmed.matches('-').count() == 7))
+        || (trimmed.len() == 19 && trimmed.matches('.').count() == 3)
+        || (trimmed.len() == 17 && trimmed.matches(':').count() == 1)
+        || (trimmed.len() == 17 && trimmed.matches('-').count() == 1)
+        || (trimmed.len() == 16 && !trimmed.contains([':', '-', '.']));
+    if !shape_valid || compact.len() != 16 {
+        return Err(invalid_macaddr(input, "macaddr8"));
+    }
+    parse_mac_bytes::<8>(&compact).map_err(|_| invalid_macaddr(input, "macaddr8"))
+}
+
+fn parse_mac_bytes<const N: usize>(input: &str) -> Result<[u8; N], ()> {
+    if input.len() != N * 2 {
+        return Err(());
+    }
+    let mut bytes = [0; N];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&input[index * 2..index * 2 + 2], 16).map_err(|_| ())?;
+    }
+    Ok(bytes)
+}
+
+fn invalid_macaddr(input: &str, type_name: &str) -> SqlError {
+    SqlError::new(
+        "22P02",
+        format!("invalid input syntax for type {type_name}: \"{input}\""),
+    )
+}
+
+pub fn format_macaddr<const N: usize>(value: &[u8; N]) -> String {
+    value
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+pub fn parse_time_text(input: &str, precision: Option<usize>) -> Result<u64, SqlError> {
+    let tokens = input.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Err(invalid_time(input, "22007"));
+    }
+    let has_date = tokens.first().is_some_and(|token| token.contains('-'));
+    let time_index = usize::from(has_date);
+    let Some(time) = tokens.get(time_index) else {
+        return Err(invalid_time(input, "22007"));
+    };
+    if tokens
+        .iter()
+        .skip(time_index + 1)
+        .any(|token| token.contains('/') && !has_date)
+    {
+        return Err(invalid_time(input, "22007"));
+    }
+    let meridiem = tokens
+        .iter()
+        .skip(time_index + 1)
+        .find(|token| token.eq_ignore_ascii_case("am") || token.eq_ignore_ascii_case("pm"));
+    let parts = time.split(':').collect::<Vec<_>>();
+    if !(2..=3).contains(&parts.len()) {
+        return Err(invalid_time(input, "22007"));
+    }
+    let mut hour = parts[0]
+        .parse::<u64>()
+        .map_err(|_| invalid_time(input, "22007"))?;
+    let minute = parts[1]
+        .parse::<u64>()
+        .map_err(|_| invalid_time(input, "22007"))?;
+    let seconds = parts
+        .get(2)
+        .copied()
+        .unwrap_or("0")
+        .parse::<f64>()
+        .map_err(|_| invalid_time(input, "22007"))?;
+    if let Some(meridiem) = meridiem {
+        if !(1..=12).contains(&hour) {
+            return Err(range_time(input));
+        }
+        if meridiem.eq_ignore_ascii_case("pm") {
+            if hour != 12 {
+                hour += 12;
+            }
+        } else if hour == 12 {
+            hour = 0;
+        }
+    }
+    if minute >= 60 || !(0.0..60.01).contains(&seconds) || hour > 24 {
+        return Err(range_time(input));
+    }
+    let mut micros =
+        ((hour * 3600 + minute * 60) as f64 * 1_000_000.0 + seconds * 1_000_000.0).round() as u64;
+    if let Some(precision) = precision {
+        let precision = precision.min(6);
+        let quantum = 10_u64.pow((6 - precision) as u32);
+        micros = ((micros + quantum / 2) / quantum) * quantum;
+    }
+    const DAY: u64 = 86_400_000_000;
+    if micros > DAY || (hour == 24 && (minute != 0 || seconds != 0.0)) {
+        return Err(range_time(input));
+    }
+    Ok(micros)
+}
+
+fn invalid_time(input: &str, code: &'static str) -> SqlError {
+    SqlError::new(
+        code,
+        format!("invalid input syntax for type time: \"{input}\""),
+    )
+}
+
+fn range_time(input: &str) -> SqlError {
+    SqlError::new(
+        "22008",
+        format!("date/time field value out of range: \"{input}\""),
+    )
+}
+
+pub fn format_time(value: u64) -> String {
+    if value == 86_400_000_000 {
+        return "24:00:00".to_string();
+    }
+    let hours = value / 3_600_000_000;
+    let minutes = (value / 60_000_000) % 60;
+    let seconds = (value / 1_000_000) % 60;
+    let micros = value % 1_000_000;
+    if micros == 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        let fraction = format!("{micros:06}").trim_end_matches('0').to_string();
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{fraction}")
+    }
 }
 
 pub fn parse_point_text(input: &str) -> Result<PointValue, SqlError> {
@@ -1088,6 +1336,45 @@ fn convert_value_to_type(
         (DataType::Tid, Value::Tid(tid)) => Ok(Value::Tid(tid)),
         (DataType::Tid, Value::Text(value)) => parse_tid_text(&value).map(Value::Tid),
         (DataType::Text, Value::Tid(tid)) => Ok(Value::Text(format_tid_text(tid))),
+        (DataType::Oid, Value::Oid(value)) => Ok(Value::Oid(value)),
+        (DataType::Oid, Value::Int64(value)) if value >= i32::MIN as i64 => {
+            Ok(Value::Oid(value as u32))
+        }
+        (DataType::Oid, Value::Text(value)) => parse_oid_text(&value).map(Value::Oid),
+        (DataType::Text, Value::Oid(value)) => Ok(Value::Text(value.to_string())),
+        (DataType::PgLsn, Value::PgLsn(value)) => Ok(Value::PgLsn(value)),
+        (DataType::PgLsn, Value::Text(value)) => parse_pg_lsn_text(&value).map(Value::PgLsn),
+        (DataType::Text, Value::PgLsn(value)) => Ok(Value::Text(format_pg_lsn(value))),
+        (DataType::MacAddr, Value::MacAddr(value)) => Ok(Value::MacAddr(value)),
+        (DataType::MacAddr, Value::Text(value)) => parse_macaddr_text(&value).map(Value::MacAddr),
+        (DataType::MacAddr, Value::MacAddr8(value)) if value[3..5] == [0xff, 0xfe] => {
+            Ok(Value::MacAddr([
+                value[0], value[1], value[2], value[5], value[6], value[7],
+            ]))
+        }
+        (DataType::Text, Value::MacAddr(value)) => Ok(Value::Text(format_macaddr(&value))),
+        (DataType::MacAddr8, Value::MacAddr8(value)) => Ok(Value::MacAddr8(value)),
+        (DataType::MacAddr8, Value::MacAddr(value)) => Ok(Value::MacAddr8([
+            value[0], value[1], value[2], 0xff, 0xfe, value[3], value[4], value[5],
+        ])),
+        (DataType::MacAddr8, Value::Text(value)) => {
+            parse_macaddr8_text(&value).map(Value::MacAddr8)
+        }
+        (DataType::Text, Value::MacAddr8(value)) => Ok(Value::Text(format_macaddr(&value))),
+        (DataType::Time(precision), Value::TimeMicros(value)) => {
+            if let Some(precision) = precision {
+                let quantum = 10_u64.pow((6 - (*precision).min(6)) as u32);
+                Ok(Value::TimeMicros(
+                    ((value + quantum / 2) / quantum) * quantum,
+                ))
+            } else {
+                Ok(Value::TimeMicros(value))
+            }
+        }
+        (DataType::Time(precision), Value::Text(value)) => {
+            parse_time_text(&value, *precision).map(Value::TimeMicros)
+        }
+        (DataType::Text, Value::TimeMicros(value)) => Ok(Value::Text(format_time(value))),
         (DataType::Path, Value::Path(path)) => Ok(Value::Path(path)),
         (DataType::Path, Value::Text(value)) => parse_path_text(&value).map(Value::Path),
         (DataType::Text, Value::Path(path)) => Ok(Value::Text(format_path_text(&path))),

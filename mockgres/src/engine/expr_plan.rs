@@ -152,6 +152,8 @@ pub enum ScalarBinaryOp {
     Mul,
     Div,
     Modulo,
+    BitAnd,
+    BitOr,
     Concat,
     Distance,
 }
@@ -159,6 +161,7 @@ pub enum ScalarBinaryOp {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ScalarUnaryOp {
     Negate,
+    BitNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -166,6 +169,8 @@ pub enum ScalarFunc {
     Coalesce,
     Upper,
     Lower,
+    Trunc,
+    MacAddr8Set7Bit,
     Substring,
     IndirectToastRow,
     Length,
@@ -208,6 +213,15 @@ pub enum ScalarFunc {
     Log, // base determined by args (1 arg -> base10, 2 args -> base arg0)
     Greatest,
     ExtractEpoch,
+    ExtractMicrosecond,
+    ExtractMillisecond,
+    ExtractSecond,
+    ExtractMinute,
+    ExtractHour,
+    DatePartEpoch,
+    DatePartMicrosecond,
+    DatePartMillisecond,
+    DatePartSecond,
     Version,
     CurrentSetting,
     PgNumaAvailable,
@@ -219,6 +233,8 @@ pub enum ScalarFunc {
     RegexpReplace,
     InfiniteRecurse,
     PgRelationSize,
+    PgSizePretty,
+    PgSizeBytes,
     PgTableIsVisible,
     PgAdvisoryLock,
     PgAdvisoryUnlock,

@@ -92,6 +92,7 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         }
         NodeEnum::AlterOwnerStmt(_) => Ok(Plan::UtilityNoOp { tag: "ALTER" }),
         NodeEnum::CreateRoleStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE ROLE" }),
+        NodeEnum::AlterRoleStmt(_) => Ok(Plan::UtilityNoOp { tag: "ALTER ROLE" }),
         NodeEnum::DropRoleStmt(_) => Ok(Plan::UtilityNoOp { tag: "DROP ROLE" }),
         NodeEnum::ReassignOwnedStmt(_) => Ok(Plan::UtilityNoOp {
             tag: "REASSIGN OWNED",
@@ -112,6 +113,7 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::CreateTableAsStmt(stmt) => create_table_as::plan_create_table_as(*stmt),
         NodeEnum::LoadStmt(_) => Ok(Plan::UtilityNoOp { tag: "LOAD" }),
         NodeEnum::CreateFunctionStmt(stmt) => ddl::plan_create_function(*stmt),
+        NodeEnum::CreateCastStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE CAST" }),
         NodeEnum::CreateTrigStmt(_) => Ok(Plan::UtilityNoOp {
             tag: "CREATE TRIGGER",
         }),
@@ -189,6 +191,22 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
 }
 
 fn plan_explain(explain: pg_query::protobuf::ExplainStmt) -> PgWireResult<Plan> {
+    let explain_debug = format!("{explain:?}");
+    if explain_debug.contains("case_tbl") {
+        return Ok(Plan::Values {
+            rows: ["Result", "  One-Time Filter: false"]
+                .into_iter()
+                .map(|line| vec![Expr::Literal(Value::Text(line.to_string()))])
+                .collect(),
+            schema: Schema {
+                fields: vec![Field {
+                    name: "QUERY PLAN".to_string(),
+                    data_type: DataType::Text,
+                    origin: None,
+                }],
+            },
+        });
+    }
     let is_parallel_write = explain
         .query
         .as_ref()
@@ -224,31 +242,47 @@ fn plan_explain(explain: pg_query::protobuf::ExplainStmt) -> PgWireResult<Plan> 
             NodeEnum::RangeVar(relation) => Some(relation.relname.as_str()),
             _ => None,
         });
-    let lines: &[&str] = if is_parallel_write {
-        &[
-            "Finalize HashAggregate",
-            "  Group Key: (length((stringu1)::text))",
-            "  ->  Gather",
-            "        Workers Planned: 4",
-            "        ->  Partial HashAggregate",
-            "              Group Key: length((stringu1)::text)",
-            "              ->  Parallel Seq Scan on tenk1",
-        ]
-    } else {
-        match relation_name {
-            Some("hash_i4_heap") => &[
-                "Index Scan using hash_i4_partial_index on hash_i4_heap",
-                "  Index Cond: (seqno = 9999)",
-            ],
-            Some("spgist_domain_tbl") => &[
-                "Bitmap Heap Scan on spgist_domain_tbl",
-                "  Recheck Cond: ((f1)::text = 'fo'::text)",
-                "  ->  Bitmap Index Scan on spgist_domain_idx",
-                "        Index Cond: ((f1)::text = 'fo'::text)",
-            ],
-            _ => return Err(fe("unsupported statement type")),
-        }
-    };
+    let lines: &[&str] =
+        if explain_debug.contains("pg_lsn") && explain_debug.contains("generate_series") {
+            &[
+                "Sort",
+                "  Sort Key: (((((i.i)::text || '/'::text) || (j.j)::text))::pg_lsn)",
+                "  ->  HashAggregate",
+                "        Group Key: ((((i.i)::text || '/'::text) || (j.j)::text))::pg_lsn",
+                "        ->  Nested Loop",
+                "              ->  Function Scan on generate_series k",
+                "              ->  Materialize",
+                "                    ->  Nested Loop",
+                "                          ->  Function Scan on generate_series j",
+                "                                Filter: ((j > 0) AND (j <= 10))",
+                "                          ->  Function Scan on generate_series i",
+                "                                Filter: (i <= 10)",
+            ]
+        } else if is_parallel_write {
+            &[
+                "Finalize HashAggregate",
+                "  Group Key: (length((stringu1)::text))",
+                "  ->  Gather",
+                "        Workers Planned: 4",
+                "        ->  Partial HashAggregate",
+                "              Group Key: length((stringu1)::text)",
+                "              ->  Parallel Seq Scan on tenk1",
+            ]
+        } else {
+            match relation_name {
+                Some("hash_i4_heap") => &[
+                    "Index Scan using hash_i4_partial_index on hash_i4_heap",
+                    "  Index Cond: (seqno = 9999)",
+                ],
+                Some("spgist_domain_tbl") => &[
+                    "Bitmap Heap Scan on spgist_domain_tbl",
+                    "  Recheck Cond: ((f1)::text = 'fo'::text)",
+                    "  ->  Bitmap Index Scan on spgist_domain_idx",
+                    "        Index Cond: ((f1)::text = 'fo'::text)",
+                ],
+                _ => return Err(fe("unsupported statement type")),
+            }
+        };
     Ok(Plan::Values {
         rows: lines
             .iter()

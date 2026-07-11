@@ -1,3 +1,4 @@
+mod catalog_foreign_keys;
 mod config;
 mod describe;
 mod errors;

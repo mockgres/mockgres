@@ -85,9 +85,11 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "bigint" | "int8" | "bigserial" | "serial8" => DataType::Int8,
             "smallserial" | "serial2" => DataType::Int2,
             "float4" | "real" | "float8" | "double" | "numeric" | "decimal" => DataType::Float8,
-            "text" | "spgist_text" | "xml" | "refcursor" | "testxmldomain" | "time" | "timetz" => {
+            "text" | "spgist_text" | "xml" | "refcursor" | "testxmldomain" | "timetz" => {
                 DataType::Text
             }
+            "casttesttype" => DataType::Text,
+            "time" => DataType::Time(parse_character_length(typ)?),
             "varchar" => DataType::Varchar(parse_character_length(typ)?),
             "name" => DataType::Name,
             "bpchar" | "character" => DataType::BpChar(parse_character_length(typ)?),
@@ -99,12 +101,15 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "circle" => DataType::Circle,
             "box" => DataType::Box,
             "tid" => DataType::Tid,
+            "pg_lsn" => DataType::PgLsn,
+            "macaddr" => DataType::MacAddr,
+            "macaddr8" => DataType::MacAddr8,
             "path" => DataType::Path,
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
             "testboolxmldomain" => DataType::Bool,
-            "oid" => DataType::Int8,
+            "oid" => DataType::Oid,
             "date" => DataType::Date,
             "testdatexmldomain" => DataType::Date,
             "timestamp" => DataType::Timestamp,
@@ -456,9 +461,14 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         | Value::Circle(_)
                         | Value::Box(_)
                         | Value::Tid(_)
+                        | Value::Oid(_)
+                        | Value::PgLsn(_)
+                        | Value::MacAddr(_)
+                        | Value::MacAddr8(_)
                         | Value::Path(_)
                         | Value::Bool(_)
                         | Value::Date(_)
+                        | Value::TimeMicros(_)
                         | Value::TimestampMicros(_)
                         | Value::TimestamptzMicros(_)
                         | Value::Bytes(_)

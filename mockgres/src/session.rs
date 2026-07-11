@@ -14,6 +14,59 @@ use crate::txn::TxId;
 
 pub type SessionId = i32;
 
+#[derive(Clone, Debug)]
+pub struct RoleState {
+    pub name: String,
+    pub superuser: bool,
+    pub inherit: bool,
+    pub createrole: bool,
+    pub createdb: bool,
+    pub canlogin: bool,
+    pub replication: bool,
+    pub bypassrls: bool,
+}
+
+impl RoleState {
+    fn new(name: String, canlogin: bool) -> Self {
+        Self {
+            name,
+            superuser: false,
+            inherit: true,
+            createrole: false,
+            createdb: false,
+            canlogin,
+            replication: false,
+            bypassrls: false,
+        }
+    }
+
+    fn apply_options(&mut self, options: &str) {
+        let options = options
+            .split(|character: char| !character.is_ascii_alphanumeric())
+            .filter(|option| !option.is_empty())
+            .collect::<Vec<_>>();
+        for option in options {
+            match option {
+                "SUPERUSER" => self.superuser = true,
+                "NOSUPERUSER" => self.superuser = false,
+                "INHERIT" => self.inherit = true,
+                "NOINHERIT" => self.inherit = false,
+                "CREATEROLE" => self.createrole = true,
+                "NOCREATEROLE" => self.createrole = false,
+                "CREATEDB" => self.createdb = true,
+                "NOCREATEDB" => self.createdb = false,
+                "LOGIN" => self.canlogin = true,
+                "NOLOGIN" => self.canlogin = false,
+                "REPLICATION" => self.replication = true,
+                "NOREPLICATION" => self.replication = false,
+                "BYPASSRLS" => self.bypassrls = true,
+                "NOBYPASSRLS" => self.bypassrls = false,
+                _ => {}
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct RowPointer {
@@ -158,6 +211,7 @@ pub struct SessionState {
     pub maintenance_catalog_reads: u32,
     pub cursors: std::collections::HashMap<String, Plan>,
     pub currtid_calls: std::collections::HashMap<String, u32>,
+    pub roles: std::collections::HashMap<String, RoleState>,
 }
 
 impl Default for SessionState {
@@ -185,6 +239,7 @@ impl Default for SessionState {
             maintenance_catalog_reads: 0,
             cursors: std::collections::HashMap::new(),
             currtid_calls: std::collections::HashMap::new(),
+            roles: std::collections::HashMap::new(),
         }
     }
 }
@@ -407,6 +462,46 @@ impl Session {
         let current = *calls;
         *calls += 1;
         current
+    }
+
+    pub fn apply_role_statement(&self, query: &str) {
+        let normalized = query.trim().trim_end_matches(';').to_ascii_uppercase();
+        let mut words = normalized.split_whitespace();
+        let Some(action) = words.next() else {
+            return;
+        };
+        let Some(kind) = words.next() else {
+            return;
+        };
+        if !matches!(kind, "ROLE" | "USER") {
+            return;
+        }
+        let Some(raw_name) = words.next() else {
+            return;
+        };
+        let name = raw_name.trim_matches('"').to_ascii_lowercase();
+        let options = words.collect::<Vec<_>>().join(" ");
+        let mut state = self.state.lock();
+        match action {
+            "CREATE" => {
+                let mut role = RoleState::new(name.clone(), kind == "USER");
+                role.apply_options(&options);
+                state.roles.insert(name, role);
+            }
+            "ALTER" => {
+                if let Some(role) = state.roles.get_mut(&name) {
+                    role.apply_options(&options);
+                }
+            }
+            "DROP" => {
+                state.roles.remove(&name);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn role(&self, name: &str) -> Option<RoleState> {
+        self.state.lock().roles.get(name).cloned()
     }
 
     pub fn set_statement_time_micros(&self, micros: i64) {

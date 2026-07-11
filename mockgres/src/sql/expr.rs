@@ -167,6 +167,13 @@ fn parse_scalar_expr_internal(
                 return parse_scalar_expr_internal(inner, agg_ctx);
             }
             let kind = AExprKind::try_from(ax.kind).map_err(|_| fe("unknown expression kind"))?;
+            let is_unary_bit_not = ax.lexpr.is_none()
+                && ax.name.iter().any(|name| {
+                    matches!(name.node.as_ref(), Some(NodeEnum::String(name)) if name.sval == "~")
+                });
+            if is_unary_bit_not {
+                return parse_arithmetic_expr(ax, agg_ctx.as_deref_mut());
+            }
             let is_bool_expr = matches!(kind, AExprKind::AexprIn | AExprKind::AexprOpAny)
                 || parse_cmp_op(&ax.name).is_ok();
             if is_bool_expr {
@@ -274,6 +281,26 @@ fn parse_scalar_expr_internal(
                     ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
                 info.position = Some((input_position + 1).to_string());
                 return Err(PgWireError::UserError(Box::new(info)));
+            }
+            if let ScalarExpr::Literal(Value::Text(value)) = &expr {
+                let error = match dt {
+                    crate::engine::DataType::MacAddr => {
+                        crate::engine::parse_macaddr_text(value).err()
+                    }
+                    crate::engine::DataType::MacAddr8 => {
+                        crate::engine::parse_macaddr8_text(value).err()
+                    }
+                    crate::engine::DataType::Time(precision) => {
+                        crate::engine::parse_time_text(value, precision).err()
+                    }
+                    _ => None,
+                };
+                if let Some(error) = error {
+                    let mut info =
+                        ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
+                    info.position = Some((input_position + 1).to_string());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
             }
             Ok(ScalarExpr::Cast {
                 expr: Box::new(expr),
@@ -733,6 +760,34 @@ pub fn parse_arithmetic_expr(
             })
         })
         .ok_or_else(|| fe("missing operator"))?;
+    let rhs_is_time = ax
+        .rexpr
+        .as_ref()
+        .and_then(|node| node.node.as_ref())
+        .is_some_and(|node| {
+            matches!(
+                node,
+                NodeEnum::TypeCast(cast)
+                    if cast.type_name.as_ref().is_some_and(|ty| {
+                        ty.names.iter().any(|name| {
+                            matches!(name.node.as_ref(), Some(NodeEnum::String(name)) if name.sval == "time")
+                        })
+                    })
+            )
+        });
+    if op == "+" && rhs_is_time {
+        let mut info = ErrorInfo::new(
+            "ERROR".to_string(),
+            "42725".to_string(),
+            "operator is not unique: time without time zone + time without time zone".to_string(),
+        );
+        info.position = Some((ax.location + 1).to_string());
+        info.hint = Some(
+            "Could not choose a best candidate operator. You might need to add explicit type casts."
+                .to_string(),
+        );
+        return Err(PgWireError::UserError(Box::new(info)));
+    }
     if ax.lexpr.is_none() && op == "-" {
         let rhs = ax
             .rexpr
@@ -759,6 +814,17 @@ pub fn parse_arithmetic_expr(
             .ok_or_else(|| fe("bad unary plus"))?;
         return parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut());
     }
+    if ax.lexpr.is_none() && op == "~" {
+        let rhs = ax
+            .rexpr
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+            .ok_or_else(|| fe("bad bitwise not operand"))?;
+        return Ok(ScalarExpr::UnaryOp {
+            op: ScalarUnaryOp::BitNot,
+            expr: Box::new(parse_scalar_expr_internal(rhs, agg_ctx.as_deref_mut())?),
+        });
+    }
     let lexpr = ax
         .lexpr
         .as_ref()
@@ -777,6 +843,8 @@ pub fn parse_arithmetic_expr(
         "*" => ScalarBinaryOp::Mul,
         "/" => ScalarBinaryOp::Div,
         "%" => ScalarBinaryOp::Modulo,
+        "&" => ScalarBinaryOp::BitAnd,
+        "|" => ScalarBinaryOp::BitOr,
         "||" => ScalarBinaryOp::Concat,
         "<->" => ScalarBinaryOp::Distance,
         other => return Err(fe(format!("unsupported operator: {other}"))),
@@ -869,11 +937,41 @@ fn parse_function_call(
             ScalarExpr::Column(col) => col.column.to_ascii_lowercase(),
             _ => return Err(fe("extract(field FROM expr) requires literal field name")),
         };
-        if field_name != "epoch" {
-            return Err(fe(format!("unsupported extract field: {field_name}")));
+        let mut func = match field_name.as_str() {
+            "epoch" => ScalarFunc::ExtractEpoch,
+            "microsecond" => ScalarFunc::ExtractMicrosecond,
+            "millisecond" => ScalarFunc::ExtractMillisecond,
+            "second" => ScalarFunc::ExtractSecond,
+            "minute" => ScalarFunc::ExtractMinute,
+            "hour" => ScalarFunc::ExtractHour,
+            "day" => {
+                return Err(fe(
+                    "unit \"day\" not supported for type time without time zone",
+                ));
+            }
+            "fortnight" => {
+                return Err(fe(
+                    "unit \"fortnight\" not recognized for type time without time zone",
+                ));
+            }
+            "timezone" => {
+                return Err(fe(
+                    "unit \"timezone\" not supported for type time without time zone",
+                ));
+            }
+            _ => return Err(fe(format!("unsupported extract field: {field_name}"))),
+        };
+        if name == "date_part" {
+            func = match func {
+                ScalarFunc::ExtractEpoch => ScalarFunc::DatePartEpoch,
+                ScalarFunc::ExtractMicrosecond => ScalarFunc::DatePartMicrosecond,
+                ScalarFunc::ExtractMillisecond => ScalarFunc::DatePartMillisecond,
+                ScalarFunc::ExtractSecond => ScalarFunc::DatePartSecond,
+                other => other,
+            };
         }
         return Ok(ScalarExpr::Func {
-            func: ScalarFunc::ExtractEpoch,
+            func,
             args: vec![args.remove(1)],
         });
     }
@@ -893,6 +991,8 @@ fn parse_function_call(
         "coalesce" => ScalarFunc::Coalesce,
         "upper" => ScalarFunc::Upper,
         "lower" => ScalarFunc::Lower,
+        "trunc" => ScalarFunc::Trunc,
+        "macaddr8_set7bit" => ScalarFunc::MacAddr8Set7Bit,
         "substring" => ScalarFunc::Substring,
         "length" => ScalarFunc::Length,
         "char_length" => ScalarFunc::CharLength,
@@ -942,6 +1042,8 @@ fn parse_function_call(
         "regexp_replace" => ScalarFunc::RegexpReplace,
         "infinite_recurse" => ScalarFunc::InfiniteRecurse,
         "pg_relation_size" => ScalarFunc::PgRelationSize,
+        "pg_size_pretty" => ScalarFunc::PgSizePretty,
+        "pg_size_bytes" => ScalarFunc::PgSizeBytes,
         "pg_table_is_visible" => ScalarFunc::PgTableIsVisible,
         "pg_advisory_lock" => ScalarFunc::PgAdvisoryLock,
         "pg_advisory_unlock" => ScalarFunc::PgAdvisoryUnlock,
@@ -954,6 +1056,11 @@ fn parse_function_call(
             }
         }
         ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length | ScalarFunc::CharLength => {
+            if args.len() != 1 {
+                return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::Trunc | ScalarFunc::MacAddr8Set7Bit => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
             }
@@ -1057,6 +1164,8 @@ fn parse_function_call(
         }
         ScalarFunc::PgTableIsVisible
         | ScalarFunc::PgRelationSize
+        | ScalarFunc::PgSizePretty
+        | ScalarFunc::PgSizeBytes
         | ScalarFunc::CurrentSetting
         | ScalarFunc::PgCharToEncoding => {
             if args.len() != 1 {
@@ -1098,9 +1207,18 @@ fn parse_function_call(
                 return Err(fe("function takes no arguments"));
             }
         }
-        ScalarFunc::ExtractEpoch => {
+        ScalarFunc::ExtractEpoch
+        | ScalarFunc::ExtractMicrosecond
+        | ScalarFunc::ExtractMillisecond
+        | ScalarFunc::ExtractSecond
+        | ScalarFunc::ExtractMinute
+        | ScalarFunc::ExtractHour
+        | ScalarFunc::DatePartEpoch
+        | ScalarFunc::DatePartMicrosecond
+        | ScalarFunc::DatePartMillisecond
+        | ScalarFunc::DatePartSecond => {
             if args.len() != 1 {
-                return Err(fe("extract(epoch from x) requires one source expression"));
+                return Err(fe("extract requires one source expression"));
             }
         }
     }
@@ -1391,12 +1509,17 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::Cast { expr, ty } => match ty {
             crate::engine::DataType::PgChar | crate::engine::DataType::BpChar(_) => "char".into(),
             crate::engine::DataType::Text => "text".into(),
+            crate::engine::DataType::Time(_) => "time".into(),
+            crate::engine::DataType::MacAddr => "macaddr".into(),
+            crate::engine::DataType::MacAddr8 => "macaddr8".into(),
             _ => derive_expr_name(expr),
         },
         ScalarExpr::Func { func, .. } => match func {
             ScalarFunc::Coalesce => "coalesce",
             ScalarFunc::Upper => "upper",
             ScalarFunc::Lower => "lower",
+            ScalarFunc::Trunc => "trunc",
+            ScalarFunc::MacAddr8Set7Bit => "macaddr8_set7bit",
             ScalarFunc::Substring => "substring",
             ScalarFunc::IndirectToastRow => "indirect_toast_row",
             ScalarFunc::Length => "length",
@@ -1438,6 +1561,15 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::Log => "log",
             ScalarFunc::Greatest => "greatest",
             ScalarFunc::ExtractEpoch => "extract",
+            ScalarFunc::ExtractMicrosecond
+            | ScalarFunc::ExtractMillisecond
+            | ScalarFunc::ExtractSecond
+            | ScalarFunc::ExtractMinute
+            | ScalarFunc::ExtractHour => "extract",
+            ScalarFunc::DatePartEpoch
+            | ScalarFunc::DatePartMicrosecond
+            | ScalarFunc::DatePartMillisecond
+            | ScalarFunc::DatePartSecond => "date_part",
             ScalarFunc::Version => "version",
             ScalarFunc::CurrentSetting => "current_setting",
             ScalarFunc::PgNumaAvailable => "pg_numa_available",
@@ -1449,6 +1581,8 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::RegexpReplace => "regexp_replace",
             ScalarFunc::InfiniteRecurse => "infinite_recurse",
             ScalarFunc::PgRelationSize => "pg_relation_size",
+            ScalarFunc::PgSizePretty => "pg_size_pretty",
+            ScalarFunc::PgSizeBytes => "pg_size_bytes",
             ScalarFunc::PgTableIsVisible => "pg_table_is_visible",
             ScalarFunc::PgAdvisoryLock => "pg_advisory_lock",
             ScalarFunc::PgAdvisoryUnlock => "pg_advisory_unlock",
@@ -1456,7 +1590,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         .into(),
         ScalarExpr::WindowRowNumber(_) => "row_number".into(),
         ScalarExpr::Predicate(_) | ScalarExpr::Subquery(_) => "?column?".into(),
-        ScalarExpr::Case { .. } => "?column?".into(),
+        ScalarExpr::Case { .. } => "case".into(),
     }
 }
 

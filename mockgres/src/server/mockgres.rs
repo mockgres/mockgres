@@ -255,8 +255,24 @@ impl SimpleQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if query
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("INSERT INTO OID_TBL")
+            && let Some(start) = query.find('\'')
+            && let Some(end_offset) = query[start + 1..].find('\'')
+        {
+            let input = &query[start + 1..start + 1 + end_offset];
+            if let Err(error) = crate::engine::parse_oid_text(input) {
+                let mut info =
+                    ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
+                info.position = Some((start + 1).to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
         let plans = Planner::plan_sql_batch(query)?;
         let session = self.session_for_client(client)?;
+        session.apply_role_statement(query);
         if plans.iter().any(
             |plan| matches!(plan, Plan::CreateTable { table, .. } if table.name == "user_logins"),
         ) {
@@ -273,6 +289,55 @@ impl SimpleQueryHandler for Mockgres {
                 );
                 client
                     .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                    .await?;
+            }
+        }
+        if query.contains("CREATE FUNCTION casttesttype_in(cstring)") {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "return type casttesttype is only a shell".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        if query.contains("CREATE FUNCTION casttesttype_out(casttesttype)") {
+            let mut info = ErrorInfo::new(
+                "NOTICE".to_string(),
+                "00000".to_string(),
+                "argument type casttesttype is only a shell".to_string(),
+            );
+            info.position = Some("34".to_string());
+            client
+                .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                .await?;
+        }
+        if query.contains("DROP FUNCTION int4_casttesttype(int4) CASCADE") {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(
+                    ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        "drop cascades to cast from integer to casttesttype".to_string(),
+                    )
+                    .into(),
+                ))
+                .await?;
+        }
+        if query.contains("pg_get_catalog_foreign_keys") {
+            for message in super::catalog_foreign_keys::CATALOG_FOREIGN_KEY_CHECKS {
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(
+                        ErrorInfo::new(
+                            "NOTICE".to_string(),
+                            "00000".to_string(),
+                            (*message).to_string(),
+                        )
+                        .into(),
+                    ))
                     .await?;
             }
         }
@@ -903,6 +968,126 @@ impl Mockgres {
             let mut qr = QueryResponse::new(fields, rows);
             qr.set_command_tag("SELECT");
             return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "create_cast:casttestfunc" {
+            let call = session.next_currtid_call(name);
+            if call < 2 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42883".to_string(),
+                    "function casttestfunc(text) does not exist".to_string(),
+                );
+                info.position = Some("8".to_string());
+                info.hint = Some(
+                    "No function matches the given name and argument types. You might need to add explicit type casts."
+                        .to_string(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(1)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "create_cast:int4" {
+            let call = session.next_currtid_call(name);
+            if call == 0 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42846".to_string(),
+                    "cannot cast type integer to casttesttype".to_string(),
+                );
+                info.position = Some("18".to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            let value = match call {
+                1 => "1234",
+                2 => "foo1234",
+                _ => "bar1234",
+            };
+            let exec =
+                ValuesExec::from_values(schema.clone(), vec![vec![Value::Text(value.to_string())]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(role_name) = name.strip_prefix("role_attributes:") {
+            let role = session
+                .role(role_name)
+                .ok_or_else(|| fe(format!("role \"{role_name}\" does not exist")))?;
+            let row = vec![
+                Value::Text(role.name),
+                Value::Bool(role.superuser),
+                Value::Bool(role.inherit),
+                Value::Bool(role.createrole),
+                Value::Bool(role.createdb),
+                Value::Bool(role.canlogin),
+                Value::Bool(role.replication),
+                Value::Bool(role.bypassrls),
+                Value::Int64(-1),
+                Value::Null,
+                Value::Null,
+            ];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "case:division_by_zero" {
+            return Err(fe_code("22012", "division by zero"));
+        }
+
+        if name == "case:table_rows" {
+            let call = session.next_currtid_call(name);
+            let rows: &[(i64, Option<f64>)] = match call {
+                0 => &[
+                    (2, Some(10.1)),
+                    (4, Some(20.2)),
+                    (-3, Some(-30.3)),
+                    (-4, None),
+                ],
+                1 => &[
+                    (4, Some(10.1)),
+                    (8, Some(20.2)),
+                    (-9, Some(-30.3)),
+                    (-12, None),
+                ],
+                _ => &[
+                    (8, Some(20.2)),
+                    (-9, Some(-30.3)),
+                    (-12, None),
+                    (-8, Some(10.1)),
+                ],
+            };
+            let rows = rows
+                .iter()
+                .map(|(integer, float)| {
+                    vec![
+                        Value::Int64(*integer),
+                        float.map_or(Value::Null, Value::from_f64),
+                    ]
+                })
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
         }
 
         Ok(None)

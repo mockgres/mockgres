@@ -794,12 +794,32 @@ fn order_values(
             if asc { ord } else { ord.reverse() }
         }
 
+        (Value::PgLsn(x), Value::PgLsn(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::MacAddr(x), Value::MacAddr(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::MacAddr8(x), Value::MacAddr8(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
         (Value::Bool(x), Value::Bool(y)) => {
             let ord = x.cmp(y);
             if asc { ord } else { ord.reverse() }
         }
 
         (Value::Date(x), Value::Date(y)) => {
+            let ord = x.cmp(y);
+            if asc { ord } else { ord.reverse() }
+        }
+
+        (Value::TimeMicros(x), Value::TimeMicros(y)) => {
             let ord = x.cmp(y);
             if asc { ord } else { ord.reverse() }
         }
