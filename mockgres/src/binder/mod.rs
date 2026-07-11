@@ -1241,6 +1241,32 @@ fn bind_with_search_path(
                 returning_schema,
             })
         }
+        Plan::CopyFrom {
+            mut table,
+            columns,
+            filename,
+        } => {
+            let tm = resolve_table_meta(db, search_path, &table).map_err(map_catalog_err)?;
+            if table.schema.is_none() {
+                table.schema = Some(tm.schema.clone());
+            }
+            if let Some(columns) = &columns {
+                let mut seen = HashSet::with_capacity(columns.len());
+                for column in columns {
+                    if !tm.columns.iter().any(|candidate| candidate.name == *column) {
+                        return Err(fe_code("42703", format!("unknown column: {column}")));
+                    }
+                    if !seen.insert(column) {
+                        return Err(fe_code("42701", format!("column {column} specified twice")));
+                    }
+                }
+            }
+            Ok(Plan::CopyFrom {
+                table,
+                columns,
+                filename,
+            })
+        }
         Plan::CreateDatabase { .. } => Ok(p),
         Plan::DropDatabase { name } => Ok(Plan::UnsupportedDbDDL {
             kind: DbDdlKind::Drop,

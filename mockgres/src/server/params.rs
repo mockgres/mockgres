@@ -249,6 +249,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::CreateTablespace { .. }
         | Plan::DropTablespace { .. }
         | Plan::Vacuum { .. }
+        | Plan::CopyFrom { .. }
         | Plan::CreateDatabase { .. }
         | Plan::DropDatabase { .. }
         | Plan::AlterDatabase { .. }
@@ -525,6 +526,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::CreateTablespace { .. }
         | Plan::DropTablespace { .. }
         | Plan::Vacuum { .. }
+        | Plan::CopyFrom { .. }
         | Plan::CreateDatabase { .. }
         | Plan::DropDatabase { .. }
         | Plan::AlterDatabase { .. }

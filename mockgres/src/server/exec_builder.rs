@@ -13,6 +13,7 @@ use crate::engine::{
 use crate::session::Session;
 use crate::txn::{TransactionManager, TxId};
 
+use super::exec::copy::build_copy_from_executor;
 use super::exec::ddl::build_ddl_executor;
 use super::exec::read::build_read_executor;
 use super::exec::set_show::build_set_show_executor;
@@ -95,6 +96,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::Vacuum {
             is_vacuum: false, ..
         } => "ANALYZE",
+        Plan::CopyFrom { .. } => "COPY",
         Plan::CreateDatabase { .. } => "CREATE DATABASE",
         Plan::DropDatabase { .. } => "DROP DATABASE",
         Plan::AlterDatabase { .. } => "ALTER DATABASE",
@@ -223,6 +225,11 @@ pub fn build_executor(
             params.clone(),
             ctx,
         ),
+        Plan::CopyFrom {
+            table,
+            columns,
+            filename,
+        } => build_copy_from_executor(db, txn_manager, session, table, columns, filename, ctx),
         Plan::Update {
             table,
             table_alias: _,

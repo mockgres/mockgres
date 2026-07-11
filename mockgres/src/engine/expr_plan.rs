@@ -504,6 +504,11 @@ pub enum Plan {
         tables: Vec<ObjName>,
         is_vacuum: bool,
     },
+    CopyFrom {
+        table: ObjName,
+        columns: Option<Vec<String>>,
+        filename: String,
+    },
     AlterTableRename {
         table: ObjName,
         new_name: String,
@@ -669,6 +674,7 @@ impl Plan {
             | Plan::CreateTablespace { .. }
             | Plan::DropTablespace { .. }
             | Plan::Vacuum { .. }
+            | Plan::CopyFrom { .. }
             | Plan::CreateDatabase { .. }
             | Plan::DropDatabase { .. }
             | Plan::AlterDatabase { .. }

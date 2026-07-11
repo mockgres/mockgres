@@ -1,3 +1,4 @@
+pub mod copy;
 pub mod ddl;
 pub mod locks;
 pub mod read;

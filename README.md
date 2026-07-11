@@ -71,7 +71,7 @@ details. The upstream suite uses a fresh shared database and does not invoke
 - Core SQL: SELECT/INSERT/UPDATE/DELETE, WHERE/ORDER BY/LIMIT/OFFSET, projections/aliases, aggregates (count/sum/avg/min/max), GROUP BY/HAVING, simple scalar functions (now/current_timestamp/current_date/upper/lower/length/coalesce/abs/log/ln/greatest/extract epoch), type casts, interval literals, expressions
 - CTEs (`WITH`): non-recursive CTEs on SELECT/UPDATE/INSERT/DELETE, including SELECT/INSERT/UPDATE/DELETE CTE bodies with RETURNING, dependency-aware multi-CTE resolution, column alias lists, CTE reuse in joins/`FROM`
 - Joins: CROSS/INNER/LEFT with ON predicates, multi-join, subqueries IN (SELECT ...)
-- DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, INSERT ... SELECT, RETURNING
+- DML: INSERT ... ON CONFLICT DO NOTHING/DO UPDATE, UPDATE ... FROM, INSERT ... SELECT, RETURNING, server-side `COPY ... FROM` text files
 - Locking and tx: BEGIN/COMMIT/ROLLBACK (read committed only), SELECT FOR UPDATE SKIP LOCKED
 - Copy-on-write snapshots: global freeze + per-session sandboxes (`mockgres_freeze()`, `mockgres_reset()`)
 - types: int2/int4/int8, float8, point, name, char(n), text/varchar, bool, date, timestamp/tz, bytea, interval, JSONB (no json ops though)

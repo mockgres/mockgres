@@ -2,7 +2,7 @@ use crate::engine::{Plan, fe};
 use pg_query::{NodeEnum, parse, protobuf::Token, scan};
 use pgwire::error::PgWireResult;
 
-use super::{ddl, delete, dml, insert, update};
+use super::{copy, ddl, delete, dml, insert, update};
 
 pub struct Planner;
 
@@ -88,6 +88,7 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::UpdateStmt(upd) => update::plan_update(*upd),
         NodeEnum::DeleteStmt(del) => delete::plan_delete(*del),
         NodeEnum::TruncateStmt(trunc) => ddl::plan_truncate(trunc),
+        NodeEnum::CopyStmt(copy) => copy::plan_copy(*copy),
         _ => Err(fe("unsupported statement type")),
     }
 }
