@@ -83,6 +83,7 @@ pub struct TableMeta {
     pub id: TableId,
     pub schema: SchemaName,
     pub name: TableName,
+    pub parents: Vec<TableId>,
     pub columns: Vec<Column>,
     pub primary_key: Option<PrimaryKeyMeta>,
     pub indexes: Vec<IndexMeta>,

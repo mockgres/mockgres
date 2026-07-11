@@ -122,6 +122,28 @@ impl Db {
         foreign_keys: Vec<ForeignKeySpec>,
         search_path: &[SchemaId],
     ) -> anyhow::Result<TableId> {
+        self.create_table_with_parents(
+            schema,
+            name,
+            cols,
+            Vec::new(),
+            pk_spec,
+            foreign_keys,
+            search_path,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_table_with_parents(
+        &mut self,
+        schema: &str,
+        name: &str,
+        cols: Vec<ColumnSpec>,
+        parents: Vec<TableId>,
+        pk_spec: Option<PrimaryKeySpec>,
+        foreign_keys: Vec<ForeignKeySpec>,
+        search_path: &[SchemaId],
+    ) -> anyhow::Result<TableId> {
         let schema_id = self.catalog.ensure_schema(schema);
         if self.catalog.get_table(schema, name).is_some() {
             return Err(sql_err(
@@ -182,6 +204,7 @@ impl Db {
             id,
             schema: SchemaName::new(schema),
             name: name.to_string(),
+            parents,
             columns: columns.clone(),
             primary_key: pk_meta,
             indexes: vec![],

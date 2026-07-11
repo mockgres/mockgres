@@ -55,6 +55,13 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
         schema,
         name: rv.relname,
     };
+    let mut parents = Vec::with_capacity(stmt.inh_relations.len());
+    for parent in stmt.inh_relations {
+        let Some(pg_query::NodeEnum::RangeVar(parent)) = parent.node else {
+            return Err(fe("invalid inherited table"));
+        };
+        parents.push(range_var_to_obj_name(&parent));
+    }
 
     let mut cols = Vec::new();
     let mut pk: Option<PrimaryKeySpec> = None;
@@ -172,6 +179,7 @@ pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
     Ok(Plan::CreateTable {
         table,
         cols,
+        parents,
         pk,
         foreign_keys,
         uniques,

@@ -1,4 +1,5 @@
 mod copy;
+mod create_table_as;
 mod cte;
 mod ddl;
 mod delete;

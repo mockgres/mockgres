@@ -1,4 +1,5 @@
 pub mod copy;
+pub mod create_table_as;
 pub mod ddl;
 pub mod locks;
 pub mod read;

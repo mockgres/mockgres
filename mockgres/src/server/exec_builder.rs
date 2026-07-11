@@ -14,6 +14,7 @@ use crate::session::Session;
 use crate::txn::{TransactionManager, TxId};
 
 use super::exec::copy::build_copy_from_executor;
+use super::exec::create_table_as::build_create_table_as_executor;
 use super::exec::ddl::build_ddl_executor;
 use super::exec::read::build_read_executor;
 use super::exec::set_show::build_set_show_executor;
@@ -68,6 +69,12 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::Alias { .. } => "SELECT",
 
         Plan::CreateTable { .. } => "CREATE TABLE",
+        Plan::CreateTableAs {
+            with_data: true, ..
+        } => "SELECT",
+        Plan::CreateTableAs {
+            with_data: false, ..
+        } => "CREATE TABLE AS",
         Plan::AlterTableAddColumn { .. }
         | Plan::AlterTableDropColumn { .. }
         | Plan::AlterTableSetNotNull { .. }
@@ -230,6 +237,25 @@ pub fn build_executor(
             columns,
             filename,
         } => build_copy_from_executor(db, txn_manager, session, table, columns, filename, ctx),
+        Plan::CreateTableAs {
+            table,
+            column_names,
+            query,
+            with_data,
+            if_not_exists,
+        } => build_create_table_as_executor(
+            db,
+            txn_manager,
+            session,
+            snapshot_xid,
+            table,
+            column_names,
+            query,
+            *with_data,
+            *if_not_exists,
+            params.clone(),
+            ctx,
+        ),
         Plan::Update {
             table,
             table_alias: _,

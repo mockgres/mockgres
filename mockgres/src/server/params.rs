@@ -216,6 +216,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 collect_param_hints_from_returning(clause, out);
             }
         }
+        Plan::CreateTableAs { query, .. } => collect_param_hints_from_plan(query, out),
         Plan::Alias { input, .. } => collect_param_hints_from_plan(input, out),
         Plan::Values { rows, .. } => {
             for row in rows {
@@ -493,6 +494,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 collect_param_indexes_from_returning(clause, out);
             }
         }
+        Plan::CreateTableAs { query, .. } => collect_param_indexes(query, out),
         Plan::Alias { input, .. } => collect_param_indexes(input, out),
         Plan::Values { rows, .. } => {
             for row in rows {

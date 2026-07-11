@@ -24,21 +24,36 @@ pub(crate) fn build_ddl_executor(
         Plan::CreateTable {
             table,
             cols,
+            parents,
             pk,
             foreign_keys,
             uniques,
         } => {
-            let schema_name = {
+            let (schema_name, parent_ids) = {
                 let db_read = db.read();
-                resolve_schema_for_create(&db_read, session, table.schema.as_ref())?
+                let schema_name =
+                    resolve_schema_for_create(&db_read, session, table.schema.as_ref())?;
+                let mut parent_ids = Vec::with_capacity(parents.len());
+                for parent in parents {
+                    let Some(parent_schema) = resolve_table_schema(&db_read, session, parent)?
+                    else {
+                        return Err(fe_code("42P01", format!("no such table {}", parent.name)));
+                    };
+                    let parent_meta = db_read
+                        .resolve_table(&parent_schema, &parent.name)
+                        .map_err(map_db_err)?;
+                    parent_ids.push(parent_meta.id);
+                }
+                (schema_name, parent_ids)
             };
             let search_path = session.search_path();
             let mut db_write = db.write();
             db_write
-                .create_table(
+                .create_table_with_parents(
                     &schema_name,
                     &table.name,
                     cols.clone(),
+                    parent_ids,
                     pk.clone(),
                     foreign_keys.clone(),
                     &search_path,
@@ -702,7 +717,7 @@ fn resolve_table_schema(
     Ok(None)
 }
 
-fn resolve_schema_for_create(
+pub(crate) fn resolve_schema_for_create(
     db: &Db,
     session: &Session,
     explicit: Option<&SchemaName>,

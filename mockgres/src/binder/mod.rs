@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{SchemaId, TableMeta};
 use crate::db::Db;
 use crate::engine::{
-    AggCall, AggFunc, DataType, DbDdlKind, Expr, Field, FieldOrigin, InsertSource, LockSpec,
-    ObjName, OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError, UpdateSet,
-    WindowSpec, fe, fe_code,
+    AggCall, AggFunc, ColumnSpec, DataType, DbDdlKind, Expr, Field, FieldOrigin, InsertSource,
+    LockSpec, ObjName, OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError,
+    UpdateSet, WindowSpec, fe, fe_code,
 };
 use crate::session::Session;
 use anyhow::Error;
@@ -1241,6 +1241,60 @@ fn bind_with_search_path(
                 returning_schema,
             })
         }
+        Plan::CreateTable {
+            table,
+            cols,
+            parents,
+            pk,
+            foreign_keys,
+            uniques,
+        } => {
+            let (cols, parents) = bind_inherited_columns(db, search_path, cols, parents)?;
+            Ok(Plan::CreateTable {
+                table,
+                cols,
+                parents,
+                pk,
+                foreign_keys,
+                uniques,
+            })
+        }
+        Plan::CreateTableAs {
+            table,
+            column_names,
+            query,
+            with_data,
+            if_not_exists,
+        } => {
+            let query = bind_with_search_path(
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                cte_scope,
+                *query,
+            )?;
+            if column_names.len() > query.schema().fields.len() {
+                return Err(fe_code("42601", "too many column names were specified"));
+            }
+            let mut seen = HashSet::with_capacity(query.schema().fields.len());
+            for (index, field) in query.schema().fields.iter().enumerate() {
+                let name = column_names.get(index).unwrap_or(&field.name);
+                if !seen.insert(name) {
+                    return Err(fe_code(
+                        "42701",
+                        format!("column \"{name}\" specified more than once"),
+                    ));
+                }
+            }
+            Ok(Plan::CreateTableAs {
+                table,
+                column_names,
+                query: Box::new(query),
+                with_data,
+                if_not_exists,
+            })
+        }
         Plan::CopyFrom {
             mut table,
             columns,
@@ -1292,6 +1346,129 @@ fn resolve_table_meta<'a>(
     } else {
         db.resolve_table_in_search_path(search_path, &table.name)
     }
+}
+
+#[derive(Clone)]
+struct MergedColumn {
+    spec: ColumnSpec,
+    conflicting_default: bool,
+    is_local: bool,
+}
+
+fn bind_inherited_columns(
+    db: &Db,
+    search_path: &[SchemaId],
+    local_columns: Vec<ColumnSpec>,
+    parents: Vec<ObjName>,
+) -> PgWireResult<(Vec<ColumnSpec>, Vec<ObjName>)> {
+    let mut merged: Vec<MergedColumn> = Vec::new();
+    let mut resolved_parents = Vec::with_capacity(parents.len());
+    let mut parent_ids = HashSet::with_capacity(parents.len());
+
+    for mut parent in parents {
+        let parent_meta = resolve_table_meta(db, search_path, &parent).map_err(map_catalog_err)?;
+        if !parent_ids.insert(parent_meta.id) {
+            return Err(fe_code(
+                "42710",
+                format!(
+                    "relation \"{}\" would be inherited from more than once",
+                    parent_meta.name
+                ),
+            ));
+        }
+        if parent.schema.is_none() {
+            parent.schema = Some(parent_meta.schema.clone());
+        }
+        resolved_parents.push(parent);
+
+        for column in &parent_meta.columns {
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing.spec.0 == column.name)
+            {
+                if existing.spec.1 != column.data_type {
+                    return Err(fe_code(
+                        "42804",
+                        format!("inherited column \"{}\" has a type conflict", column.name),
+                    ));
+                }
+                existing.spec.2 &= column.nullable;
+                match (&existing.spec.3, &column.default) {
+                    (Some(left), Some(right)) if left != right => {
+                        existing.conflicting_default = true;
+                    }
+                    (None, Some(default)) => existing.spec.3 = Some(default.clone()),
+                    _ => {}
+                }
+            } else {
+                merged.push(MergedColumn {
+                    spec: (
+                        column.name.clone(),
+                        column.data_type.clone(),
+                        column.nullable,
+                        column.default.clone(),
+                        None,
+                    ),
+                    conflicting_default: false,
+                    is_local: false,
+                });
+            }
+        }
+    }
+
+    for local in local_columns {
+        let (name, data_type, nullable, default, identity) = local;
+        if let Some(existing) = merged.iter_mut().find(|existing| existing.spec.0 == name) {
+            if existing.is_local {
+                return Err(fe_code(
+                    "42701",
+                    format!("column \"{name}\" specified more than once"),
+                ));
+            }
+            if existing.spec.1 != data_type {
+                return Err(fe_code(
+                    "42804",
+                    format!("column \"{name}\" has a type conflict"),
+                ));
+            }
+            existing.spec.2 &= nullable;
+            if default.is_some() {
+                existing.spec.3 = default;
+                existing.conflicting_default = false;
+            } else if existing.conflicting_default {
+                return Err(fe_code(
+                    "42611",
+                    format!("column \"{name}\" inherits conflicting default values"),
+                ));
+            }
+            if identity.is_some() {
+                existing.spec.2 = false;
+                existing.spec.4 = identity;
+            }
+            existing.is_local = true;
+        } else {
+            merged.push(MergedColumn {
+                spec: (name, data_type, nullable, default, identity),
+                conflicting_default: false,
+                is_local: true,
+            });
+        }
+    }
+
+    if let Some(conflict) = merged.iter().find(|column| column.conflicting_default) {
+        return Err(fe_code(
+            "42611",
+            format!(
+                "column \"{}\" inherits conflicting default values",
+                conflict.spec.0
+            ),
+        ));
+    }
+
+    Ok((
+        merged.into_iter().map(|column| column.spec).collect(),
+        resolved_parents,
+    ))
 }
 
 pub(super) fn current_schema_name(db: &Db, search_path: &[SchemaId]) -> String {

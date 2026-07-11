@@ -318,7 +318,7 @@ pub struct ForeignKeySpec {
     pub on_delete: ReferentialAction,
 }
 
-type ColumnSpec = (
+pub type ColumnSpec = (
     String,
     DataType,
     bool,
@@ -416,9 +416,17 @@ pub enum Plan {
     CreateTable {
         table: ObjName,
         cols: Vec<ColumnSpec>,
+        parents: Vec<ObjName>,
         pk: Option<PrimaryKeySpec>,
         foreign_keys: Vec<ForeignKeySpec>,
         uniques: Vec<UniqueSpec>,
+    },
+    CreateTableAs {
+        table: ObjName,
+        column_names: Vec<String>,
+        query: Box<Plan>,
+        with_data: bool,
+        if_not_exists: bool,
     },
     AlterTableAddColumn {
         table: ObjName,
@@ -654,6 +662,7 @@ impl Plan {
             Plan::UnboundSeqScan { .. }
             | Plan::UnboundJoin { .. }
             | Plan::CreateTable { .. }
+            | Plan::CreateTableAs { .. }
             | Plan::AlterTableAddColumn { .. }
             | Plan::AlterTableDropColumn { .. }
             | Plan::AlterTableSetNotNull { .. }
