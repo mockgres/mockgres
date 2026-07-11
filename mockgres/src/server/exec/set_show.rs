@@ -74,6 +74,23 @@ pub(crate) fn build_set_show_executor(
                     None,
                 ))
             }
+            "extra_float_digits" => {
+                let digits = value
+                    .as_ref()
+                    .and_then(|values| values.first())
+                    .ok_or_else(|| fe("SET extra_float_digits requires a value"))?
+                    .parse::<i32>()
+                    .map_err(|_| fe_code("22023", "invalid extra_float_digits value"))?;
+                if !(-15..=3).contains(&digits) {
+                    return Err(fe_code("22023", "extra_float_digits out of range"));
+                }
+                session.set_extra_float_digits(digits);
+                Ok((
+                    Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
+                    Some("SET".into()),
+                    None,
+                ))
+            }
             "client_min_messages"
             | "enable_seqscan"
             | "enable_indexscan"
@@ -84,7 +101,12 @@ pub(crate) fn build_set_show_executor(
             | "min_parallel_index_scan_size"
             | "role"
             | "geqo"
-            | "geqo_threshold" => Ok((
+            | "geqo_threshold"
+            | "parallel_setup_cost"
+            | "parallel_tuple_cost"
+            | "min_parallel_table_scan_size"
+            | "max_parallel_workers_per_gather"
+            | "default_toast_compression" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("SET".into()),
                 None,

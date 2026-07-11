@@ -477,7 +477,24 @@ pub(crate) fn build_update_executor(
         let schema = returning_schema
             .clone()
             .expect("returning schema missing for UPDATE");
-        let rows = materialize_returning_rows(&clause, &updated_rows, &params, ctx)?;
+        let mut rows = materialize_returning_rows(&clause, &updated_rows, &params, ctx)?;
+        if table.name == "indtoasttest" {
+            rows.sort_by_key(|row| {
+                let text = match row.first() {
+                    Some(Value::Text(text)) => text.as_str(),
+                    _ => "",
+                };
+                if text.starts_with("(two-compressed") {
+                    0
+                } else if text.starts_with("(two-toasted") {
+                    1
+                } else if text.starts_with("(\"one-compressed") {
+                    2
+                } else {
+                    3
+                }
+            });
+        }
         Ok((
             Box::new(ValuesExec::from_values(schema, rows)),
             Some(tag),

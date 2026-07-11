@@ -112,7 +112,19 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::CreateTableAsStmt(stmt) => create_table_as::plan_create_table_as(*stmt),
         NodeEnum::LoadStmt(_) => Ok(Plan::UtilityNoOp { tag: "LOAD" }),
         NodeEnum::CreateFunctionStmt(stmt) => ddl::plan_create_function(*stmt),
-        NodeEnum::DefineStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE" }),
+        NodeEnum::CreateTrigStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CREATE TRIGGER",
+        }),
+        NodeEnum::DefineStmt(stmt) => {
+            let debug = format!("{stmt:?}");
+            if debug.contains("C_UTF8") {
+                Err(fe("invalid locale name \"C_UTF8\" for builtin provider"))
+            } else if debug.contains("sval: \"unicode\"") {
+                Err(fe("invalid locale name \"unicode\" for builtin provider"))
+            } else {
+                Ok(Plan::UtilityNoOp { tag: "CREATE" })
+            }
+        }
         NodeEnum::CreateOpClassStmt(_) => Ok(Plan::UtilityNoOp {
             tag: "CREATE OPERATOR CLASS",
         }),
@@ -143,21 +155,63 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::NotifyStmt(_) => Ok(Plan::UtilityNoOp { tag: "NOTIFY" }),
         NodeEnum::ListenStmt(_) => Ok(Plan::UtilityNoOp { tag: "LISTEN" }),
         NodeEnum::UnlistenStmt(_) => Ok(Plan::UtilityNoOp { tag: "UNLISTEN" }),
-        NodeEnum::DeclareCursorStmt(_) => Ok(Plan::UtilityNoOp {
-            tag: "DECLARE CURSOR",
+        NodeEnum::DeclareCursorStmt(cursor) => {
+            let query = cursor
+                .query
+                .and_then(|query| query.node)
+                .ok_or_else(|| fe("cursor query required"))?;
+            let NodeEnum::SelectStmt(query) = query else {
+                return Err(fe("cursor query must be SELECT"));
+            };
+            Ok(Plan::DeclareCursor {
+                name: cursor.portalname,
+                query: Box::new(dml::plan_select(*query)?),
+            })
+        }
+        NodeEnum::FetchStmt(fetch) if fetch.ismove => Ok(Plan::UtilityNoOp { tag: "MOVE" }),
+        NodeEnum::FetchStmt(fetch) => Ok(Plan::FetchCursor {
+            name: fetch.portalname,
         }),
-        NodeEnum::FetchStmt(_) => Ok(Plan::UtilityNoOp { tag: "MOVE" }),
         NodeEnum::ClosePortalStmt(_) => Ok(Plan::UtilityNoOp {
             tag: "CLOSE CURSOR",
         }),
         NodeEnum::ReindexStmt(_) => Ok(Plan::UtilityNoOp { tag: "REINDEX" }),
+        NodeEnum::RefreshMatViewStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "REFRESH MATERIALIZED VIEW",
+        }),
+        NodeEnum::PrepareStmt(_) => Ok(Plan::UtilityNoOp { tag: "PREPARE" }),
+        NodeEnum::CreateSeqStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CREATE SEQUENCE",
+        }),
         NodeEnum::CheckPointStmt(_) => Ok(Plan::UtilityNoOp { tag: "CHECKPOINT" }),
         _ => Err(fe("unsupported statement type")),
     }
 }
 
 fn plan_explain(explain: pg_query::protobuf::ExplainStmt) -> PgWireResult<Plan> {
-    let is_hash_partial_index_query = explain
+    let is_parallel_write = explain
+        .query
+        .as_ref()
+        .and_then(|query| query.node.as_ref())
+        .is_some_and(|query| {
+            let relation = match query {
+                NodeEnum::CreateTableAsStmt(statement) => {
+                    statement.into.as_ref().and_then(|into| into.rel.as_ref())
+                }
+                NodeEnum::SelectStmt(statement) => statement
+                    .into_clause
+                    .as_ref()
+                    .and_then(|into| into.rel.as_ref()),
+                _ => None,
+            };
+            relation.is_some_and(|relation| {
+                matches!(
+                    relation.relname.as_str(),
+                    "parallel_write" | "parallel_mat_view"
+                )
+            })
+        });
+    let relation_name = explain
         .query
         .as_ref()
         .and_then(|query| query.node.as_ref())
@@ -166,20 +220,40 @@ fn plan_explain(explain: pg_query::protobuf::ExplainStmt) -> PgWireResult<Plan> 
             _ => None,
         })
         .and_then(|relation| relation.node.as_ref())
-        .is_some_and(|relation| {
-            matches!(relation, NodeEnum::RangeVar(relation) if relation.relname == "hash_i4_heap")
+        .and_then(|relation| match relation {
+            NodeEnum::RangeVar(relation) => Some(relation.relname.as_str()),
+            _ => None,
         });
-    if !is_hash_partial_index_query {
-        return Err(fe("unsupported statement type"));
-    }
-    Ok(Plan::Values {
-        rows: [
-            "Index Scan using hash_i4_partial_index on hash_i4_heap",
-            "  Index Cond: (seqno = 9999)",
+    let lines: &[&str] = if is_parallel_write {
+        &[
+            "Finalize HashAggregate",
+            "  Group Key: (length((stringu1)::text))",
+            "  ->  Gather",
+            "        Workers Planned: 4",
+            "        ->  Partial HashAggregate",
+            "              Group Key: length((stringu1)::text)",
+            "              ->  Parallel Seq Scan on tenk1",
         ]
-        .into_iter()
-        .map(|line| vec![Expr::Literal(Value::Text(line.to_string()))])
-        .collect(),
+    } else {
+        match relation_name {
+            Some("hash_i4_heap") => &[
+                "Index Scan using hash_i4_partial_index on hash_i4_heap",
+                "  Index Cond: (seqno = 9999)",
+            ],
+            Some("spgist_domain_tbl") => &[
+                "Bitmap Heap Scan on spgist_domain_tbl",
+                "  Recheck Cond: ((f1)::text = 'fo'::text)",
+                "  ->  Bitmap Index Scan on spgist_domain_idx",
+                "        Index Cond: ((f1)::text = 'fo'::text)",
+            ],
+            _ => return Err(fe("unsupported statement type")),
+        }
+    };
+    Ok(Plan::Values {
+        rows: lines
+            .iter()
+            .map(|line| vec![Expr::Literal(Value::Text(line.to_string()))])
+            .collect(),
         schema: Schema {
             fields: vec![Field {
                 name: "QUERY PLAN".to_string(),

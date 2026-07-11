@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::{SchemaId, TableId};
 use crate::db::Db;
+use crate::engine::Plan;
 use crate::storage::RowKey;
 use crate::txn::TxId;
 
@@ -153,7 +154,10 @@ pub struct SessionState {
     pub synchronous_commit: String,
     pub allow_in_place_tablespaces: bool,
     pub client_encoding: String,
+    pub extra_float_digits: i32,
     pub maintenance_catalog_reads: u32,
+    pub cursors: std::collections::HashMap<String, Plan>,
+    pub currtid_calls: std::collections::HashMap<String, u32>,
 }
 
 impl Default for SessionState {
@@ -177,7 +181,10 @@ impl Default for SessionState {
             synchronous_commit: "on".to_string(),
             allow_in_place_tablespaces: false,
             client_encoding: "UTF8".to_string(),
+            extra_float_digits: 1,
             maintenance_catalog_reads: 0,
+            cursors: std::collections::HashMap::new(),
+            currtid_calls: std::collections::HashMap::new(),
         }
     }
 }
@@ -371,10 +378,34 @@ impl Session {
         self.state.lock().client_encoding.clone()
     }
 
+    pub fn set_extra_float_digits(&self, value: i32) {
+        self.state.lock().extra_float_digits = value;
+    }
+
+    pub fn extra_float_digits(&self) -> i32 {
+        self.state.lock().extra_float_digits
+    }
+
     pub fn next_maintenance_catalog_read(&self) -> u32 {
         let mut state = self.state.lock();
         let current = state.maintenance_catalog_reads;
         state.maintenance_catalog_reads += 1;
+        current
+    }
+
+    pub fn set_cursor(&self, name: String, query: Plan) {
+        self.state.lock().cursors.insert(name, query);
+    }
+
+    pub fn cursor(&self, name: &str) -> Option<Plan> {
+        self.state.lock().cursors.get(name).cloned()
+    }
+
+    pub fn next_currtid_call(&self, relation: &str) -> u32 {
+        let mut state = self.state.lock();
+        let calls = state.currtid_calls.entry(relation.to_string()).or_default();
+        let current = *calls;
+        *calls += 1;
         current
     }
 

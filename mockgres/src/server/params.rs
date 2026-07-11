@@ -259,6 +259,8 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::CallBuiltin { .. }
+        | Plan::DeclareCursor { .. }
+        | Plan::FetchCursor { .. }
         | Plan::BeginTransaction
         | Plan::CommitTransaction
         | Plan::RollbackTransaction => {}
@@ -538,6 +540,8 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
         | Plan::CallBuiltin { .. }
+        | Plan::DeclareCursor { .. }
+        | Plan::FetchCursor { .. }
         | Plan::BeginTransaction
         | Plan::CommitTransaction
         | Plan::RollbackTransaction => {}
@@ -693,6 +697,12 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             Ok(Value::from_f64(v))
         }
         DataType::Text => Ok(Value::Text(s.to_string())),
+        DataType::Varchar(length) => crate::engine::coerce_value_to_type(
+            Value::Text(s.to_string()),
+            &DataType::Varchar(*length),
+            tz,
+        )
+        .map_err(|error| fe_code(error.code, error.message)),
         DataType::Name => {
             crate::engine::coerce_value_to_type(Value::Text(s.to_string()), &DataType::Name, tz)
                 .map_err(|e| fe_code(e.code, e.message))
@@ -706,8 +716,27 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             .map_err(|e| fe_code(e.code, e.message))?;
             Ok(value)
         }
+        DataType::PgChar => {
+            crate::engine::coerce_value_to_type(Value::Text(s.to_string()), &DataType::PgChar, tz)
+                .map_err(|error| fe_code(error.code, error.message))
+        }
         DataType::Point => crate::engine::parse_point_text(s)
             .map(Value::Point)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Lseg => crate::engine::parse_lseg_text(s)
+            .map(Value::Lseg)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Line => crate::engine::parse_line_text(s)
+            .map(Value::Line)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Circle => crate::engine::parse_circle_text(s)
+            .map(Value::Circle)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Box => crate::engine::parse_box_text(s)
+            .map(Value::Box)
+            .map_err(|error| fe_code(error.code, error.message)),
+        DataType::Tid => crate::engine::parse_tid_text(s)
+            .map(Value::Tid)
             .map_err(|error| fe_code(error.code, error.message)),
         DataType::Path => crate::engine::parse_path_text(s)
             .map(Value::Path)
@@ -784,6 +813,16 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))
         }
+        DataType::Varchar(length) => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|error| fe(format!("invalid utf8 parameter: {error}")))?;
+            crate::engine::coerce_value_to_type(
+                Value::Text(s.to_string()),
+                &DataType::Varchar(*length),
+                tz,
+            )
+            .map_err(|error| fe_code(error.code, error.message))
+        }
         DataType::Name => {
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
@@ -800,6 +839,12 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
             )
             .map_err(|e| fe_code(e.code, e.message))
         }
+        DataType::PgChar => {
+            if bytes.len() != 1 {
+                return Err(fe("binary char must be 1 byte"));
+            }
+            Ok(Value::PgChar(bytes[0]))
+        }
         DataType::Point => {
             if bytes.len() != 16 {
                 return Err(fe("binary point must be 16 bytes"));
@@ -807,6 +852,88 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
             let x = f64::from_be_bytes(bytes[..8].try_into().expect("point x width checked"));
             let y = f64::from_be_bytes(bytes[8..].try_into().expect("point y width checked"));
             Ok(Value::Point(crate::engine::PointValue::new(x, y)))
+        }
+        DataType::Lseg => {
+            if bytes.len() != 32 {
+                return Err(fe("binary lseg must be 32 bytes"));
+            }
+            let coordinate = |offset: usize| {
+                f64::from_be_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("binary lseg coordinate width checked"),
+                )
+            };
+            Ok(Value::Lseg(crate::engine::LsegValue::new(
+                crate::engine::PointValue::new(coordinate(0), coordinate(8)),
+                crate::engine::PointValue::new(coordinate(16), coordinate(24)),
+            )))
+        }
+        DataType::Line => {
+            if bytes.len() != 24 {
+                return Err(fe("binary line must be 24 bytes"));
+            }
+            let coordinate = |offset: usize| {
+                f64::from_be_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("binary line coordinate width checked"),
+                )
+            };
+            Ok(Value::Line(crate::engine::LineValue::new(
+                coordinate(0),
+                coordinate(8),
+                coordinate(16),
+            )))
+        }
+        DataType::Circle => {
+            if bytes.len() != 24 {
+                return Err(fe("binary circle must be 24 bytes"));
+            }
+            let coordinate = |offset: usize| {
+                f64::from_be_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("binary circle coordinate width checked"),
+                )
+            };
+            Ok(Value::Circle(crate::engine::CircleValue::new(
+                crate::engine::PointValue::new(coordinate(0), coordinate(8)),
+                coordinate(16),
+            )))
+        }
+        DataType::Box => {
+            if bytes.len() != 32 {
+                return Err(fe("binary box must be 32 bytes"));
+            }
+            let coordinate = |offset: usize| {
+                f64::from_be_bytes(
+                    bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("binary box coordinate width checked"),
+                )
+            };
+            Ok(Value::Box(crate::engine::BoxValue::new(
+                crate::engine::PointValue::new(coordinate(0), coordinate(8)),
+                crate::engine::PointValue::new(coordinate(16), coordinate(24)),
+            )))
+        }
+        DataType::Tid => {
+            if bytes.len() != 6 {
+                return Err(fe("binary tid must be 6 bytes"));
+            }
+            Ok(Value::Tid(crate::engine::TidValue::new(
+                u32::from_be_bytes(
+                    bytes[..4]
+                        .try_into()
+                        .expect("binary tid block width checked"),
+                ),
+                u16::from_be_bytes(
+                    bytes[4..]
+                        .try_into()
+                        .expect("binary tid offset width checked"),
+                ),
+            )))
         }
         DataType::Path => {
             if bytes.len() < 5 {

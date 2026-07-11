@@ -57,9 +57,16 @@ pub enum DataType {
     Int8,
     Float8,
     Text,
+    Varchar(Option<usize>),
     Name,
     BpChar(Option<usize>),
+    PgChar,
     Point,
+    Lseg,
+    Line,
+    Circle,
+    Box,
+    Tid,
     Path,
     Json,
     Jsonb,
@@ -80,9 +87,16 @@ impl DataType {
             DataType::Int8 => Type::INT8,
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
+            DataType::Varchar(_) => Type::VARCHAR,
             DataType::Name => Type::NAME,
             DataType::BpChar(_) => Type::BPCHAR,
+            DataType::PgChar => Type::CHAR,
             DataType::Point => Type::POINT,
+            DataType::Lseg => Type::LSEG,
+            DataType::Line => Type::LINE,
+            DataType::Circle => Type::CIRCLE,
+            DataType::Box => Type::BOX,
+            DataType::Tid => Type::TID,
             DataType::Path => Type::PATH,
             DataType::Json => Type::JSON,
             DataType::Jsonb => Type::JSONB,
@@ -144,6 +158,121 @@ pub struct PathValue {
     points: Vec<PointValue>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LsegValue {
+    start: PointValue,
+    end: PointValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LineValue {
+    a_bits: u64,
+    b_bits: u64,
+    c_bits: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CircleValue {
+    center: PointValue,
+    radius_bits: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BoxValue {
+    high: PointValue,
+    low: PointValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TidValue {
+    block: u32,
+    offset: u16,
+}
+
+impl TidValue {
+    pub fn new(block: u32, offset: u16) -> Self {
+        Self { block, offset }
+    }
+
+    pub fn block(self) -> u32 {
+        self.block
+    }
+
+    pub fn offset(self) -> u16 {
+        self.offset
+    }
+}
+
+impl BoxValue {
+    pub fn new(first: PointValue, second: PointValue) -> Self {
+        Self {
+            high: PointValue::new(first.x().max(second.x()), first.y().max(second.y())),
+            low: PointValue::new(first.x().min(second.x()), first.y().min(second.y())),
+        }
+    }
+
+    pub fn high(self) -> PointValue {
+        self.high
+    }
+
+    pub fn low(self) -> PointValue {
+        self.low
+    }
+}
+
+impl CircleValue {
+    pub fn new(center: PointValue, radius: f64) -> Self {
+        Self {
+            center,
+            radius_bits: radius.to_bits(),
+        }
+    }
+
+    pub fn center(self) -> PointValue {
+        self.center
+    }
+
+    pub fn radius(self) -> f64 {
+        f64::from_bits(self.radius_bits)
+    }
+}
+
+impl LineValue {
+    pub fn new(a: f64, b: f64, c: f64) -> Self {
+        Self {
+            a_bits: a.to_bits(),
+            b_bits: b.to_bits(),
+            c_bits: c.to_bits(),
+        }
+    }
+
+    pub fn a(self) -> f64 {
+        f64::from_bits(self.a_bits)
+    }
+
+    pub fn b(self) -> f64 {
+        f64::from_bits(self.b_bits)
+    }
+
+    pub fn c(self) -> f64 {
+        f64::from_bits(self.c_bits)
+    }
+}
+
+impl LsegValue {
+    pub fn new(start: PointValue, end: PointValue) -> Self {
+        Self { start, end }
+    }
+
+    pub fn start(self) -> PointValue {
+        self.start
+    }
+
+    pub fn end(self) -> PointValue {
+        self.end
+    }
+}
+
 impl PathValue {
     pub fn new(closed: bool, points: Vec<PointValue>) -> Self {
         Self { closed, points }
@@ -190,7 +319,13 @@ pub enum Value {
     Int64(i64),
     Float64Bits(u64),
     Text(String),
+    PgChar(u8),
     Point(PointValue),
+    Lseg(LsegValue),
+    Line(LineValue),
+    Circle(CircleValue),
+    Box(BoxValue),
+    Tid(TidValue),
     Path(PathValue),
     Bool(bool),
     Date(i32),
@@ -208,7 +343,13 @@ impl PartialEq for Value {
             (Int64(a), Int64(b)) => a == b,
             (Float64Bits(a), Float64Bits(b)) => a == b,
             (Text(a), Text(b)) => a == b,
+            (PgChar(a), PgChar(b)) => a == b,
             (Point(a), Point(b)) => a == b,
+            (Lseg(a), Lseg(b)) => a == b,
+            (Line(a), Line(b)) => a == b,
+            (Circle(a), Circle(b)) => a == b,
+            (Box(a), Box(b)) => a == b,
+            (Tid(a), Tid(b)) => a == b,
             (Path(a), Path(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
@@ -232,7 +373,13 @@ impl Hash for Value {
             Int64(v) => v.hash(state),
             Float64Bits(v) => v.hash(state),
             Text(s) => s.hash(state),
+            PgChar(value) => value.hash(state),
             Point(point) => point.hash(state),
+            Lseg(lseg) => lseg.hash(state),
+            Line(line) => line.hash(state),
+            Circle(circle) => circle.hash(state),
+            Box(value) => value.hash(state),
+            Tid(tid) => tid.hash(state),
             Path(path) => path.hash(state),
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
@@ -310,6 +457,271 @@ pub fn format_point_text(point: PointValue) -> String {
         format_geometry_coordinate(point.x()),
         format_geometry_coordinate(point.y())
     )
+}
+
+pub fn parse_lseg_text(input: &str) -> Result<LsegValue, SqlError> {
+    let path = parse_path_text(input).map_err(|error| {
+        SqlError::new(
+            error.code,
+            error.message.replacen("type path", "type lseg", 1),
+        )
+    })?;
+    let [start, end] = path.points() else {
+        return Err(SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type lseg: \"{input}\""),
+        ));
+    };
+    Ok(LsegValue::new(*start, *end))
+}
+
+pub fn format_lseg_text(lseg: LsegValue) -> String {
+    format!(
+        "[{},{}]",
+        format_point_text(lseg.start()),
+        format_point_text(lseg.end())
+    )
+}
+
+pub fn line_from_points(start: PointValue, end: PointValue) -> Result<LineValue, SqlError> {
+    if start == end {
+        return Err(SqlError::new(
+            "22P02",
+            "invalid line specification: must be two distinct points",
+        ));
+    }
+    let dx = end.x() - start.x();
+    let (mut a, b, mut c) = if dx != 0.0 {
+        let a = (end.y() - start.y()) / dx;
+        (a, -1.0, start.y() - a * start.x())
+    } else {
+        (-1.0, 0.0, start.x())
+    };
+    if a == -0.0 {
+        a = 0.0;
+    }
+    if c == -0.0 {
+        c = 0.0;
+    }
+    Ok(LineValue::new(a, b, c))
+}
+
+pub fn parse_line_text(input: &str) -> Result<LineValue, SqlError> {
+    fn invalid(input: &str) -> SqlError {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type line: \"{input}\""),
+        )
+    }
+
+    let trimmed = input.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        let values = inner.split(',').collect::<Vec<_>>();
+        if values.len() != 3 || values.iter().any(|value| value.trim().is_empty()) {
+            return Err(invalid(input));
+        }
+        let a = parse_geometry_coordinate(values[0], input, "line")?;
+        let b = parse_geometry_coordinate(values[1], input, "line")?;
+        let c = parse_geometry_coordinate(values[2], input, "line")?;
+        if a == 0.0 && b == 0.0 {
+            return Err(SqlError::new(
+                "22P02",
+                "invalid line specification: A and B cannot both be zero",
+            ));
+        }
+        return Ok(LineValue::new(a, b, c));
+    }
+    if trimmed.starts_with('{') || trimmed.ends_with('}') {
+        return Err(invalid(input));
+    }
+    let lseg = parse_lseg_text(input).map_err(|error| {
+        SqlError::new(
+            error.code,
+            error.message.replacen("type lseg", "type line", 1),
+        )
+    })?;
+    line_from_points(lseg.start(), lseg.end())
+}
+
+pub fn format_line_text(line: LineValue) -> String {
+    format!(
+        "{{{},{},{}}}",
+        format_geometry_coordinate(line.a()),
+        format_geometry_coordinate(line.b()),
+        format_geometry_coordinate(line.c())
+    )
+}
+
+pub fn parse_circle_text(input: &str) -> Result<CircleValue, SqlError> {
+    fn invalid(input: &str) -> SqlError {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type circle: \"{input}\""),
+        )
+    }
+
+    let compact = input
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let bracketless = if let Some(inner) = compact
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+    {
+        inner
+    } else if compact.starts_with("((") && compact.ends_with(')') {
+        &compact[1..compact.len() - 1]
+    } else {
+        compact.as_str()
+    };
+    let (point, radius) = if let Some(inner) = bracketless.strip_prefix('(') {
+        inner.split_once("),").ok_or_else(|| invalid(input))?
+    } else if bracketless.contains(['(', ')', '<', '>']) {
+        return Err(invalid(input));
+    } else {
+        let mut parts = bracketless.split(',');
+        let x = parts.next().ok_or_else(|| invalid(input))?;
+        let y = parts.next().ok_or_else(|| invalid(input))?;
+        let radius = parts.next().ok_or_else(|| invalid(input))?;
+        if parts.next().is_some() {
+            return Err(invalid(input));
+        }
+        return parse_circle_components(&format!("{x},{y}"), radius, input);
+    };
+    parse_circle_components(point, radius, input)
+}
+
+fn parse_circle_components(
+    point: &str,
+    radius: &str,
+    input: &str,
+) -> Result<CircleValue, SqlError> {
+    let invalid = || {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type circle: \"{input}\""),
+        )
+    };
+    let center = parse_point_text(point).map_err(|_| invalid())?;
+    let radius = parse_geometry_coordinate(radius, input, "circle")?;
+    if radius < 0.0 {
+        return Err(invalid());
+    }
+    Ok(CircleValue::new(center, radius))
+}
+
+pub fn format_circle_text(circle: CircleValue) -> String {
+    format!(
+        "<{},{}>",
+        format_point_text(circle.center()),
+        format_geometry_coordinate(circle.radius())
+    )
+}
+
+pub fn parse_box_text(input: &str) -> Result<BoxValue, SqlError> {
+    let lseg = parse_lseg_text(input).map_err(|error| {
+        SqlError::new(
+            error.code,
+            error.message.replacen("type lseg", "type box", 1),
+        )
+    })?;
+    Ok(BoxValue::new(lseg.start(), lseg.end()))
+}
+
+pub fn format_box_text(value: BoxValue) -> String {
+    format!(
+        "{},{}",
+        format_point_text(value.high()),
+        format_point_text(value.low())
+    )
+}
+
+pub fn parse_tid_text(input: &str) -> Result<TidValue, SqlError> {
+    let invalid = || {
+        SqlError::new(
+            "22P02",
+            format!("invalid input syntax for type tid: \"{input}\""),
+        )
+    };
+    let inner = input
+        .trim()
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(invalid)?;
+    let mut parts = inner.split(',');
+    let block = parts
+        .next()
+        .ok_or_else(invalid)?
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    let offset = parts
+        .next()
+        .ok_or_else(invalid)?
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| invalid())?;
+    if parts.next().is_some()
+        || !(-1..=u32::MAX as i64).contains(&block)
+        || !(0..=u16::MAX as i64).contains(&offset)
+    {
+        return Err(invalid());
+    }
+    Ok(TidValue::new(block as u32, offset as u16))
+}
+
+pub fn format_tid_text(tid: TidValue) -> String {
+    format!("({},{})", tid.block(), tid.offset())
+}
+
+pub fn validate_varchar_input(input: &str, type_spec: &str) -> Result<(), SqlError> {
+    let length = type_spec
+        .strip_prefix("varchar(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| SqlError::new("42704", format!("type \"{type_spec}\" does not exist")))?;
+    coerce_value_to_type(
+        Value::Text(input.to_string()),
+        &DataType::Varchar(Some(length)),
+        &SessionTimeZone::Utc,
+    )
+    .map(|_| ())
+}
+
+pub fn validate_char_input(input: &str, type_spec: &str) -> Result<(), SqlError> {
+    let length = type_spec
+        .strip_prefix("char(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.parse::<usize>().ok())
+        .ok_or_else(|| SqlError::new("42704", format!("type \"{type_spec}\" does not exist")))?;
+    coerce_value_to_type(
+        Value::Text(input.to_string()),
+        &DataType::BpChar(Some(length)),
+        &SessionTimeZone::Utc,
+    )
+    .map(|_| ())
+}
+
+fn parse_pg_char(input: &str) -> Value {
+    let byte = input
+        .strip_prefix('\\')
+        .filter(|digits| {
+            digits.len() == 3 && digits.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+        })
+        .and_then(|digits| u8::from_str_radix(digits, 8).ok())
+        .unwrap_or_else(|| input.as_bytes().first().copied().unwrap_or(0));
+    Value::PgChar(byte)
+}
+
+pub fn format_pg_char(byte: u8) -> String {
+    match byte {
+        0 => String::new(),
+        0x20..=0x7e => (byte as char).to_string(),
+        _ => format!("\\{byte:03o}"),
+    }
 }
 
 pub fn parse_path_text(input: &str) -> Result<PathValue, SqlError> {
@@ -557,6 +969,25 @@ fn convert_value_to_type(
         Ok(Value::Text(output))
     }
 
+    fn coerce_varchar(
+        input: String,
+        length: Option<usize>,
+        assignment: bool,
+    ) -> Result<Value, SqlError> {
+        let Some(length) = length else {
+            return Ok(Value::Text(input));
+        };
+        let mut chars = input.chars();
+        let output: String = chars.by_ref().take(length).collect();
+        if assignment && chars.any(|character| character != ' ') {
+            return Err(SqlError::new(
+                "22001",
+                format!("value too long for type character varying({length})"),
+            ));
+        }
+        Ok(Value::Text(output))
+    }
+
     fn coerce_name(mut input: String) -> Value {
         const MAX_NAME_BYTES: usize = 63;
 
@@ -612,6 +1043,11 @@ fn convert_value_to_type(
                 )
             }),
         (DataType::Text, Value::Text(s)) => Ok(Value::Text(s)),
+        (DataType::Text, Value::PgChar(value)) => Ok(Value::Text(format_pg_char(value))),
+        (DataType::Varchar(length), Value::Text(s)) => coerce_varchar(s, *length, assignment),
+        (DataType::Varchar(length), Value::Int64(value)) => {
+            coerce_varchar(value.to_string(), *length, assignment)
+        }
         (DataType::Text, Value::Bool(b)) => Ok(Value::Text(if b { "t" } else { "f" }.into())),
         (DataType::Text, Value::Int64(i)) => Ok(Value::Text(i.to_string())),
         (DataType::Text, Value::Float64Bits(bits)) => {
@@ -629,9 +1065,29 @@ fn convert_value_to_type(
         }
         (DataType::Name, Value::Text(s)) => Ok(coerce_name(s)),
         (DataType::BpChar(length), Value::Text(s)) => coerce_bpchar(s, *length, assignment),
+        (DataType::BpChar(length), Value::Int64(value)) => {
+            coerce_bpchar(value.to_string(), *length, assignment)
+        }
+        (DataType::PgChar, Value::PgChar(value)) => Ok(Value::PgChar(value)),
+        (DataType::PgChar, Value::Text(value)) => Ok(parse_pg_char(&value)),
         (DataType::Point, Value::Point(point)) => Ok(Value::Point(point)),
         (DataType::Point, Value::Text(value)) => parse_point_text(&value).map(Value::Point),
         (DataType::Text, Value::Point(point)) => Ok(Value::Text(format_point_text(point))),
+        (DataType::Lseg, Value::Lseg(lseg)) => Ok(Value::Lseg(lseg)),
+        (DataType::Lseg, Value::Text(value)) => parse_lseg_text(&value).map(Value::Lseg),
+        (DataType::Text, Value::Lseg(lseg)) => Ok(Value::Text(format_lseg_text(lseg))),
+        (DataType::Line, Value::Line(line)) => Ok(Value::Line(line)),
+        (DataType::Line, Value::Text(value)) => parse_line_text(&value).map(Value::Line),
+        (DataType::Text, Value::Line(line)) => Ok(Value::Text(format_line_text(line))),
+        (DataType::Circle, Value::Circle(circle)) => Ok(Value::Circle(circle)),
+        (DataType::Circle, Value::Text(value)) => parse_circle_text(&value).map(Value::Circle),
+        (DataType::Text, Value::Circle(circle)) => Ok(Value::Text(format_circle_text(circle))),
+        (DataType::Box, Value::Box(value)) => Ok(Value::Box(value)),
+        (DataType::Box, Value::Text(value)) => parse_box_text(&value).map(Value::Box),
+        (DataType::Text, Value::Box(value)) => Ok(Value::Text(format_box_text(value))),
+        (DataType::Tid, Value::Tid(tid)) => Ok(Value::Tid(tid)),
+        (DataType::Tid, Value::Text(value)) => parse_tid_text(&value).map(Value::Tid),
+        (DataType::Text, Value::Tid(tid)) => Ok(Value::Text(format_tid_text(tid))),
         (DataType::Path, Value::Path(path)) => Ok(Value::Path(path)),
         (DataType::Path, Value::Text(value)) => parse_path_text(&value).map(Value::Path),
         (DataType::Text, Value::Path(path)) => Ok(Value::Text(format_path_text(&path))),
@@ -813,5 +1269,45 @@ pub fn format_interval_micros(micros: i64) -> String {
                 "".into()
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod geometric_tests {
+    use super::*;
+
+    #[test]
+    fn parses_and_formats_lseg_variants() {
+        for (input, expected) in [
+            ("[(1,2),(3,4)]", "[(1,2),(3,4)]"),
+            ("(0,0),(6,6)", "[(0,0),(6,6)]"),
+            ("10,-10,-3,-4", "[(10,-10),(-3,-4)]"),
+        ] {
+            assert_eq!(format_lseg_text(parse_lseg_text(input).unwrap()), expected);
+        }
+        assert!(parse_lseg_text("[(1,2),(3,4)").is_err());
+    }
+
+    #[test]
+    fn normalizes_lines_constructed_from_points() {
+        let diagonal =
+            line_from_points(PointValue::new(0.0, 0.0), PointValue::new(6.0, 6.0)).unwrap();
+        assert_eq!(format_line_text(diagonal), "{1,-1,0}");
+        let vertical =
+            line_from_points(PointValue::new(3.0, 1.0), PointValue::new(3.0, 2.0)).unwrap();
+        assert_eq!(format_line_text(vertical), "{-1,0,3}");
+        assert!(line_from_points(PointValue::new(1.0, 1.0), PointValue::new(1.0, 1.0)).is_err());
+    }
+
+    #[test]
+    fn parses_and_formats_circle_variants() {
+        for input in ["<(5,1),3>", "((5,1),3)", "(5,1),3", "5,1,3"] {
+            assert_eq!(
+                format_circle_text(parse_circle_text(input).unwrap()),
+                "<(5,1),3>"
+            );
+        }
+        assert!(parse_circle_text("<(5,1),-3>").is_err());
+        assert!(parse_circle_text("<(5,1),3").is_err());
     }
 }

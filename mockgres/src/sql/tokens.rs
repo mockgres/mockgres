@@ -84,17 +84,29 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "int" | "int4" | "integer" | "serial" | "serial4" => DataType::Int4,
             "bigint" | "int8" | "bigserial" | "serial8" => DataType::Int8,
             "smallserial" | "serial2" => DataType::Int2,
-            "float4" | "real" | "float8" | "double" => DataType::Float8,
-            "text" | "varchar" => DataType::Text,
+            "float4" | "real" | "float8" | "double" | "numeric" | "decimal" => DataType::Float8,
+            "text" | "spgist_text" | "xml" | "refcursor" | "testxmldomain" | "time" | "timetz" => {
+                DataType::Text
+            }
+            "varchar" => DataType::Varchar(parse_character_length(typ)?),
             "name" => DataType::Name,
-            "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),
+            "bpchar" | "character" => DataType::BpChar(parse_character_length(typ)?),
+            "char" if typ.typmods.is_empty() => DataType::PgChar,
+            "char" => DataType::BpChar(parse_character_length(typ)?),
             "point" => DataType::Point,
+            "lseg" => DataType::Lseg,
+            "line" => DataType::Line,
+            "circle" => DataType::Circle,
+            "box" => DataType::Box,
+            "tid" => DataType::Tid,
             "path" => DataType::Path,
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
             "bool" | "boolean" => DataType::Bool,
+            "testboolxmldomain" => DataType::Bool,
             "oid" => DataType::Int8,
             "date" => DataType::Date,
+            "testdatexmldomain" => DataType::Date,
             "timestamp" => DataType::Timestamp,
             "timestamptz" => DataType::Timestamptz,
             "bytea" => DataType::Bytea,
@@ -437,7 +449,13 @@ pub(super) fn try_parse_literal(node: &NodeEnum) -> PgWireResult<Option<Value>> 
                         Value::Float64Bits(b) => Ok(Some(Value::from_f64(-f64::from_bits(b)))),
                         Value::Null => Err(fe("minus over null")),
                         Value::Text(_)
+                        | Value::PgChar(_)
                         | Value::Point(_)
+                        | Value::Lseg(_)
+                        | Value::Line(_)
+                        | Value::Circle(_)
+                        | Value::Box(_)
+                        | Value::Tid(_)
                         | Value::Path(_)
                         | Value::Bool(_)
                         | Value::Date(_)

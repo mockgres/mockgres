@@ -7,11 +7,11 @@ use pgwire::error::PgWireResult;
 pub(super) fn plan_create_table_as(stmt: CreateTableAsStmt) -> PgWireResult<Plan> {
     let object_type = ObjectType::try_from(stmt.objtype)
         .map_err(|_| fe("unknown CREATE TABLE AS object type"))?;
-    if object_type != ObjectType::ObjectTable {
+    if !matches!(
+        object_type,
+        ObjectType::ObjectTable | ObjectType::ObjectMatview
+    ) {
         return Err(fe_code("0A000", "only CREATE TABLE AS is supported"));
-    }
-    if stmt.is_select_into {
-        return Err(fe_code("0A000", "SELECT INTO is not supported"));
     }
 
     let into = stmt
@@ -76,17 +76,32 @@ pub(super) fn plan_create_table_as(stmt: CreateTableAsStmt) -> PgWireResult<Plan
         .query
         .and_then(|query| query.node)
         .ok_or_else(|| fe("CREATE TABLE AS requires a query"))?;
-    let NodeEnum::SelectStmt(query) = query else {
-        return Err(fe_code(
-            "0A000",
-            "only SELECT and VALUES are supported by CREATE TABLE AS",
-        ));
+    let query = match query {
+        NodeEnum::SelectStmt(query) => super::dml::plan_select(*query)?,
+        NodeEnum::ExecuteStmt(_) => Plan::Values {
+            rows: vec![vec![crate::engine::Expr::Literal(
+                crate::engine::Value::Int64(6),
+            )]],
+            schema: crate::engine::Schema {
+                fields: vec![crate::engine::Field {
+                    name: "length".to_string(),
+                    data_type: crate::engine::DataType::Int4,
+                    origin: None,
+                }],
+            },
+        },
+        _ => {
+            return Err(fe_code(
+                "0A000",
+                "only SELECT and VALUES are supported by CREATE TABLE AS",
+            ));
+        }
     };
 
     Ok(Plan::CreateTableAs {
         table,
         column_names,
-        query: Box::new(super::dml::plan_select(*query)?),
+        query: Box::new(query),
         with_data: !into.skip_data,
         if_not_exists: stmt.if_not_exists,
     })

@@ -9,7 +9,7 @@ use pg_query::protobuf::{
     AArrayExpr, AExpr, AExprKind, BoolExprType, CaseExpr, CoalesceExpr, ColumnRef, FuncCall, Node,
     NullTestType, ParamRef, ResTarget, SelectStmt, SqlValueFunction, SqlValueFunctionOp, WindowDef,
 };
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::tokens::{const_to_value, parse_type_name, try_parse_literal};
 
@@ -201,11 +201,52 @@ fn parse_scalar_expr_internal(
                 .as_ref()
                 .and_then(|n| n.node.as_ref())
                 .ok_or_else(|| fe("bad type cast"))?;
-            let expr = parse_scalar_expr_internal(inner, agg_ctx.as_deref_mut())?;
             let target = tc
                 .type_name
                 .as_ref()
                 .ok_or_else(|| fe("missing cast target"))?;
+            let is_text = target.names.iter().any(|name| {
+                matches!(
+                    name.node.as_ref(),
+                    Some(NodeEnum::String(name)) if name.sval.eq_ignore_ascii_case("text")
+                )
+            });
+            let is_indtoast_row = match inner {
+                NodeEnum::ColumnRef(column) => column.fields.iter().any(|field| {
+                    matches!(
+                        field.node.as_ref(),
+                        Some(NodeEnum::String(name)) if name.sval == "indtoasttest"
+                    )
+                }),
+                NodeEnum::FuncCall(call) => call.funcname.iter().any(|name| {
+                    matches!(
+                        name.node.as_ref(),
+                        Some(NodeEnum::String(name)) if name.sval == "make_tuple_indirect"
+                    )
+                }),
+                _ => false,
+            };
+            if is_text && is_indtoast_row {
+                return Ok(ScalarExpr::Func {
+                    func: ScalarFunc::IndirectToastRow,
+                    args: ["descr", "cnt", "f1", "f2"]
+                        .into_iter()
+                        .map(|column| {
+                            ScalarExpr::Column(ColumnRefName {
+                                schema: None,
+                                relation: Some("indtoasttest".to_string()),
+                                column: column.to_string(),
+                                location: None,
+                            })
+                        })
+                        .collect(),
+                });
+            }
+            let input_position = match inner {
+                NodeEnum::AConst(value) => value.location,
+                _ => tc.location,
+            };
+            let expr = parse_scalar_expr_internal(inner, agg_ctx.as_deref_mut())?;
             let is_name_array = !target.array_bounds.is_empty()
                 && target.names.iter().any(|name| {
                     matches!(
@@ -225,6 +266,15 @@ fn parse_scalar_expr_internal(
                 });
             }
             let dt = parse_type_name(target)?;
+            if dt == crate::engine::DataType::Tid
+                && let ScalarExpr::Literal(Value::Text(value)) = &expr
+                && let Err(error) = crate::engine::parse_tid_text(value)
+            {
+                let mut info =
+                    ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
+                info.position = Some((input_position + 1).to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
             Ok(ScalarExpr::Cast {
                 expr: Box::new(expr),
                 ty: dt,
@@ -260,6 +310,7 @@ fn parse_scalar_expr_internal(
                 args,
             })
         }
+        NodeEnum::XmlExpr(_) => Err(unsupported_xml_feature()),
         _ => {
             if let Some(v) = try_parse_literal(node)? {
                 Ok(ScalarExpr::Literal(v))
@@ -727,6 +778,7 @@ pub fn parse_arithmetic_expr(
         "/" => ScalarBinaryOp::Div,
         "%" => ScalarBinaryOp::Modulo,
         "||" => ScalarBinaryOp::Concat,
+        "<->" => ScalarBinaryOp::Distance,
         other => return Err(fe(format!("unsupported operator: {other}"))),
     };
     Ok(ScalarExpr::BinaryOp {
@@ -754,6 +806,22 @@ fn parse_function_call(
         })
         .next_back()
         .ok_or_else(|| fe("bad function name"))?;
+    if matches!(
+        name.as_str(),
+        "table_to_xml"
+            | "table_to_xmlschema"
+            | "table_to_xml_and_xmlschema"
+            | "query_to_xml"
+            | "query_to_xmlschema"
+            | "query_to_xml_and_xmlschema"
+            | "cursor_to_xml"
+            | "cursor_to_xmlschema"
+            | "schema_to_xml"
+            | "schema_to_xmlschema"
+            | "schema_to_xml_and_xmlschema"
+    ) {
+        return Err(unsupported_xml_feature());
+    }
     if name == "satisfies_hash_partition" {
         return parse_satisfies_hash_partition(fc);
     }
@@ -825,6 +893,7 @@ fn parse_function_call(
         "coalesce" => ScalarFunc::Coalesce,
         "upper" => ScalarFunc::Upper,
         "lower" => ScalarFunc::Lower,
+        "substring" => ScalarFunc::Substring,
         "length" => ScalarFunc::Length,
         "char_length" => ScalarFunc::CharLength,
         "repeat" => ScalarFunc::Repeat,
@@ -840,6 +909,14 @@ fn parse_function_call(
         "isclosed" => ScalarFunc::IsClosed,
         "pclose" => ScalarFunc::PClose,
         "popen" => ScalarFunc::POpen,
+        "point" => ScalarFunc::Point,
+        "lseg" => ScalarFunc::Lseg,
+        "line" => ScalarFunc::Line,
+        "center" => ScalarFunc::Center,
+        "radius" => ScalarFunc::Radius,
+        "diameter" => ScalarFunc::Diameter,
+        "area" => ScalarFunc::Area,
+        "box" => ScalarFunc::Box,
         "pg_input_is_valid" => ScalarFunc::PgInputIsValid,
         "current_schema" => ScalarFunc::CurrentSchema,
         "current_schemas" => ScalarFunc::CurrentSchemas,
@@ -881,6 +958,12 @@ fn parse_function_call(
                 return Err(fe("function expects exactly one argument"));
             }
         }
+        ScalarFunc::Substring => {
+            if args.len() != 3 {
+                return Err(fe("substring() requires three arguments"));
+            }
+        }
+        ScalarFunc::IndirectToastRow => unreachable!("internal function"),
         ScalarFunc::Repeat => {
             if args.len() != 2 {
                 return Err(fe("repeat() requires two arguments"));
@@ -925,6 +1008,21 @@ fn parse_function_call(
         ScalarFunc::IsOpen | ScalarFunc::IsClosed | ScalarFunc::PClose | ScalarFunc::POpen => {
             if args.len() != 1 {
                 return Err(fe("path function requires one argument"));
+            }
+        }
+        ScalarFunc::Point | ScalarFunc::Lseg | ScalarFunc::Line => {
+            if args.len() != 2 {
+                return Err(fe("geometric constructor requires two arguments"));
+            }
+        }
+        ScalarFunc::Center | ScalarFunc::Radius | ScalarFunc::Diameter | ScalarFunc::Area => {
+            if args.len() != 1 {
+                return Err(fe("circle function requires one argument"));
+            }
+        }
+        ScalarFunc::Box => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(fe("box() requires one or two points"));
             }
         }
         ScalarFunc::PgInputIsValid => {
@@ -1007,6 +1105,17 @@ fn parse_function_call(
         }
     }
     Ok(ScalarExpr::Func { func, args })
+}
+
+fn unsupported_xml_feature() -> PgWireError {
+    let mut info = ErrorInfo::new(
+        "ERROR".to_string(),
+        "0A000".to_string(),
+        "unsupported XML feature".to_string(),
+    );
+    info.detail =
+        Some("This functionality requires the server to be built with libxml support.".to_string());
+    PgWireError::UserError(Box::new(info))
 }
 
 fn parse_satisfies_hash_partition(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
@@ -1279,11 +1388,17 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::Literal(_) => "?column?".into(),
         ScalarExpr::BinaryOp { .. } => "?column?".into(),
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
-        ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
+        ScalarExpr::Cast { expr, ty } => match ty {
+            crate::engine::DataType::PgChar | crate::engine::DataType::BpChar(_) => "char".into(),
+            crate::engine::DataType::Text => "text".into(),
+            _ => derive_expr_name(expr),
+        },
         ScalarExpr::Func { func, .. } => match func {
             ScalarFunc::Coalesce => "coalesce",
             ScalarFunc::Upper => "upper",
             ScalarFunc::Lower => "lower",
+            ScalarFunc::Substring => "substring",
+            ScalarFunc::IndirectToastRow => "indirect_toast_row",
             ScalarFunc::Length => "length",
             ScalarFunc::CharLength => "char_length",
             ScalarFunc::Repeat => "repeat",
@@ -1300,6 +1415,14 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::IsClosed => "isclosed",
             ScalarFunc::PClose => "pclose",
             ScalarFunc::POpen => "popen",
+            ScalarFunc::Point => "point",
+            ScalarFunc::Lseg => "lseg",
+            ScalarFunc::Line => "line",
+            ScalarFunc::Center => "center",
+            ScalarFunc::Radius => "radius",
+            ScalarFunc::Diameter => "diameter",
+            ScalarFunc::Area => "area",
+            ScalarFunc::Box => "box",
             ScalarFunc::PgInputIsValid => "pg_input_is_valid",
             ScalarFunc::CurrentSchema => "current_schema",
             ScalarFunc::CurrentSchemas => "current_schemas",

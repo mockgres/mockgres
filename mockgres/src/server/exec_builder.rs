@@ -116,6 +116,8 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         Plan::ShowVariable { .. } => "SHOW",
         Plan::SetVariable { .. } => "SET",
         Plan::CallBuiltin { .. } => "SELECT",
+        Plan::DeclareCursor { .. } => "DECLARE CURSOR",
+        Plan::FetchCursor { .. } => "FETCH",
         Plan::InsertValues { .. } => "INSERT",
         Plan::InsertSelect { .. } => "INSERT",
         Plan::Update { .. } => "UPDATE",
@@ -155,6 +157,18 @@ pub fn build_executor(
             Some((*tag).to_string()),
             None,
         )),
+        Plan::DeclareCursor { name, query } => {
+            session.set_cursor(name.clone(), query.as_ref().clone());
+            Ok((
+                Box::new(crate::engine::ValuesExec::new(
+                    crate::engine::Schema { fields: vec![] },
+                    vec![],
+                )?),
+                Some("DECLARE CURSOR".to_string()),
+                None,
+            ))
+        }
+        Plan::FetchCursor { .. } => unreachable!("fetch cursor must be resolved during binding"),
         Plan::Values { .. }
         | Plan::Projection { .. }
         | Plan::WindowRowNumber { .. }

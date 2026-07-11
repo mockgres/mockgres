@@ -40,10 +40,14 @@ pub(crate) fn coerce_value_for_column(
         return Ok(Value::Null);
     }
     let coerced = coerce_value_to_type(val, &col.data_type, &ctx.time_zone).map_err(|e| {
-        sql_err(
-            e.code,
-            format!("column {} (index {}): {}", col.name, idx, e.message),
-        )
+        if e.code == "22001" {
+            sql_err(e.code, e.message)
+        } else {
+            sql_err(
+                e.code,
+                format!("column {} (index {}): {}", col.name, idx, e.message),
+            )
+        }
     })?;
     Ok(coerced)
 }

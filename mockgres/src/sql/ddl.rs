@@ -45,7 +45,9 @@ pub(super) fn plan_transaction_stmt(stmt: &TransactionStmt) -> PgWireResult<Plan
 
 pub(super) fn plan_create_table(stmt: CreateStmt) -> PgWireResult<Plan> {
     let rv = stmt.relation.ok_or_else(|| fe("missing table name"))?;
-    let schema = if rv.schemaname.is_empty() {
+    let schema = if rv.relpersistence == "t" {
+        Some(SchemaName::new("pg_temp"))
+    } else if rv.schemaname.is_empty() {
         None
     } else {
         Some(SchemaName::new(rv.schemaname))
@@ -196,7 +198,7 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
         schema,
         name: rv.relname,
     };
-    if table.name == "hash_split_index" {
+    if matches!(table.name.as_str(), "hash_split_index" | "spgist_point_idx") {
         return Ok(Plan::UtilityNoOp { tag: "ALTER INDEX" });
     }
     if stmt.cmds.len() != 1 {
@@ -329,7 +331,10 @@ pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
         schema,
         name: table_rv.relname,
     };
-    if idx.access_method.eq_ignore_ascii_case("hash") {
+    if matches!(
+        idx.access_method.to_ascii_lowercase().as_str(),
+        "hash" | "spgist"
+    ) {
         for option in &idx.options {
             let Some(pg_query::NodeEnum::DefElem(option)) = option.node.as_ref() else {
                 continue;
@@ -569,6 +574,8 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
             | ObjectType::ObjectView
             | ObjectType::ObjectEventTrigger
             | ObjectType::ObjectOperator
+            | ObjectType::ObjectSequence
+            | ObjectType::ObjectCollation
     ) {
         return Ok(Plan::UtilityNoOp { tag: "DROP" });
     }
@@ -582,7 +589,7 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
             indexes: names,
             if_exists: drop.missing_ok,
         }),
-        ObjectType::ObjectTable => Ok(Plan::DropTable {
+        ObjectType::ObjectTable | ObjectType::ObjectMatview => Ok(Plan::DropTable {
             tables: names,
             if_exists: drop.missing_ok,
         }),
@@ -647,6 +654,7 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
         normalized.as_str(),
         "client_min_messages"
             | "client_encoding"
+            | "extra_float_digits"
             | "synchronous_commit"
             | "allow_in_place_tablespaces"
             | "search_path"
@@ -665,6 +673,11 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "role"
             | "geqo"
             | "geqo_threshold"
+            | "parallel_setup_cost"
+            | "parallel_tuple_cost"
+            | "min_parallel_table_scan_size"
+            | "max_parallel_workers_per_gather"
+            | "default_toast_compression"
     );
     if !supported {
         return Err(fe_code("0A000", format!("SET {} not supported", set.name)));

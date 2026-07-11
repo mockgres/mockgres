@@ -571,7 +571,13 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             }
             Value::Float64Bits(_) => Some(DataType::Float8),
             Value::Text(_) => Some(DataType::Text),
+            Value::PgChar(_) => Some(DataType::PgChar),
             Value::Point(_) => Some(DataType::Point),
+            Value::Lseg(_) => Some(DataType::Lseg),
+            Value::Line(_) => Some(DataType::Line),
+            Value::Circle(_) => Some(DataType::Circle),
+            Value::Box(_) => Some(DataType::Box),
+            Value::Tid(_) => Some(DataType::Tid),
             Value::Path(_) => Some(DataType::Path),
             Value::Bool(_) => Some(DataType::Bool),
             Value::Date(_) => Some(DataType::Date),
@@ -583,6 +589,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
         },
         ScalarExpr::BinaryOp { op, left, right } => match op {
             ScalarBinaryOp::Concat => Some(DataType::Text),
+            ScalarBinaryOp::Distance => Some(DataType::Float8),
             ScalarBinaryOp::Add
             | ScalarBinaryOp::Sub
             | ScalarBinaryOp::Mul
@@ -636,6 +643,8 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
         ScalarExpr::Func { func, args } => match func {
             ScalarFunc::Upper
             | ScalarFunc::Lower
+            | ScalarFunc::Substring
+            | ScalarFunc::IndirectToastRow
             | ScalarFunc::Repeat
             | ScalarFunc::CurrentSchema
             | ScalarFunc::CurrentDatabase => Some(DataType::Text),
@@ -665,6 +674,12 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
                 Some(DataType::Bool)
             }
             ScalarFunc::PClose | ScalarFunc::POpen => Some(DataType::Path),
+            ScalarFunc::Point => Some(DataType::Point),
+            ScalarFunc::Lseg => Some(DataType::Lseg),
+            ScalarFunc::Line => Some(DataType::Line),
+            ScalarFunc::Center => Some(DataType::Point),
+            ScalarFunc::Radius | ScalarFunc::Diameter | ScalarFunc::Area => Some(DataType::Float8),
+            ScalarFunc::Box => Some(DataType::Box),
             ScalarFunc::Now
             | ScalarFunc::CurrentTimestamp
             | ScalarFunc::StatementTimestamp

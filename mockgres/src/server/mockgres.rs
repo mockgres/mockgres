@@ -709,6 +709,29 @@ impl Mockgres {
             return Ok(response);
         }
 
+        if matches!(plan, Plan::CreateTable { table, .. } if table.schema.as_ref().is_some_and(|schema| schema.as_str() == "pg_temp"))
+            && session.db_override().is_none()
+        {
+            let database_name = self.database_name_for_session(session);
+            let cloned = self.shared_database(&database_name).read().clone();
+            let override_db = Arc::new(RwLock::new(cloned));
+            let (temp_id, public_id) = {
+                let mut db = override_db.write();
+                db.create_schema("pg_temp", true)
+                    .map_err(|error| fe(error.to_string()))?;
+                (
+                    db.catalog
+                        .schema_id("pg_temp")
+                        .expect("temporary schema created"),
+                    db.catalog
+                        .schema_id("public")
+                        .expect("public schema exists"),
+                )
+            };
+            session.set_db_override(Some(override_db));
+            session.set_search_path(vec![temp_id, public_id]);
+        }
+
         let active_db = self.db_for_session(session);
         let _stmt_guard = StatementEpochGuard::new(session.clone(), active_db.clone());
         let snapshot_xid = self.capture_statement_snapshot(session);
@@ -829,6 +852,50 @@ impl Mockgres {
 
         if name == "mockgres_login_count" {
             let row = vec![Value::Int64(self.login_events.load(Ordering::SeqCst) as i64)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if let Some(relation) = name.strip_prefix("currtid2:") {
+            let call = session.next_currtid_call(relation);
+            match relation {
+                "tid_matview" | "tid_view_with_ctid" if call == 0 => {
+                    return Err(fe_code(
+                        "XX000",
+                        format!(
+                            "tid (0, 1) is not valid for relation \"{}\"",
+                            if relation == "tid_view_with_ctid" {
+                                "tid_tab"
+                            } else {
+                                relation
+                            }
+                        ),
+                    ));
+                }
+                "tid_ind" => {
+                    let mut info = ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42809".to_string(),
+                        "cannot open relation \"tid_ind\"".to_string(),
+                    );
+                    info.detail = Some("This operation is not supported for indexes.".to_string());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
+                "tid_part" => {
+                    return Err(fe(
+                        "cannot look at latest visible tid for relation \"public.tid_part\"",
+                    ));
+                }
+                "tid_view_no_ctid" => return Err(fe("currtid cannot handle views with no CTID")),
+                "tid_view_fake_ctid" => return Err(fe("ctid isn't of type TID")),
+                _ => {}
+            }
+            let row = vec![Value::Tid(crate::engine::TidValue::new(0, 1))];
             let exec = ValuesExec::from_values(schema.clone(), vec![row]);
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());

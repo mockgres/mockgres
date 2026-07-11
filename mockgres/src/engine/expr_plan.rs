@@ -153,6 +153,7 @@ pub enum ScalarBinaryOp {
     Div,
     Modulo,
     Concat,
+    Distance,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -165,6 +166,8 @@ pub enum ScalarFunc {
     Coalesce,
     Upper,
     Lower,
+    Substring,
+    IndirectToastRow,
     Length,
     CharLength,
     Repeat,
@@ -182,6 +185,14 @@ pub enum ScalarFunc {
     IsClosed,
     PClose,
     POpen,
+    Point,
+    Lseg,
+    Line,
+    Center,
+    Radius,
+    Diameter,
+    Area,
+    Box,
     PgInputIsValid,
     CurrentSchema,
     CurrentSchemas,
@@ -593,6 +604,13 @@ pub enum Plan {
         args: Vec<ScalarExpr>,
         schema: Schema,
     },
+    DeclareCursor {
+        name: String,
+        query: Box<Plan>,
+    },
+    FetchCursor {
+        name: String,
+    },
     InsertValues {
         table: ObjName,
         columns: Option<Vec<String>>,
@@ -735,6 +753,8 @@ impl Plan {
             | Plan::AlterDatabase { .. }
             | Plan::UnsupportedDbDDL { .. }
             | Plan::SetVariable { .. }
+            | Plan::DeclareCursor { .. }
+            | Plan::FetchCursor { .. }
             | Plan::BeginTransaction
             | Plan::CommitTransaction
             | Plan::RollbackTransaction => {

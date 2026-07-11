@@ -21,8 +21,10 @@ use unicode_normalization::UnicodeNormalization;
 use super::exec::ExecNode;
 use super::types::format_interval_micros;
 use super::{
-    BoolExpr, CmpOp, DataType, PathValue, PointValue, ScalarBinaryOp, ScalarExpr, ScalarFunc,
-    ScalarUnaryOp, Value, cast_value_to_type, fe, fe_code, format_path_text, format_point_text,
+    BoolExpr, BoxValue, CircleValue, CmpOp, DataType, LineValue, LsegValue, PathValue, PointValue,
+    ScalarBinaryOp, ScalarExpr, ScalarFunc, ScalarUnaryOp, TidValue, Value, cast_value_to_type, fe,
+    fe_code, format_box_text, format_circle_text, format_line_text, format_lseg_text,
+    format_path_text, format_point_text, format_tid_text, line_from_points,
 };
 
 #[derive(Clone)]
@@ -54,6 +56,7 @@ pub struct EvalContext {
     pub statement_time: Option<StatementTimeContext>,
     pub session_id: Option<SessionId>,
     pub advisory_locks: Option<Arc<AdvisoryLockRegistry>>,
+    pub extra_float_digits: i32,
 }
 
 impl EvalContext {
@@ -63,6 +66,7 @@ impl EvalContext {
             statement_time: None,
             session_id: None,
             advisory_locks: None,
+            extra_float_digits: 1,
         }
     }
 
@@ -74,6 +78,7 @@ impl EvalContext {
             statement_time: Some(statement_time),
             session_id: None,
             advisory_locks: None,
+            extra_float_digits: session.extra_float_digits(),
         }
     }
 
@@ -86,6 +91,7 @@ impl EvalContext {
             statement_time: Some(statement_time),
             session_id: None,
             advisory_locks: None,
+            extra_float_digits: 1,
         }
     }
 
@@ -99,6 +105,7 @@ impl EvalContext {
             statement_time,
             session_id: None,
             advisory_locks: None,
+            extra_float_digits: session.extra_float_digits(),
         }
     }
 
@@ -121,6 +128,7 @@ impl Default for EvalContext {
             statement_time: Some(StatementTimeContext::new(now_utc_micros(), tz)),
             session_id: None,
             advisory_locks: None,
+            extra_float_digits: 1,
         }
     }
 }
@@ -336,6 +344,16 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
                 _ => Value::Null,
             })
         }
+        ScalarBinaryOp::Distance => match (left, right) {
+            (Value::Circle(left), Value::Circle(right)) => {
+                let dx = left.center().x() - right.center().x();
+                let dy = left.center().y() - right.center().y();
+                Ok(Value::from_f64(
+                    dx.hypot(dy) - left.radius() - right.radius(),
+                ))
+            }
+            _ => Err(fe("distance operator requires circles")),
+        },
     }
 }
 
@@ -506,6 +524,45 @@ fn eval_function(
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Err(fe("lower() expects text")),
         },
+        ScalarFunc::Substring => match args.as_slice() {
+            [Value::Text(value), Value::Int64(start), Value::Int64(count)] => {
+                let start = (*start - 1).max(0) as usize;
+                let count = (*count).max(0) as usize;
+                Ok(Value::Text(value.chars().skip(start).take(count).collect()))
+            }
+            values if values.iter().any(|value| matches!(value, Value::Null)) => Ok(Value::Null),
+            _ => Err(fe("substring() requires text and integer arguments")),
+        },
+        ScalarFunc::IndirectToastRow => {
+            fn field(value: &Value) -> String {
+                match value {
+                    Value::Null => String::new(),
+                    Value::Text(value) => {
+                        let quoted = value.chars().any(|character| {
+                            matches!(character, ',' | '(' | ')' | '"' | '\\')
+                                || character.is_whitespace()
+                        });
+                        if quoted {
+                            format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+                        } else {
+                            value.clone()
+                        }
+                    }
+                    Value::Int64(value) => value.to_string(),
+                    other => format!("{other:?}"),
+                }
+            }
+            if args.len() != 4 {
+                return Err(fe("indirect row formatter requires four arguments"));
+            }
+            Ok(Value::Text(format!(
+                "({},{},{},{})",
+                field(&args[0]),
+                field(&args[1]),
+                field(&args[2]),
+                field(&args[3])
+            )))
+        }
         ScalarFunc::Repeat => match args.as_slice() {
             [Value::Text(value), Value::Int64(count)] => {
                 if *count < 0 {
@@ -620,10 +677,78 @@ fn eval_function(
             [Value::Null] => Ok(Value::Null),
             _ => Err(fe("path conversion requires a path")),
         },
+        ScalarFunc::Point => match args.as_slice() {
+            [Value::Int64(x), Value::Int64(y)] => {
+                Ok(Value::Point(PointValue::new(*x as f64, *y as f64)))
+            }
+            [x, y] if x.as_f64().is_some() && y.as_f64().is_some() => Ok(Value::Point(
+                PointValue::new(x.as_f64().unwrap(), y.as_f64().unwrap()),
+            )),
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("point() requires two numeric arguments")),
+        },
+        ScalarFunc::Lseg => match args.as_slice() {
+            [Value::Point(start), Value::Point(end)] => {
+                Ok(Value::Lseg(LsegValue::new(*start, *end)))
+            }
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("lseg() requires two point arguments")),
+        },
+        ScalarFunc::Line => match args.as_slice() {
+            [Value::Point(start), Value::Point(end)] => line_from_points(*start, *end)
+                .map(Value::Line)
+                .map_err(|error| fe_code(error.code, error.message)),
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("line() requires two point arguments")),
+        },
+        ScalarFunc::Center => match args.as_slice() {
+            [Value::Circle(circle)] => Ok(Value::Point(circle.center())),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("center() requires a circle")),
+        },
+        ScalarFunc::Radius | ScalarFunc::Diameter | ScalarFunc::Area => match args.as_slice() {
+            [Value::Circle(circle)] => {
+                let radius = circle.radius();
+                let value = match func {
+                    ScalarFunc::Radius => radius,
+                    ScalarFunc::Diameter => radius * 2.0,
+                    ScalarFunc::Area => std::f64::consts::PI * radius * radius,
+                    _ => unreachable!(),
+                };
+                Ok(Value::from_f64(value))
+            }
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("circle measurement requires a circle")),
+        },
+        ScalarFunc::Box => match args.as_slice() {
+            [Value::Point(point)] => Ok(Value::Box(BoxValue::new(*point, *point))),
+            [Value::Point(first), Value::Point(second)] => {
+                Ok(Value::Box(BoxValue::new(*first, *second)))
+            }
+            values if values.iter().any(|value| matches!(value, Value::Null)) => Ok(Value::Null),
+            _ => Err(fe("box() requires point arguments")),
+        },
         ScalarFunc::PgInputIsValid => match args.as_slice() {
             [Value::Text(value), Value::Text(data_type)] if data_type == "path" => {
                 Ok(Value::Bool(crate::engine::parse_path_text(value).is_ok()))
             }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "lseg" => {
+                Ok(Value::Bool(crate::engine::parse_lseg_text(value).is_ok()))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "line" => {
+                Ok(Value::Bool(crate::engine::parse_line_text(value).is_ok()))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type == "tid" => {
+                Ok(Value::Bool(crate::engine::parse_tid_text(value).is_ok()))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type.starts_with("varchar(") => {
+                Ok(Value::Bool(
+                    crate::engine::validate_varchar_input(value, data_type).is_ok(),
+                ))
+            }
+            [Value::Text(value), Value::Text(data_type)] if data_type.starts_with("char(") => Ok(
+                Value::Bool(crate::engine::validate_char_input(value, data_type).is_ok()),
+            ),
             [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
             _ => Err(fe("unsupported input type for pg_input_is_valid")),
         },
@@ -935,7 +1060,13 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
     Ok(match v {
         Value::Null => None,
         Value::Text(s) => Some(s),
+        Value::PgChar(value) => Some(crate::engine::format_pg_char(value)),
         Value::Point(point) => Some(format_point_text(point)),
+        Value::Lseg(lseg) => Some(format_lseg_text(lseg)),
+        Value::Line(line) => Some(format_line_text(line)),
+        Value::Circle(circle) => Some(format_circle_text(circle)),
+        Value::Box(value) => Some(format_box_text(value)),
+        Value::Tid(tid) => Some(format_tid_text(tid)),
         Value::Path(path) => Some(format_path_text(&path)),
         Value::Int64(i) => Some(i.to_string()),
         Value::Float64Bits(bits) => Some(f64::from_bits(bits).to_string()),
@@ -952,7 +1083,28 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
 struct PointOutput(PointValue);
 
 #[derive(Debug)]
-struct FloatOutput(f64);
+struct LsegOutput(LsegValue);
+
+#[derive(Debug)]
+struct LineOutput(LineValue);
+
+#[derive(Debug)]
+struct CircleOutput(CircleValue);
+
+#[derive(Debug)]
+struct BoxOutput(BoxValue);
+
+#[derive(Debug)]
+struct TidOutput(TidValue);
+
+#[derive(Debug)]
+struct PgCharOutput(u8);
+
+#[derive(Debug)]
+struct FloatOutput {
+    value: f64,
+    extra_float_digits: i32,
+}
 
 impl ToSql for FloatOutput {
     fn to_sql(
@@ -960,7 +1112,7 @@ impl ToSql for FloatOutput {
         _ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        out.put_f64(self.0);
+        out.put_f64(self.value);
         Ok(IsNull::No)
     }
 
@@ -978,7 +1130,18 @@ impl ToSqlText for FloatOutput {
         out: &mut BytesMut,
         _format_options: &FormatOptions,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        let mut value = self.0.to_string();
+        let mut value =
+            if self.extra_float_digits < 0 && self.value.is_finite() && self.value != 0.0 {
+                let exponent = self.value.abs().log10().floor() as i32;
+                let decimals = (13 - exponent).max(0) as usize;
+                let formatted = format!("{:.*}", decimals, self.value);
+                formatted
+                    .trim_end_matches('0')
+                    .trim_end_matches('.')
+                    .to_string()
+            } else {
+                self.value.to_string()
+            };
         if value.ends_with(".0") {
             value.truncate(value.len() - 2);
         }
@@ -1013,6 +1176,191 @@ impl ToSqlText for PointOutput {
         _format_options: &FormatOptions,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         out.put_slice(format_point_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for LsegOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.start().x());
+        out.put_f64(self.0.start().y());
+        out.put_f64(self.0.end().x());
+        out.put_f64(self.0.end().y());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::LSEG
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for LsegOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_lseg_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for LineOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.a());
+        out.put_f64(self.0.b());
+        out.put_f64(self.0.c());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::LINE
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for LineOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_line_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for CircleOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.center().x());
+        out.put_f64(self.0.center().y());
+        out.put_f64(self.0.radius());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::CIRCLE
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for CircleOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_circle_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for BoxOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0.high().x());
+        out.put_f64(self.0.high().y());
+        out.put_f64(self.0.low().x());
+        out.put_f64(self.0.low().y());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::BOX
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for BoxOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_box_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for TidOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_u32(self.0.block());
+        out.put_u16(self.0.offset());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TID
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for TidOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(format_tid_text(self.0).as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for PgCharOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_u8(self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::CHAR
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for PgCharOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(crate::engine::format_pg_char(self.0).as_bytes());
         Ok(IsNull::No)
     }
 }
@@ -1205,6 +1553,22 @@ pub(super) fn compare_values(lhs: &Value, rhs: &Value) -> Option<std::cmp::Order
             }
         }
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Line(a), Value::Line(b)) => {
+            if a == b {
+                Ordering::Equal
+            } else {
+                Ordering::Less
+            }
+        }
+        (Value::Circle(a), Value::Circle(b)) => {
+            let left = a.radius() * a.radius();
+            let right = b.radius() * b.radius();
+            if left.is_nan() || right.is_nan() {
+                Ordering::Equal
+            } else {
+                left.partial_cmp(&right).unwrap_or(Ordering::Equal)
+            }
+        }
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
         (Value::Date(a), Value::Date(b)) => a.cmp(b),
         (Value::TimestampMicros(a), Value::TimestampMicros(b)) => a.cmp(b),
@@ -1266,14 +1630,35 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Text) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Varchar(_)) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
                                 (Value::Null, DataType::Name) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
                                 (Value::Null, DataType::BpChar(_)) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::PgChar) => {
+                                    enc.encode_field(&Option::<PgCharOutput>::None)
+                                }
                                 (Value::Null, DataType::Point) => {
                                     enc.encode_field(&Option::<PointOutput>::None)
+                                }
+                                (Value::Null, DataType::Lseg) => {
+                                    enc.encode_field(&Option::<LsegOutput>::None)
+                                }
+                                (Value::Null, DataType::Line) => {
+                                    enc.encode_field(&Option::<LineOutput>::None)
+                                }
+                                (Value::Null, DataType::Circle) => {
+                                    enc.encode_field(&Option::<CircleOutput>::None)
+                                }
+                                (Value::Null, DataType::Box) => {
+                                    enc.encode_field(&Option::<BoxOutput>::None)
+                                }
+                                (Value::Null, DataType::Tid) => {
+                                    enc.encode_field(&Option::<TidOutput>::None)
                                 }
                                 (Value::Null, DataType::Path) => {
                                     enc.encode_field(&Option::<PathOutput>::None)
@@ -1303,16 +1688,41 @@ pub async fn to_pgwire_stream(
                                 (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
                                 (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
                                 (Value::Int64(i), DataType::Float8) => {
-                                    enc.encode_field(&FloatOutput(i as f64))
+                                    enc.encode_field(&FloatOutput {
+                                        value: i as f64,
+                                        extra_float_digits: ctx.extra_float_digits,
+                                    })
                                 }
                                 (Value::Float64Bits(b), DataType::Float8) => {
-                                    enc.encode_field(&FloatOutput(f64::from_bits(b)))
+                                    enc.encode_field(&FloatOutput {
+                                        value: f64::from_bits(b),
+                                        extra_float_digits: ctx.extra_float_digits,
+                                    })
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
+                                (Value::Text(s), DataType::Varchar(_)) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Name) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::BpChar(_)) => enc.encode_field(&s),
+                                (Value::PgChar(value), DataType::PgChar) => {
+                                    enc.encode_field(&PgCharOutput(value))
+                                }
                                 (Value::Point(point), DataType::Point) => {
                                     enc.encode_field(&PointOutput(point))
+                                }
+                                (Value::Lseg(lseg), DataType::Lseg) => {
+                                    enc.encode_field(&LsegOutput(lseg))
+                                }
+                                (Value::Line(line), DataType::Line) => {
+                                    enc.encode_field(&LineOutput(line))
+                                }
+                                (Value::Circle(circle), DataType::Circle) => {
+                                    enc.encode_field(&CircleOutput(circle))
+                                }
+                                (Value::Box(value), DataType::Box) => {
+                                    enc.encode_field(&BoxOutput(value))
+                                }
+                                (Value::Tid(tid), DataType::Tid) => {
+                                    enc.encode_field(&TidOutput(tid))
                                 }
                                 (Value::Path(path), DataType::Path) => {
                                     enc.encode_field(&PathOutput(path))

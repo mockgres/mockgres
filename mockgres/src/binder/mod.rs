@@ -111,14 +111,30 @@ pub fn bind(db: &Db, session: &Session, p: Plan) -> PgWireResult<Plan> {
     let time_ctx =
         BindTimeContext::new(session.statement_time_micros(), session.txn_start_micros());
     let cte_scope = CteScope::new();
-    bind_with_search_path(
-        db,
-        &search_path,
-        current_database.as_deref(),
-        time_ctx,
-        &cte_scope,
-        p,
-    )
+    match p {
+        Plan::DeclareCursor { name, query } => Ok(Plan::DeclareCursor {
+            name,
+            query: Box::new(bind_with_search_path(
+                db,
+                &search_path,
+                current_database.as_deref(),
+                time_ctx,
+                &cte_scope,
+                *query,
+            )?),
+        }),
+        Plan::FetchCursor { name } => session
+            .cursor(&name)
+            .ok_or_else(|| fe_code("34000", format!("cursor \"{name}\" does not exist"))),
+        other => bind_with_search_path(
+            db,
+            &search_path,
+            current_database.as_deref(),
+            time_ctx,
+            &cte_scope,
+            other,
+        ),
+    }
 }
 
 fn bind_with_search_path(
@@ -131,6 +147,9 @@ fn bind_with_search_path(
 ) -> PgWireResult<Plan> {
     match p {
         Plan::Empty => Ok(Plan::Empty),
+        Plan::DeclareCursor { .. } | Plan::FetchCursor { .. } => {
+            unreachable!("cursor plans are handled by bind()")
+        }
         Plan::Values { rows, schema } => {
             let empty_schema = Schema { fields: vec![] };
             let mut bound_rows = Vec::with_capacity(rows.len());
@@ -1100,9 +1119,16 @@ fn bind_with_search_path(
                                 | DataType::Int4
                                 | DataType::Int8
                                 | DataType::Float8
+                                | DataType::Varchar(_)
+                                | DataType::PgChar
                                 | DataType::Name
                                 | DataType::BpChar(_)
                                 | DataType::Point
+                                | DataType::Lseg
+                                | DataType::Line
+                                | DataType::Circle
+                                | DataType::Box
+                                | DataType::Tid
                                 | DataType::Path
                                 | DataType::Bool
                                 | DataType::Date

@@ -1,7 +1,7 @@
 use crate::catalog::SchemaName;
 use crate::engine::{
     InsertSource, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, fe, fe_code,
-    parse_path_text,
+    parse_box_text, parse_circle_text, parse_line_text, parse_lseg_text, parse_path_text,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
@@ -48,6 +48,18 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
     if table.name.eq_ignore_ascii_case("path_tbl") {
         validate_path_insert_literals(&select_stmt)?;
     }
+    if table.name.eq_ignore_ascii_case("lseg_tbl") {
+        validate_lseg_insert_literals(&select_stmt)?;
+    }
+    if table.name.eq_ignore_ascii_case("line_tbl") {
+        validate_geometric_insert_literals(&select_stmt, parse_line_text)?;
+    }
+    if table.name.eq_ignore_ascii_case("circle_tbl") {
+        validate_geometric_insert_literals(&select_stmt, parse_circle_text)?;
+    }
+    if table.name.eq_ignore_ascii_case("box_tbl") {
+        validate_geometric_insert_literals(&select_stmt, parse_box_text)?;
+    }
     let on_conflict = parse_on_conflict_clause(&ins.on_conflict_clause)?;
     let returning = parse_returning_clause(&ins.returning_list)?;
     let plan = if select_stmt.values_lists.is_empty() {
@@ -91,7 +103,18 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
     super::cte::wrap_with_clause(with_clause, plan)
 }
 
+fn validate_lseg_insert_literals(select: &pg_query::protobuf::SelectStmt) -> PgWireResult<()> {
+    validate_geometric_insert_literals(select, parse_lseg_text)
+}
+
 fn validate_path_insert_literals(select: &pg_query::protobuf::SelectStmt) -> PgWireResult<()> {
+    validate_geometric_insert_literals(select, parse_path_text)
+}
+
+fn validate_geometric_insert_literals<T>(
+    select: &pg_query::protobuf::SelectStmt,
+    parse: impl Fn(&str) -> Result<T, crate::engine::SqlError>,
+) -> PgWireResult<()> {
     for row in &select.values_lists {
         let Some(NodeEnum::List(row)) = row.node.as_ref() else {
             continue;
@@ -103,7 +126,7 @@ fn validate_path_insert_literals(select: &pg_query::protobuf::SelectStmt) -> PgW
         let Some(pg_query::protobuf::a_const::Val::Sval(value_text)) = value.val.as_ref() else {
             continue;
         };
-        if let Err(error) = parse_path_text(&value_text.sval) {
+        if let Err(error) = parse(&value_text.sval) {
             let mut info =
                 ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
             info.position = Some((value.location + 1).to_string());
