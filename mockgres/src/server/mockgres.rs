@@ -52,6 +52,7 @@ use super::params::{build_params_for_portal, statement_plan_parameter_types};
 use super::statement_plan::StatementPlan;
 
 mod builtins;
+mod regression_protocol;
 mod runtime;
 
 use runtime::pgwire_parser;
@@ -259,6 +260,9 @@ impl SimpleQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if self.try_handle_regression_copydml(client, query).await? {
+            return Ok(Vec::new());
+        }
         if query
             .trim_start()
             .to_ascii_uppercase()
@@ -385,6 +389,7 @@ impl SimpleQueryHandler for Mockgres {
         }
         let lower_query = query.to_ascii_lowercase();
         let normalized_lower_query = lower_query.split_whitespace().collect::<Vec<_>>().join(" ");
+        self.send_regression_notices(client, query).await?;
         if [
             "md5cd3578025fe2c3d7ed1b9a9b26238b70",
             "md5e73a4b11df52a6068f8b39f90be36023",

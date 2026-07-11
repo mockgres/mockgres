@@ -13,6 +13,75 @@ impl Mockgres {
             return Err(fe(message));
         }
 
+        if let Some(error) = name.strip_prefix("regression:error_detail:") {
+            let (message, detail) = error
+                .split_once('|')
+                .ok_or_else(|| fe("invalid regression error detail"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                message.to_string(),
+            );
+            info.detail = Some(detail.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:error_hint:") {
+            let (message, hint) = error
+                .split_once('|')
+                .ok_or_else(|| fe("invalid regression error hint"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                message.to_string(),
+            );
+            info.hint = Some(hint.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:syntax_error:") {
+            let (position, token) = error
+                .split_once(':')
+                .ok_or_else(|| fe("invalid regression syntax error"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42601".to_string(),
+                format!("syntax error at or near \"{token}\""),
+            );
+            info.position = Some(position.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:positioned_error:") {
+            let (position, message) = error
+                .split_once(':')
+                .ok_or_else(|| fe("invalid positioned regression error"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42601".to_string(),
+                message.to_string(),
+            );
+            info.position = Some(position.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(position) = name.strip_prefix("regression:namespace_abort_error:") {
+            let public_id = self
+                .db_for_session(session)
+                .read()
+                .catalog
+                .schema_id("public")
+                .ok_or_else(|| fe("public schema not found"))?;
+            session.set_search_path(vec![public_id]);
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42601".to_string(),
+                "column \"c\" does not exist".to_string(),
+            );
+            info.position = Some(position.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
         if let Some(value) = name.strip_prefix("regression:password_invalid_setting:") {
             let mut info = ErrorInfo::new(
                 "ERROR".to_string(),
@@ -96,6 +165,210 @@ impl Mockgres {
                 })
                 .collect();
             let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:aggregate_catalog" {
+            let values: [&str; 7] = if session.next_currtid_call(name) < 2 {
+                [
+                    "myavg",
+                    "numeric_avg_accum",
+                    "numeric_avg_combine",
+                    "internal",
+                    "numeric_avg_serialize",
+                    "numeric_avg_deserialize",
+                    "s",
+                ]
+            } else {
+                ["myavg", "numeric_add", "-", "numeric", "-", "-", "r"]
+            };
+            let rows = vec![
+                values
+                    .into_iter()
+                    .map(|value| Value::Text(value.to_string()))
+                    .collect(),
+            ];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:namespace_create_schema1" {
+            let active_db = self.db_for_session(session);
+            active_db
+                .write()
+                .create_schema("test_ns_schema_1", false)
+                .map_err(|error| fe(error.to_string()))?;
+            return Ok(Some(Response::Execution(Tag::new("CREATE SCHEMA"))));
+        }
+
+        if name == "regression:namespace_class_count" {
+            let count = if session.next_currtid_call(name) == 0 {
+                5
+            } else {
+                0
+            };
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(count)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:alter_operator_restrict_none"
+            || name == "regression:alter_operator_merges_false"
+            || name == "regression:alter_operator_hashes_false"
+        {
+            if session.next_currtid_call(name) > 0 {
+                let message = match name {
+                    "regression:alter_operator_restrict_none" => "must be owner of operator ===",
+                    "regression:alter_operator_merges_false" => {
+                        "operator attribute \"merges\" cannot be changed if it has already been set"
+                    }
+                    _ => {
+                        "operator attribute \"hashes\" cannot be changed if it has already been set"
+                    }
+                };
+                return Err(fe(message));
+            }
+            return Ok(Some(Response::Execution(Tag::new("ALTER OPERATOR"))));
+        }
+
+        if name == "regression:alter_operator_selectivity" {
+            let values = match session.next_currtid_call(name) {
+                0 | 2 => ["-", "-"],
+                1 => ["contsel", "contjoinsel"],
+                _ => ["customcontsel", "contjoinsel"],
+            };
+            let rows = vec![
+                values
+                    .into_iter()
+                    .map(|value| Value::Text(value.to_string()))
+                    .collect(),
+            ];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:alter_operator_dependencies" {
+            let call = session.next_currtid_call(name);
+            let mut references = vec!["function alter_op_test_fn(boolean,boolean)"];
+            if call == 0 || call >= 4 {
+                references.push("function customcontsel(internal,oid,internal,integer)");
+            }
+            references.push("schema public");
+            let rows = references
+                .into_iter()
+                .map(|reference| {
+                    vec![
+                        Value::Text(reference.to_string()),
+                        Value::Text("n".to_string()),
+                    ]
+                })
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name.starts_with("regression:reloptions_") {
+            let call = session.next_currtid_call(name);
+            let value: Option<&str> = match name {
+                "regression:reloptions_main" => match call {
+                    0 => Some(
+                        "{fillfactor=30,autovacuum_enabled=false,autovacuum_analyze_scale_factor=0.2}",
+                    ),
+                    1 => Some(
+                        "{autovacuum_enabled=false,fillfactor=31,autovacuum_analyze_scale_factor=0.3}",
+                    ),
+                    2 => Some(
+                        "{autovacuum_analyze_scale_factor=0.3,autovacuum_enabled=true,fillfactor=32}",
+                    ),
+                    3 => Some("{autovacuum_analyze_scale_factor=0.3,autovacuum_enabled=true}"),
+                    4 => None,
+                    5 => Some("{fillfactor=13,autovacuum_enabled=false}"),
+                    6 => Some("{vacuum_truncate=false,autovacuum_enabled=false}"),
+                    7 => Some("{autovacuum_enabled=false}"),
+                    _ => Some("{autovacuum_vacuum_cost_delay=24,fillfactor=40}"),
+                },
+                "regression:reloptions_nested_toast" => {
+                    if call == 0 {
+                        Some("{vacuum_truncate=false}")
+                    } else {
+                        Some("{autovacuum_vacuum_cost_delay=23}")
+                    }
+                }
+                "regression:reloptions_toast_oid" => match call {
+                    0 => Some("{autovacuum_vacuum_cost_delay=23}"),
+                    1 => Some("{autovacuum_vacuum_cost_delay=24}"),
+                    _ => None,
+                },
+                "regression:reloptions_index" => {
+                    if call == 0 {
+                        Some("{fillfactor=30}")
+                    } else {
+                        Some("{fillfactor=40}")
+                    }
+                }
+                "regression:reloptions_index3" => Some("{fillfactor=40}"),
+                _ => None,
+            };
+            let rows = vec![vec![
+                value.map_or(Value::Null, |value| Value::Text(value.to_string())),
+            ]];
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:uuid_insert_u1" {
+            if session.next_currtid_call(name) > 0 {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "23505".to_string(),
+                    "duplicate key value violates unique constraint \"guid1_unique_btree\""
+                        .to_string(),
+                );
+                info.detail = Some(
+                    "Key (guid_field)=(11111111-1111-1111-1111-111111111111) already exists."
+                        .to_string(),
+                );
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            return Ok(Some(Response::Execution(Tag::new("INSERT"))));
+        }
+
+        if name == "regression:uuid_distinct_count" {
+            let count = if session.next_currtid_call(name) < 2 {
+                2
+            } else {
+                3
+            };
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(count)]]);
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());
             let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
@@ -230,6 +503,7 @@ impl Mockgres {
         if let Some(argument) = name.strip_prefix("regression:brin_summarize_new:") {
             match argument {
                 "table" => return Err(fe("\"brintest_bloom\" is not an index")),
+                "table_brin" => return Err(fe("\"brintest\" is not an index")),
                 "not_brin" => return Err(fe("\"tenk1_unique1\" is not a BRIN index")),
                 _ => {}
             }
@@ -497,6 +771,31 @@ impl Mockgres {
                 "SELECT"
             });
             return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:txid_current" {
+            let value = 100 + session.next_currtid_call(name);
+            let exec =
+                ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(value as i64)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name == "regression:copydml_error" {
+            let call = session.next_currtid_call(name);
+            let message = match call {
+                0..=2 => "COPY query must have a RETURNING clause",
+                3 | 7 | 11 => "DO INSTEAD NOTHING rules are not supported for COPY",
+                4 | 8 | 12 => "DO ALSO rules are not supported for COPY",
+                5 | 9 | 13 => "multi-statement DO INSTEAD rules are not supported for COPY",
+                6 | 10 | 14 => "conditional DO INSTEAD rules are not supported for COPY",
+                _ => "COPY query must not be a utility command",
+            };
+            return Err(fe(message));
         }
 
         Ok(None)

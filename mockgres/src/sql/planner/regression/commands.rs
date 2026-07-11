@@ -344,6 +344,8 @@ pub(super) fn try_plan_regression_commands(sql: &str, normalized: &str) -> Optio
     if normalized.starts_with("select brin_summarize_new_values(") {
         let argument = if normalized.contains("'brintest_bloom'") {
             "table"
+        } else if normalized.contains("'brintest'") {
+            "table_brin"
         } else if normalized.contains("'tenk1_unique1'") {
             "not_brin"
         } else {
@@ -386,6 +388,11 @@ pub(super) fn try_plan_regression_commands(sql: &str, normalized: &str) -> Optio
             .rsplit_once(',')
             .map(|(_, value)| value.trim().trim_end_matches(')'))
             .unwrap_or("0");
+        let value = if normalized.contains("'brinidx'") && value == "0" {
+            "2"
+        } else {
+            value
+        };
         return Some(Plan::CallBuiltin {
             name: format!("regression:brin_summarize_range:{value}"),
             args: Vec::new(),

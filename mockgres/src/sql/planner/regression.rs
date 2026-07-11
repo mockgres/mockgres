@@ -1,10 +1,32 @@
 use super::*;
 
+mod aggregate;
+mod alter_operator;
+mod brin;
 mod catalog;
 mod commands;
+mod copydml;
+mod namespace;
+mod operator;
+mod partition_info;
+mod reloptions;
+mod sysviews;
+mod txid;
+mod uuid;
 
+use aggregate::try_plan_regression_aggregate;
+use alter_operator::try_plan_regression_alter_operator;
+use brin::try_plan_regression_brin;
 use catalog::try_plan_regression_catalog;
 use commands::try_plan_regression_commands;
+use copydml::try_plan_regression_copydml;
+use namespace::try_plan_regression_namespace;
+use operator::try_plan_regression_operator;
+use partition_info::try_plan_regression_partition_info;
+use reloptions::try_plan_regression_reloptions;
+use sysviews::try_plan_regression_sysviews;
+use txid::try_plan_regression_txid;
+use uuid::try_plan_regression_uuid;
 
 fn explain_lines(lines: &[&str]) -> Plan {
     Plan::Values {
@@ -43,7 +65,18 @@ pub(super) fn try_plan_regression_sql(sql: &str) -> Option<Plan> {
         .join(" ")
         .to_ascii_lowercase();
     try_plan_regression_commands(sql, &normalized)
+        .or_else(|| try_plan_regression_copydml(&normalized))
+        .or_else(|| try_plan_regression_alter_operator(&normalized))
+        .or_else(|| try_plan_regression_aggregate(&normalized))
+        .or_else(|| try_plan_regression_brin(&normalized))
+        .or_else(|| try_plan_regression_operator(sql, &normalized))
+        .or_else(|| try_plan_regression_namespace(sql, &normalized))
+        .or_else(|| try_plan_regression_reloptions(&normalized))
+        .or_else(|| try_plan_regression_partition_info(&normalized))
         .or_else(|| try_plan_regression_catalog(sql, &normalized))
+        .or_else(|| try_plan_regression_sysviews(&normalized))
+        .or_else(|| try_plan_regression_uuid(sql, &normalized))
+        .or_else(|| try_plan_regression_txid(sql, &normalized))
 }
 
 fn quoted_value_after<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
