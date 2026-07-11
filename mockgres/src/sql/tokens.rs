@@ -85,6 +85,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "bigint" | "int8" => DataType::Int8,
             "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
+            "name" => DataType::Name,
             "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),
             "point" => DataType::Point,
             "json" => DataType::Json,

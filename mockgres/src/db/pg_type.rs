@@ -134,9 +134,9 @@ const BUILTIN_TYPES: &[PgTypeRow] = &[
         typbasetype: 0,
         typtypmod: -1,
         typrelid: 0,
-        typelem: 0,
+        typelem: 18,
         typarray: 1003,
-        typcollation: 0,
+        typcollation: 950,
     },
     PgTypeRow {
         oid: 20,
@@ -617,7 +617,7 @@ const BUILTIN_TYPES: &[PgTypeRow] = &[
         typrelid: 0,
         typelem: 19,
         typarray: 0,
-        typcollation: 0,
+        typcollation: 950,
     },
     PgTypeRow {
         oid: 1007,
@@ -912,7 +912,7 @@ const BUILTIN_TYPES: &[PgTypeRow] = &[
 pub(super) fn init_pg_type(db: &mut Db) {
     let cols = vec![
         ("oid".to_string(), DataType::Int4, false, None, None),
-        ("typname".to_string(), DataType::Text, false, None, None),
+        ("typname".to_string(), DataType::Name, false, None, None),
         (
             "typnamespace".to_string(),
             DataType::Int4,

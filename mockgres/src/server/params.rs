@@ -687,6 +687,10 @@ fn parse_text_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWire
             Ok(Value::from_f64(v))
         }
         DataType::Text => Ok(Value::Text(s.to_string())),
+        DataType::Name => {
+            crate::engine::coerce_value_to_type(Value::Text(s.to_string()), &DataType::Name, tz)
+                .map_err(|e| fe_code(e.code, e.message))
+        }
         DataType::BpChar(length) => {
             let value = crate::engine::coerce_value_to_type(
                 Value::Text(s.to_string()),
@@ -770,6 +774,12 @@ fn parse_binary_value(bytes: &[u8], ty: &DataType, tz: &SessionTimeZone) -> PgWi
             let s = std::str::from_utf8(bytes)
                 .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
             Ok(Value::Text(s.to_string()))
+        }
+        DataType::Name => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|e| fe(format!("invalid utf8 parameter: {e}")))?;
+            crate::engine::coerce_value_to_type(Value::Text(s.to_string()), &DataType::Name, tz)
+                .map_err(|e| fe_code(e.code, e.message))
         }
         DataType::BpChar(length) => {
             let s = std::str::from_utf8(bytes)

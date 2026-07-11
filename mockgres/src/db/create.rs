@@ -30,7 +30,7 @@ impl Db {
                 "pg_namespace",
                 vec![
                     ("oid".to_string(), DataType::Int4, false, None, None),
-                    ("nspname".to_string(), DataType::Text, false, None, None),
+                    ("nspname".to_string(), DataType::Name, false, None, None),
                 ],
                 None,
                 Vec::new(),
@@ -43,7 +43,7 @@ impl Db {
                 "pg_class",
                 vec![
                     ("oid".to_string(), DataType::Int4, false, None, None),
-                    ("relname".to_string(), DataType::Text, false, None, None),
+                    ("relname".to_string(), DataType::Name, false, None, None),
                     (
                         "relnamespace".to_string(),
                         DataType::Int4,
@@ -68,10 +68,10 @@ impl Db {
                 "pg_catalog",
                 "pg_tables",
                 vec![
-                    ("schemaname".to_string(), DataType::Text, false, None, None),
-                    ("tablename".to_string(), DataType::Text, false, None, None),
-                    ("tableowner".to_string(), DataType::Text, false, None, None),
-                    ("tablespace".to_string(), DataType::Text, true, None, None),
+                    ("schemaname".to_string(), DataType::Name, false, None, None),
+                    ("tablename".to_string(), DataType::Name, false, None, None),
+                    ("tableowner".to_string(), DataType::Name, false, None, None),
+                    ("tablespace".to_string(), DataType::Name, true, None, None),
                     ("hasindexes".to_string(), DataType::Bool, false, None, None),
                     ("hasrules".to_string(), DataType::Bool, false, None, None),
                     ("hastriggers".to_string(), DataType::Bool, false, None, None),

@@ -810,6 +810,9 @@ pub async fn to_pgwire_stream(
                                 (Value::Null, DataType::Text) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
+                                (Value::Null, DataType::Name) => {
+                                    enc.encode_field(&Option::<String>::None)
+                                }
                                 (Value::Null, DataType::BpChar(_)) => {
                                     enc.encode_field(&Option::<String>::None)
                                 }
@@ -849,6 +852,7 @@ pub async fn to_pgwire_stream(
                                     enc.encode_field(&f)
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
+                                (Value::Text(s), DataType::Name) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::BpChar(_)) => enc.encode_field(&s),
                                 (Value::Point(point), DataType::Point) => {
                                     enc.encode_field(&PointOutput(point))

@@ -57,6 +57,7 @@ pub enum DataType {
     Int8,
     Float8,
     Text,
+    Name,
     BpChar(Option<usize>),
     Point,
     Json,
@@ -78,6 +79,7 @@ impl DataType {
             DataType::Int8 => Type::INT8,
             DataType::Float8 => Type::FLOAT8,
             DataType::Text => Type::TEXT,
+            DataType::Name => Type::NAME,
             DataType::BpChar(_) => Type::BPCHAR,
             DataType::Point => Type::POINT,
             DataType::Json => Type::JSON,
@@ -392,6 +394,19 @@ fn convert_value_to_type(
         Ok(Value::Text(output))
     }
 
+    fn coerce_name(mut input: String) -> Value {
+        const MAX_NAME_BYTES: usize = 63;
+
+        if input.len() > MAX_NAME_BYTES {
+            let mut end = MAX_NAME_BYTES;
+            while !input.is_char_boundary(end) {
+                end -= 1;
+            }
+            input.truncate(end);
+        }
+        Value::Text(input)
+    }
+
     match (target, val) {
         (DataType::Int2, Value::Int64(v)) => {
             if v < i16::MIN as i64 || v > i16::MAX as i64 {
@@ -449,6 +464,7 @@ fn convert_value_to_type(
             let text = format_timestamptz(m, tz).map_err(|e| SqlError::new("22008", e))?;
             Ok(Value::Text(text))
         }
+        (DataType::Name, Value::Text(s)) => Ok(coerce_name(s)),
         (DataType::BpChar(length), Value::Text(s)) => coerce_bpchar(s, *length, assignment),
         (DataType::Point, Value::Point(point)) => Ok(Value::Point(point)),
         (DataType::Point, Value::Text(value)) => parse_point_text(&value).map(Value::Point),
