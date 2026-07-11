@@ -84,7 +84,7 @@ pub(super) fn parse_type_name(typ: &TypeName) -> PgWireResult<DataType> {
             "int" | "int4" | "integer" | "serial" | "serial4" => DataType::Int4,
             "bigint" | "int8" | "bigserial" | "serial8" => DataType::Int8,
             "smallserial" | "serial2" => DataType::Int2,
-            "float8" | "double" => DataType::Float8,
+            "float4" | "real" | "float8" | "double" => DataType::Float8,
             "text" | "varchar" => DataType::Text,
             "name" => DataType::Name,
             "bpchar" | "char" | "character" => DataType::BpChar(parse_character_length(typ)?),

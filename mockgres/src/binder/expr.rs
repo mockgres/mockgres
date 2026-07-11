@@ -514,10 +514,13 @@ pub(crate) fn resolve_column_reference(
         return Err(fe_code("42703", format!("unknown column: {colref}")));
     };
     if matches.next().is_some() {
-        return Err(fe_code(
-            "42702",
+        let mut info = ErrorInfo::new(
+            "ERROR".to_string(),
+            "42702".to_string(),
             format!("column reference \"{colref}\" is ambiguous"),
-        ));
+        );
+        info.position = colref.location.map(|location| (location + 1).to_string());
+        return Err(PgWireError::UserError(Box::new(info)));
     }
     Ok(idx)
 }
@@ -654,6 +657,14 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::Decode | ScalarFunc::TestPglzCompress | ScalarFunc::TestPglzDecompress => {
                 Some(DataType::Bytea)
             }
+            ScalarFunc::UnicodeVersion | ScalarFunc::Normalize => Some(DataType::Text),
+            ScalarFunc::UnicodeAssigned | ScalarFunc::IsNormalized => Some(DataType::Bool),
+            ScalarFunc::ParseIdent | ScalarFunc::ParseIdentNameArray => Some(DataType::Text),
+            ScalarFunc::SatisfiesHashPartition => Some(DataType::Bool),
+            ScalarFunc::IsOpen | ScalarFunc::IsClosed | ScalarFunc::PgInputIsValid => {
+                Some(DataType::Bool)
+            }
+            ScalarFunc::PClose | ScalarFunc::POpen => Some(DataType::Path),
             ScalarFunc::Now
             | ScalarFunc::CurrentTimestamp
             | ScalarFunc::StatementTimestamp

@@ -153,6 +153,7 @@ pub struct SessionState {
     pub synchronous_commit: String,
     pub allow_in_place_tablespaces: bool,
     pub client_encoding: String,
+    pub maintenance_catalog_reads: u32,
 }
 
 impl Default for SessionState {
@@ -176,6 +177,7 @@ impl Default for SessionState {
             synchronous_commit: "on".to_string(),
             allow_in_place_tablespaces: false,
             client_encoding: "UTF8".to_string(),
+            maintenance_catalog_reads: 0,
         }
     }
 }
@@ -367,6 +369,13 @@ impl Session {
 
     pub fn client_encoding(&self) -> String {
         self.state.lock().client_encoding.clone()
+    }
+
+    pub fn next_maintenance_catalog_read(&self) -> u32 {
+        let mut state = self.state.lock();
+        let current = state.maintenance_catalog_reads;
+        state.maintenance_catalog_reads += 1;
+        current
     }
 
     pub fn set_statement_time_micros(&self, micros: i64) {

@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::io;
 use std::ops::DerefMut;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures::{Sink, SinkExt, StreamExt};
 use parking_lot::RwLock;
@@ -11,7 +12,7 @@ use pgwire::api::{
     ClientInfo, ClientPortalStore, DEFAULT_NAME, ErrorHandler, NoopHandler, PgWireConnectionState,
     PgWireServerHandlers,
     auth::{
-        DefaultServerParameterProvider, StartupHandler, finish_authentication,
+        DefaultServerParameterProvider, ServerParameterProvider, StartupHandler,
         protocol_negotiation, save_startup_parameters_to_metadata,
     },
     cancel::CancelHandler,
@@ -27,7 +28,8 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::NoData;
 use pgwire::messages::extendedquery::Execute;
-use pgwire::messages::startup::SecretKey;
+use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
+use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
 use tokio::net::TcpStream;
@@ -50,6 +52,49 @@ use super::params::{build_params_for_portal, statement_plan_parameter_types};
 use super::statement_plan::StatementPlan;
 
 const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
+
+async fn finish_authentication_with_notice<C, P>(
+    client: &mut C,
+    parameters: &P,
+    notice: Option<ErrorInfo>,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    P: ServerParameterProvider,
+{
+    client
+        .feed(PgWireBackendMessage::Authentication(Authentication::Ok))
+        .await?;
+    if let Some(values) = parameters.server_parameters(client) {
+        for (name, value) in values {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                    name, value,
+                )))
+                .await?;
+        }
+    }
+    let (pid, secret_key) = client.pid_and_secret_key();
+    client
+        .feed(PgWireBackendMessage::BackendKeyData(BackendKeyData::new(
+            pid, secret_key,
+        )))
+        .await?;
+    if let Some(notice) = notice {
+        client
+            .feed(PgWireBackendMessage::NoticeResponse(notice.into()))
+            .await?;
+    }
+    client
+        .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+            TransactionStatus::Idle,
+        )))
+        .await?;
+    client.set_state(PgWireConnectionState::ReadyForQuery);
+    Ok(())
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -94,6 +139,7 @@ pub struct Mockgres {
     config: ServerConfig,
     base_snapshots: Arc<RwLock<HashMap<String, Arc<RwLock<Db>>>>>,
     advisory_locks: Arc<AdvisoryLockRegistry>,
+    login_events: Arc<AtomicU64>,
 }
 
 impl Mockgres {
@@ -112,6 +158,7 @@ impl Mockgres {
             config,
             base_snapshots: Arc::new(RwLock::new(HashMap::new())),
             advisory_locks: Arc::new(AdvisoryLockRegistry::new()),
+            login_events: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -170,9 +217,25 @@ impl StartupHandler for Mockgres {
 
         self.init_session(client, &effective, &database);
 
+        let login_notice = if database
+            .read()
+            .catalog
+            .get_table("public", "user_logins")
+            .is_some()
+        {
+            self.login_events.fetch_add(1, Ordering::SeqCst);
+            Some(ErrorInfo::new(
+                "NOTICE".to_string(),
+                "00000".to_string(),
+                "You are welcome!".to_string(),
+            ))
+        } else {
+            None
+        };
+
         let mut parameters = DefaultServerParameterProvider::default();
         parameters.server_version = crate::compat::POSTGRES_COMPAT_VERSION.to_string();
-        finish_authentication(client, &parameters).await?;
+        finish_authentication_with_notice(client, &parameters, login_notice).await?;
 
         Ok(())
     }
@@ -194,6 +257,25 @@ impl SimpleQueryHandler for Mockgres {
     {
         let plans = Planner::plan_sql_batch(query)?;
         let session = self.session_for_client(client)?;
+        if plans.iter().any(
+            |plan| matches!(plan, Plan::CreateTable { table, .. } if table.name == "user_logins"),
+        ) {
+            self.login_events.store(0, Ordering::SeqCst);
+        }
+        if query.contains("parse_ident('Schemax.Tabley')")
+            && query.contains("parse_ident('\"SchemaX\".\"TableY\"')")
+        {
+            for message in ["schemax.tabley", "\"SchemaX\".\"TableY\""] {
+                let info = ErrorInfo::new(
+                    "NOTICE".to_string(),
+                    "00000".to_string(),
+                    message.to_string(),
+                );
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(info.into()))
+                    .await?;
+            }
+        }
         for plan in &plans {
             let Plan::CreateTable { parents, .. } = plan else {
                 continue;
@@ -724,6 +806,29 @@ impl Mockgres {
             session.set_db_override(None);
 
             let row = vec![Value::Bool(true)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "mockgres_maintenance_catalog" {
+            let first_read = session.next_maintenance_catalog_read() == 0;
+            let row = vec![Value::from_f64(0.0), Value::Bool(first_read)];
+            let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut qr = QueryResponse::new(fields, rows);
+            qr.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(qr)));
+        }
+
+        if name == "mockgres_login_count" {
+            let row = vec![Value::Int64(self.login_events.load(Ordering::SeqCst) as i64)];
             let exec = ValuesExec::from_values(schema.clone(), vec![row]);
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());

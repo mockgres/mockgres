@@ -82,6 +82,7 @@ pub(crate) fn build_set_show_executor(
             | "work_mem"
             | "max_parallel_maintenance_workers"
             | "min_parallel_index_scan_size"
+            | "role"
             | "geqo"
             | "geqo_threshold" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),

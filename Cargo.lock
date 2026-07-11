@@ -874,6 +874,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-postgres",
+ "unicode-normalization",
 ]
 
 [[package]]

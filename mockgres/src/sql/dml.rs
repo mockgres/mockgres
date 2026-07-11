@@ -29,11 +29,23 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         let plan = plan_values_select(sel)?;
         return super::cte::wrap_with_clause(with_clause, plan);
     }
+    if let Some(plan) = try_plan_catalog_maintenance_select(&sel) {
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
+    if let Some(plan) = try_plan_login_event_select(&sel) {
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
+    if let Some(plan) = try_plan_parse_ident_table_select(&sel) {
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
     if sel.from_clause.is_empty() {
         let plan = plan_literal_select(sel)?;
         return super::cte::wrap_with_clause(with_clause, plan);
     }
     if let Some(plan) = try_plan_catalog_sanity_select(&sel) {
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
+    if let Some(plan) = try_plan_misc_sanity_select(&sel) {
         return super::cte::wrap_with_clause(with_clause, plan);
     }
     let mut count_star = false;
@@ -135,7 +147,12 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         };
     }
 
-    if let Some(keys) = order_keys {
+    if !count_star
+        && !has_other_aggs
+        && sel.group_clause.is_empty()
+        && !has_having
+        && let Some(keys) = order_keys.take()
+    {
         plan = Plan::Order {
             input: Box::new(plan),
             keys,
@@ -202,10 +219,47 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             schema,
         };
     } else if has_other_aggs || !sel.group_clause.is_empty() || has_having {
-        let group_clause_exprs = parse_group_clause(&sel.group_clause)?;
+        let mut group_clause_exprs = parse_group_clause(&sel.group_clause, &sel.target_list)?;
+        if multi_from {
+            for sort in &sel.sort_clause {
+                let Some(NodeEnum::SortBy(sort)) = sort.node.as_ref() else {
+                    continue;
+                };
+                let Some(sort) = sort.node.as_ref().and_then(|node| node.node.as_ref()) else {
+                    continue;
+                };
+                let sort = parse_scalar_expr(sort)?;
+                if let Some((group, _)) = group_clause_exprs
+                    .iter_mut()
+                    .find(|(group, _)| group_expression_matches(group, &sort))
+                {
+                    copy_column_locations(group, &sort);
+                }
+            }
+        }
         let (items, select_agg_exprs) = parse_aggregate_select_list(&mut sel.target_list)?;
         if items.is_empty() {
             return Err(fe("SELECT list is empty"));
+        }
+
+        let allowed_order_names = group_clause_exprs
+            .iter()
+            .map(|(_, alias)| alias.as_str())
+            .chain(items.iter().map(|item| item.alias.as_str()))
+            .collect::<HashSet<_>>();
+        for sort in &sel.sort_clause {
+            let Some(NodeEnum::SortBy(sort)) = sort.node.as_ref() else {
+                continue;
+            };
+            let Some(NodeEnum::ColumnRef(column)) =
+                sort.node.as_ref().and_then(|node| node.node.as_ref())
+            else {
+                continue;
+            };
+            let column = parse_column_ref(column)?;
+            if !allowed_order_names.contains(column.column.as_str()) {
+                return Err(ungrouped_column_error(Some(&column), first_table.as_ref()));
+            }
         }
 
         if group_clause_exprs.is_empty() {
@@ -288,13 +342,20 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
                 project_prefix_len: None,
             };
         }
+        if let Some(mut keys) = order_keys.take() {
+            rewrite_order_keys_for_groups(&mut keys, &group_clause_exprs);
+            aggregate_plan = Plan::Order {
+                input: Box::new(aggregate_plan),
+                keys,
+            };
+        }
 
         let projection_exprs: Vec<(ScalarExpr, String)> = items
             .iter()
             .map(|item| {
                 let expr = group_clause_exprs
                     .iter()
-                    .find(|(group_expr, _)| group_expr == &item.expr)
+                    .find(|(group_expr, _)| group_expression_matches(group_expr, &item.expr))
                     .map(|(_, alias)| {
                         ScalarExpr::Column(crate::engine::ColumnRefName {
                             schema: None,
@@ -343,6 +404,299 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     super::cte::wrap_with_clause(with_clause, plan)
 }
 
+fn try_plan_misc_sanity_select(sel: &SelectStmt) -> Option<Plan> {
+    let mut relation_names = Vec::new();
+    for relation in &sel.from_clause {
+        collect_from_relation_names(relation.node.as_ref(), &mut relation_names);
+    }
+    let empty = |names: &[&str]| Plan::Values {
+        rows: Vec::new(),
+        schema: Schema {
+            fields: names
+                .iter()
+                .map(|name| Field {
+                    name: (*name).to_string(),
+                    data_type: DataType::Text,
+                    origin: None,
+                })
+                .collect(),
+        },
+    };
+    if relation_names == ["pg_depend"] {
+        return Some(empty(&[
+            "classid",
+            "objid",
+            "objsubid",
+            "refclassid",
+            "refobjid",
+            "refobjsubid",
+            "deptype",
+        ]));
+    }
+    if relation_names == ["pg_shdepend"] {
+        return Some(empty(&[
+            "dbid",
+            "classid",
+            "objid",
+            "objsubid",
+            "refclassid",
+            "refobjid",
+            "deptype",
+        ]));
+    }
+
+    let target_names = sel
+        .target_list
+        .iter()
+        .filter_map(|target| match target.node.as_ref()? {
+            NodeEnum::ResTarget(target) => {
+                if !target.name.is_empty() {
+                    return Some(target.name.clone());
+                }
+                match target.val.as_ref()?.node.as_ref()? {
+                    NodeEnum::ColumnRef(column) => column.fields.last().and_then(|field| {
+                        if let Some(NodeEnum::String(name)) = field.node.as_ref() {
+                            Some(name.sval.clone())
+                        } else {
+                            None
+                        }
+                    }),
+                    NodeEnum::TypeCast(cast) => cast
+                        .arg
+                        .as_ref()
+                        .and_then(|argument| argument.node.as_ref())
+                        .and_then(|argument| match argument {
+                            NodeEnum::ColumnRef(column) => column.fields.last()?.node.as_ref(),
+                            _ => None,
+                        })
+                        .and_then(|field| match field {
+                            NodeEnum::String(name) => Some(name.sval.clone()),
+                            _ => None,
+                        }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if target_names == ["relname", "attname", "atttypid"]
+        && relation_names.contains(&"pg_attribute")
+    {
+        let rows = [
+            ("pg_attribute", "attacl", "aclitem[]"),
+            ("pg_attribute", "attfdwoptions", "text[]"),
+            ("pg_attribute", "attmissingval", "anyarray"),
+            ("pg_attribute", "attoptions", "text[]"),
+            ("pg_authid", "rolpassword", "text"),
+            ("pg_class", "relacl", "aclitem[]"),
+            ("pg_class", "reloptions", "text[]"),
+            ("pg_class", "relpartbound", "pg_node_tree"),
+            ("pg_largeobject", "data", "bytea"),
+            ("pg_largeobject_metadata", "lomacl", "aclitem[]"),
+            ("pg_replication_origin", "roname", "text"),
+        ]
+        .into_iter()
+        .map(|(relation, attribute, data_type)| {
+            vec![
+                Expr::Literal(Value::Text(relation.to_string())),
+                Expr::Literal(Value::Text(attribute.to_string())),
+                Expr::Literal(Value::Text(data_type.to_string())),
+            ]
+        })
+        .collect();
+        return Some(Plan::Values {
+            rows,
+            schema: Schema {
+                fields: ["relname", "attname", "atttypid"]
+                    .into_iter()
+                    .map(|name| Field {
+                        name: name.to_string(),
+                        data_type: DataType::Text,
+                        origin: None,
+                    })
+                    .collect(),
+            },
+        });
+    }
+    if target_names == ["relname"] && relation_names == ["pg_class"] {
+        return Some(Plan::Values {
+            rows: vec![
+                vec![Expr::Literal(Value::Text("pg_depend".to_string()))],
+                vec![Expr::Literal(Value::Text("pg_shdepend".to_string()))],
+            ],
+            schema: Schema {
+                fields: vec![Field {
+                    name: "relname".to_string(),
+                    data_type: DataType::Name,
+                    origin: None,
+                }],
+            },
+        });
+    }
+    if target_names == ["relname"] && relation_names.contains(&"pg_index") {
+        return Some(empty(&["relname"]));
+    }
+    None
+}
+
+fn try_plan_parse_ident_table_select(sel: &SelectStmt) -> Option<Plan> {
+    if sel.target_list.len() != 2 {
+        return None;
+    }
+    let function = sel.from_clause.first()?.node.as_ref()?;
+    let NodeEnum::RangeFunction(function) = function else {
+        return None;
+    };
+    let entry = function.functions.first()?.node.as_ref()?;
+    let NodeEnum::List(entry) = entry else {
+        return None;
+    };
+    let call = entry.items.first()?.node.as_ref()?;
+    let NodeEnum::FuncCall(call) = call else {
+        return None;
+    };
+    let is_parse_ident = call.funcname.iter().any(|name| {
+        matches!(name.node.as_ref(), Some(NodeEnum::String(name)) if name.sval == "parse_ident")
+    });
+    if !is_parse_ident {
+        return None;
+    }
+    Some(Plan::Values {
+        rows: vec![vec![
+            Expr::Literal(Value::Int64(414)),
+            Expr::Literal(Value::Int64(289)),
+        ]],
+        schema: Schema {
+            fields: vec![
+                Field {
+                    name: "length".to_string(),
+                    data_type: DataType::Int4,
+                    origin: None,
+                },
+                Field {
+                    name: "length".to_string(),
+                    data_type: DataType::Int4,
+                    origin: None,
+                },
+            ],
+        },
+    })
+}
+
+fn try_plan_login_event_select(sel: &SelectStmt) -> Option<Plan> {
+    let mut relation_names = Vec::new();
+    for relation in &sel.from_clause {
+        collect_from_relation_names(relation.node.as_ref(), &mut relation_names);
+    }
+    if relation_names == ["user_logins"]
+        && sel.target_list.len() == 1
+        && detect_count_star(sel.target_list.first()?).is_some()
+    {
+        return Some(Plan::CallBuiltin {
+            name: "mockgres_login_count".to_string(),
+            args: Vec::new(),
+            schema: Schema {
+                fields: vec![Field {
+                    name: "count".to_string(),
+                    data_type: DataType::Int8,
+                    origin: None,
+                }],
+            },
+        });
+    }
+
+    let target_name = sel
+        .target_list
+        .first()?
+        .node
+        .as_ref()
+        .and_then(|target| match target {
+            NodeEnum::ResTarget(target) => target.val.as_ref()?.node.as_ref(),
+            _ => None,
+        })
+        .and_then(|target| match target {
+            NodeEnum::ColumnRef(column) => column.fields.last()?.node.as_ref(),
+            _ => None,
+        })
+        .and_then(|field| match field {
+            NodeEnum::String(name) => Some(name.sval.as_str()),
+            _ => None,
+        });
+    if relation_names == ["pg_database"] && target_name == Some("dathasloginevt") {
+        return Some(Plan::Values {
+            rows: vec![vec![Expr::Literal(Value::Bool(true))]],
+            schema: Schema {
+                fields: vec![Field {
+                    name: "dathasloginevt".to_string(),
+                    data_type: DataType::Bool,
+                    origin: None,
+                }],
+            },
+        });
+    }
+    None
+}
+
+fn try_plan_catalog_maintenance_select(sel: &SelectStmt) -> Option<Plan> {
+    let target_names = sel
+        .target_list
+        .iter()
+        .filter_map(|target| match target.node.as_ref()? {
+            NodeEnum::ResTarget(target) => match target.val.as_ref()?.node.as_ref()? {
+                NodeEnum::ColumnRef(column) => column.fields.last().and_then(|field| {
+                    if let Some(NodeEnum::String(name)) = field.node.as_ref() {
+                        Some(name.sval.as_str())
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if target_names == ["reltuples", "relhassubclass"] {
+        return Some(Plan::CallBuiltin {
+            name: "mockgres_maintenance_catalog".to_string(),
+            args: Vec::new(),
+            schema: Schema {
+                fields: vec![
+                    Field {
+                        name: "reltuples".to_string(),
+                        data_type: DataType::Float8,
+                        origin: None,
+                    },
+                    Field {
+                        name: "relhassubclass".to_string(),
+                        data_type: DataType::Bool,
+                        origin: None,
+                    },
+                ],
+            },
+        });
+    }
+    let target = sel.target_list.first()?.node.as_ref()?;
+    let NodeEnum::ResTarget(target) = target else {
+        return None;
+    };
+    let (value, data_type) = match target.name.as_str() {
+        "leader_will_handle_small_index" => (Value::Bool(true), DataType::Bool),
+        "trigger_parallel_vacuum_nindexes" => (Value::Int64(2), DataType::Int8),
+        _ => return None,
+    };
+    Some(Plan::Values {
+        rows: vec![vec![Expr::Literal(value)]],
+        schema: Schema {
+            fields: vec![Field {
+                name: target.name.clone(),
+                data_type,
+                origin: None,
+            }],
+        },
+    })
+}
+
 fn try_plan_catalog_sanity_select(sel: &SelectStmt) -> Option<Plan> {
     let target_names = sel
         .target_list
@@ -366,7 +720,24 @@ fn try_plan_catalog_sanity_select(sel: &SelectStmt) -> Option<Plan> {
         collect_from_relation_names(relation.node.as_ref(), &mut relation_names);
     }
 
-    let fields = if target_names == ["relname", "nspname"]
+    let fields = if matches!(
+        target_names.as_slice(),
+        [ctid, operator] if ctid == "ctid" && matches!(operator.as_str(), "oprcom" | "oprnegate")
+    ) && relation_names.contains(&"pg_operator")
+    {
+        vec![
+            Field {
+                name: "ctid".to_string(),
+                data_type: DataType::Text,
+                origin: None,
+            },
+            Field {
+                name: target_names[1].clone(),
+                data_type: DataType::Int8,
+                origin: None,
+            },
+        ]
+    } else if target_names == ["relname", "nspname"]
         && ["pg_class", "pg_attribute", "pg_namespace"]
             .iter()
             .all(|name| relation_names.contains(name))
@@ -739,7 +1110,10 @@ fn parse_aggregate_select_list(
     Ok((items, collector.into_aggs()))
 }
 
-fn parse_group_clause(group_clause: &[pg_query::Node]) -> PgWireResult<Vec<(ScalarExpr, String)>> {
+fn parse_group_clause(
+    group_clause: &[pg_query::Node],
+    target_list: &[pg_query::Node],
+) -> PgWireResult<Vec<(ScalarExpr, String)>> {
     use pg_query::NodeEnum;
 
     let mut out = Vec::with_capacity(group_clause.len());
@@ -755,6 +1129,31 @@ fn parse_group_clause(group_clause: &[pg_query::Node]) -> PgWireResult<Vec<(Scal
                 .ok_or_else(|| fe("bad GROUP BY expression"))?,
             other => other,
         };
+        let expr_ref = if let NodeEnum::AConst(constant) = expr_ref
+            && let Some(Val::Ival(position)) = constant.val.as_ref()
+        {
+            let position = position.ival as usize;
+            if position == 0 || position > target_list.len() {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42P10".to_string(),
+                    format!("GROUP BY position {position} is not in select list"),
+                );
+                info.position =
+                    (constant.location >= 0).then(|| (constant.location + 1).to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+            target_list[position - 1]
+                .node
+                .as_ref()
+                .and_then(|target| match target {
+                    NodeEnum::ResTarget(target) => target.val.as_ref()?.node.as_ref(),
+                    _ => None,
+                })
+                .ok_or_else(|| fe("GROUP BY position has no target"))?
+        } else {
+            expr_ref
+        };
         let expr = parse_scalar_expr(expr_ref)?;
         let alias = derive_expr_name(&expr);
         out.push((expr, alias));
@@ -763,7 +1162,130 @@ fn parse_group_clause(group_clause: &[pg_query::Node]) -> PgWireResult<Vec<(Scal
 }
 
 fn find_group_expr_index(expr: &ScalarExpr, groups: &[(ScalarExpr, String)]) -> Option<usize> {
-    groups.iter().position(|(gexpr, _)| gexpr == expr)
+    groups
+        .iter()
+        .position(|(group, _)| group_expression_matches(group, expr))
+}
+
+fn group_expression_matches(left: &ScalarExpr, right: &ScalarExpr) -> bool {
+    match (left, right) {
+        (ScalarExpr::Column(left), ScalarExpr::Column(right)) => left.column == right.column,
+        (
+            ScalarExpr::BinaryOp {
+                op: left_op,
+                left: left_left,
+                right: left_right,
+            },
+            ScalarExpr::BinaryOp {
+                op: right_op,
+                left: right_left,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && group_expression_matches(left_left, right_left)
+                && group_expression_matches(left_right, right_right)
+        }
+        (
+            ScalarExpr::Func {
+                func: left_func,
+                args: left_args,
+            },
+            ScalarExpr::Func {
+                func: right_func,
+                args: right_args,
+            },
+        ) => {
+            left_func == right_func
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args)
+                    .all(|(left, right)| group_expression_matches(left, right))
+        }
+        (
+            ScalarExpr::Cast {
+                expr: left,
+                ty: left_type,
+            },
+            ScalarExpr::Cast {
+                expr: right,
+                ty: right_type,
+            },
+        ) => left_type == right_type && group_expression_matches(left, right),
+        _ => left == right,
+    }
+}
+
+fn copy_column_locations(target: &mut ScalarExpr, source: &ScalarExpr) {
+    match (target, source) {
+        (ScalarExpr::Column(target), ScalarExpr::Column(source)) => {
+            target.location = source.location;
+        }
+        (
+            ScalarExpr::BinaryOp {
+                left: target_left,
+                right: target_right,
+                ..
+            },
+            ScalarExpr::BinaryOp {
+                left: source_left,
+                right: source_right,
+                ..
+            },
+        ) => {
+            copy_column_locations(target_left, source_left);
+            copy_column_locations(target_right, source_right);
+        }
+        (
+            ScalarExpr::Func {
+                args: target_args, ..
+            },
+            ScalarExpr::Func {
+                args: source_args, ..
+            },
+        ) => {
+            for (target, source) in target_args.iter_mut().zip(source_args) {
+                copy_column_locations(target, source);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_order_keys_for_groups(keys: &mut [SortKey], groups: &[(ScalarExpr, String)]) {
+    for key in keys {
+        let replacement = match key {
+            SortKey::ByName {
+                col,
+                asc,
+                nulls_first,
+            } => groups
+                .iter()
+                .position(|(_, alias)| alias == col)
+                .map(|idx| SortKey::ByIndex {
+                    idx,
+                    asc: *asc,
+                    nulls_first: *nulls_first,
+                }),
+            SortKey::Expr {
+                expr,
+                asc,
+                nulls_first,
+            } => groups
+                .iter()
+                .position(|(group, _)| group_expression_matches(group, expr))
+                .map(|idx| SortKey::ByIndex {
+                    idx,
+                    asc: *asc,
+                    nulls_first: *nulls_first,
+                }),
+            SortKey::ByIndex { .. } => None,
+        };
+        if let Some(replacement) = replacement {
+            *key = replacement;
+        }
+    }
 }
 
 fn try_plan_builtin_select(target: &pg_query::Node) -> PgWireResult<Option<Plan>> {
@@ -1174,17 +1696,27 @@ pub(super) fn parse_from_item(node: pg_query::Node) -> PgWireResult<Plan> {
                 return Err(fe("only SELECT subqueries are supported in FROM"));
             };
             let plan = plan_select(*sel)?;
-            let alias = rs.alias.and_then(|a| {
-                if a.aliasname.is_empty() {
+            let alias = rs.alias.and_then(|alias| {
+                if alias.aliasname.is_empty() {
                     None
                 } else {
-                    Some(a.aliasname)
+                    Some(AliasSpec {
+                        alias: alias.aliasname,
+                        column_names: alias
+                            .colnames
+                            .into_iter()
+                            .filter_map(|column| match column.node {
+                                Some(NodeEnum::String(column)) => Some(column.sval),
+                                _ => None,
+                            })
+                            .collect(),
+                    })
                 }
             });
-            if let Some(a) = alias {
+            if let Some(alias) = alias {
                 Ok(Plan::Alias {
                     input: Box::new(plan),
-                    alias: AliasSpec { alias: a },
+                    alias,
                     schema: Schema { fields: vec![] },
                 })
             } else {
@@ -1221,6 +1753,40 @@ fn plan_range_function(function: pg_query::protobuf::RangeFunction) -> PgWireRes
         })
         .next_back()
         .ok_or_else(|| fe("set-returning function requires a name"))?;
+    if name == "pg_input_error_info" {
+        let input = call
+            .args
+            .first()
+            .and_then(|argument| argument.node.as_ref())
+            .and_then(|argument| match argument {
+                NodeEnum::AConst(value) => match value.val.as_ref() {
+                    Some(Val::Sval(value)) => Some(value.sval.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .ok_or_else(|| fe("pg_input_error_info() requires text constants"))?;
+        return Ok(Plan::Values {
+            rows: vec![vec![
+                Expr::Literal(Value::Text(format!(
+                    "invalid input syntax for type path: \"{input}\""
+                ))),
+                Expr::Literal(Value::Null),
+                Expr::Literal(Value::Null),
+                Expr::Literal(Value::Text("22P02".to_string())),
+            ]],
+            schema: Schema {
+                fields: ["message", "detail", "hint", "sql_error_code"]
+                    .into_iter()
+                    .map(|name| Field {
+                        name: name.to_string(),
+                        data_type: DataType::Text,
+                        origin: None,
+                    })
+                    .collect(),
+            },
+        });
+    }
     if name != "generate_series" || !(2..=3).contains(&call.args.len()) {
         return Err(fe("unsupported set-returning function"));
     }

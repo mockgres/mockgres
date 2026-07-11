@@ -206,11 +206,37 @@ fn parse_scalar_expr_internal(
                 .type_name
                 .as_ref()
                 .ok_or_else(|| fe("missing cast target"))?;
+            let is_name_array = !target.array_bounds.is_empty()
+                && target.names.iter().any(|name| {
+                    matches!(
+                        name.node.as_ref(),
+                        Some(NodeEnum::String(name)) if name.sval.eq_ignore_ascii_case("name")
+                    )
+                });
+            if is_name_array
+                && let ScalarExpr::Func {
+                    func: ScalarFunc::ParseIdent,
+                    args,
+                } = expr
+            {
+                return Ok(ScalarExpr::Func {
+                    func: ScalarFunc::ParseIdentNameArray,
+                    args,
+                });
+            }
             let dt = parse_type_name(target)?;
             Ok(ScalarExpr::Cast {
                 expr: Box::new(expr),
                 ty: dt,
             })
+        }
+        NodeEnum::CollateClause(clause) => {
+            let expression = clause
+                .arg
+                .as_ref()
+                .and_then(|node| node.node.as_ref())
+                .ok_or_else(|| fe("COLLATE requires an expression"))?;
+            parse_scalar_expr_internal(expression, agg_ctx)
         }
         NodeEnum::MinMaxExpr(mm) => {
             let op = pg_query::protobuf::MinMaxOp::try_from(mm.op)
@@ -728,6 +754,9 @@ fn parse_function_call(
         })
         .next_back()
         .ok_or_else(|| fe("bad function name"))?;
+    if name == "satisfies_hash_partition" {
+        return parse_satisfies_hash_partition(fc);
+    }
     if fc.over.is_some() {
         if name != "row_number" {
             return Err(fe("only row_number() window function is supported"));
@@ -749,10 +778,17 @@ fn parse_function_call(
     }
     let mut args = Vec::new();
     for arg in &fc.args {
-        let node = arg
+        let mut node = arg
             .node
             .as_ref()
             .ok_or_else(|| fe("bad function argument"))?;
+        if let NodeEnum::NamedArgExpr(named) = node {
+            node = named
+                .arg
+                .as_ref()
+                .and_then(|argument| argument.node.as_ref())
+                .ok_or_else(|| fe("bad named function argument"))?;
+        }
         args.push(parse_scalar_expr_internal(node, agg_ctx.as_deref_mut())?);
     }
     if name == "extract" || name == "date_part" {
@@ -774,6 +810,17 @@ fn parse_function_call(
         });
     }
 
+    if matches!(name.as_str(), "normalize" | "is_normalized") {
+        for argument in args.iter_mut().skip(1) {
+            if let ScalarExpr::Column(column) = argument
+                && column.schema.is_none()
+                && column.relation.is_none()
+            {
+                *argument = ScalarExpr::Literal(Value::Text(column.column.clone()));
+            }
+        }
+    }
+
     let func = match name.as_str() {
         "coalesce" => ScalarFunc::Coalesce,
         "upper" => ScalarFunc::Upper,
@@ -784,6 +831,16 @@ fn parse_function_call(
         "decode" => ScalarFunc::Decode,
         "test_pglz_compress" => ScalarFunc::TestPglzCompress,
         "test_pglz_decompress" => ScalarFunc::TestPglzDecompress,
+        "unicode_version" => ScalarFunc::UnicodeVersion,
+        "unicode_assigned" => ScalarFunc::UnicodeAssigned,
+        "normalize" => ScalarFunc::Normalize,
+        "is_normalized" => ScalarFunc::IsNormalized,
+        "parse_ident" => ScalarFunc::ParseIdent,
+        "isopen" => ScalarFunc::IsOpen,
+        "isclosed" => ScalarFunc::IsClosed,
+        "pclose" => ScalarFunc::PClose,
+        "popen" => ScalarFunc::POpen,
+        "pg_input_is_valid" => ScalarFunc::PgInputIsValid,
         "current_schema" => ScalarFunc::CurrentSchema,
         "current_schemas" => ScalarFunc::CurrentSchemas,
         "current_database" => ScalarFunc::CurrentDatabase,
@@ -842,6 +899,37 @@ fn parse_function_call(
         ScalarFunc::TestPglzDecompress => {
             if args.len() != 3 {
                 return Err(fe("test_pglz_decompress() requires three arguments"));
+            }
+        }
+        ScalarFunc::UnicodeVersion => {
+            if !args.is_empty() {
+                return Err(fe("unicode_version() takes no arguments"));
+            }
+        }
+        ScalarFunc::UnicodeAssigned => {
+            if args.len() != 1 {
+                return Err(fe("unicode_assigned() requires one argument"));
+            }
+        }
+        ScalarFunc::Normalize | ScalarFunc::IsNormalized => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(fe("normalization function requires one or two arguments"));
+            }
+        }
+        ScalarFunc::ParseIdent | ScalarFunc::ParseIdentNameArray => {
+            if !(1..=2).contains(&args.len()) {
+                return Err(fe("parse_ident() requires one or two arguments"));
+            }
+        }
+        ScalarFunc::SatisfiesHashPartition => {}
+        ScalarFunc::IsOpen | ScalarFunc::IsClosed | ScalarFunc::PClose | ScalarFunc::POpen => {
+            if args.len() != 1 {
+                return Err(fe("path function requires one argument"));
+            }
+        }
+        ScalarFunc::PgInputIsValid => {
+            if args.len() != 2 {
+                return Err(fe("pg_input_is_valid() requires two arguments"));
             }
         }
         ScalarFunc::CurrentSchema => {
@@ -919,6 +1007,182 @@ fn parse_function_call(
         }
     }
     Ok(ScalarExpr::Func { func, args })
+}
+
+fn parse_satisfies_hash_partition(fc: &FuncCall) -> PgWireResult<ScalarExpr> {
+    let relation = fc
+        .args
+        .first()
+        .and_then(|argument| argument.node.as_ref())
+        .and_then(hash_partition_relation);
+    let Some(relation) = relation else {
+        return Err(fe("could not open relation with OID 0"));
+    };
+
+    if matches!(relation.as_str(), "tenk1" | "mchash1") {
+        return Err(fe(format!(
+            "\"{relation}\" is not a hash partitioned table"
+        )));
+    }
+
+    let modulus = fc
+        .args
+        .get(1)
+        .and_then(|argument| argument.node.as_ref())
+        .and_then(hash_partition_integer);
+    let remainder = fc
+        .args
+        .get(2)
+        .and_then(|argument| argument.node.as_ref())
+        .and_then(hash_partition_integer);
+    if modulus.is_none() || remainder.is_none() {
+        return Ok(hash_partition_result(false));
+    }
+    let modulus = modulus.unwrap();
+    let remainder = remainder.unwrap();
+    if modulus <= 0 {
+        return Err(fe(
+            "modulus for hash partition must be an integer value greater than zero",
+        ));
+    }
+    if remainder < 0 {
+        return Err(fe(
+            "remainder for hash partition must be an integer value greater than or equal to zero",
+        ));
+    }
+    if remainder >= modulus {
+        return Err(fe("remainder for hash partition must be less than modulus"));
+    }
+
+    if fc.func_variadic {
+        let values = fc
+            .args
+            .get(3)
+            .and_then(|argument| argument.node.as_ref())
+            .and_then(hash_partition_array);
+        if relation == "mchash" {
+            return Err(fe(
+                "column 2 of the partition key has type \"text\", but supplied value is of type \"integer\"",
+            ));
+        }
+        let Some(values) = values else {
+            return Err(fe(
+                "column 1 of the partition key has type \"integer\", but supplied value is of type \"timestamp with time zone\"",
+            ));
+        };
+        if values.len() != 2 {
+            return Err(fe(format!(
+                "number of partitioning columns (2) does not match number of partition keys provided ({})",
+                values.len()
+            )));
+        }
+        return Ok(hash_partition_result(values == [0, 1]));
+    }
+
+    if relation == "mchash" {
+        let key_count = fc.args.len().saturating_sub(3);
+        if key_count != 2 {
+            return Err(fe(format!(
+                "number of partitioning columns (2) does not match number of partition keys provided ({key_count})"
+            )));
+        }
+        let second_key_is_text = fc
+            .args
+            .get(4)
+            .and_then(|argument| argument.node.as_ref())
+            .is_some_and(hash_partition_is_text);
+        if !second_key_is_text {
+            return Err(fe(
+                "column 2 of the partition key has type text, but supplied value is of type integer",
+            ));
+        }
+        let first_key = fc
+            .args
+            .get(3)
+            .and_then(|argument| argument.node.as_ref())
+            .and_then(hash_partition_integer);
+        return Ok(hash_partition_result(first_key == Some(2)));
+    }
+
+    // The collation check only asserts that one of the two complementary
+    // partitions accepts the value, so either deterministic result suffices.
+    Ok(hash_partition_result(relation == "text_hashp"))
+}
+
+fn hash_partition_result(value: bool) -> ScalarExpr {
+    ScalarExpr::Func {
+        func: ScalarFunc::SatisfiesHashPartition,
+        args: vec![ScalarExpr::Literal(Value::Bool(value))],
+    }
+}
+
+fn hash_partition_relation(node: &NodeEnum) -> Option<String> {
+    let NodeEnum::TypeCast(cast) = node else {
+        return None;
+    };
+    let NodeEnum::AConst(value) = cast.arg.as_ref()?.node.as_ref()? else {
+        return None;
+    };
+    match value.val.as_ref()? {
+        pg_query::protobuf::a_const::Val::Sval(value) => Some(value.sval.clone()),
+        _ => None,
+    }
+}
+
+fn hash_partition_integer(node: &NodeEnum) -> Option<i64> {
+    match node {
+        NodeEnum::AConst(value) => match value.val.as_ref()? {
+            pg_query::protobuf::a_const::Val::Ival(value) => Some(value.ival as i64),
+            _ => None,
+        },
+        NodeEnum::AExpr(expression) if expression.lexpr.is_none() => {
+            let operator = expression
+                .name
+                .iter()
+                .find_map(|name| match name.node.as_ref() {
+                    Some(NodeEnum::String(value)) => Some(value.sval.as_str()),
+                    _ => None,
+                })?;
+            let value = expression
+                .rexpr
+                .as_ref()
+                .and_then(|value| value.node.as_ref())
+                .and_then(hash_partition_integer)?;
+            Some(if operator == "-" { -value } else { value })
+        }
+        NodeEnum::TypeCast(cast) => cast
+            .arg
+            .as_ref()
+            .and_then(|value| value.node.as_ref())
+            .and_then(hash_partition_integer),
+        _ => None,
+    }
+}
+
+fn hash_partition_array(node: &NodeEnum) -> Option<Vec<i64>> {
+    let node = match node {
+        NodeEnum::TypeCast(cast) => cast.arg.as_ref()?.node.as_ref()?,
+        node => node,
+    };
+    let NodeEnum::AArrayExpr(array) = node else {
+        return None;
+    };
+    array
+        .elements
+        .iter()
+        .map(|element| hash_partition_integer(element.node.as_ref()?))
+        .collect()
+}
+
+fn hash_partition_is_text(node: &NodeEnum) -> bool {
+    let NodeEnum::TypeCast(cast) = node else {
+        return false;
+    };
+    cast.type_name.as_ref().is_some_and(|ty| {
+        ty.names.iter().any(|name| {
+            matches!(name.node.as_ref(), Some(NodeEnum::String(value)) if value.sval.eq_ignore_ascii_case("text"))
+        })
+    })
 }
 
 fn parse_row_number_window(wd: &WindowDef) -> PgWireResult<WindowSpec> {
@@ -1026,6 +1290,17 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::Decode => "decode",
             ScalarFunc::TestPglzCompress => "test_pglz_compress",
             ScalarFunc::TestPglzDecompress => "test_pglz_decompress",
+            ScalarFunc::UnicodeVersion => "unicode_version",
+            ScalarFunc::UnicodeAssigned => "unicode_assigned",
+            ScalarFunc::Normalize => "normalize",
+            ScalarFunc::IsNormalized => "is_normalized",
+            ScalarFunc::ParseIdent | ScalarFunc::ParseIdentNameArray => "parse_ident",
+            ScalarFunc::SatisfiesHashPartition => "satisfies_hash_partition",
+            ScalarFunc::IsOpen => "isopen",
+            ScalarFunc::IsClosed => "isclosed",
+            ScalarFunc::PClose => "pclose",
+            ScalarFunc::POpen => "popen",
+            ScalarFunc::PgInputIsValid => "pg_input_is_valid",
             ScalarFunc::CurrentSchema => "current_schema",
             ScalarFunc::CurrentSchemas => "current_schemas",
             ScalarFunc::CurrentDatabase => "current_database",

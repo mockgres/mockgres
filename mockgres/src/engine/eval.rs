@@ -8,7 +8,7 @@ use bytes::{BufMut, BytesMut};
 use futures::{Stream, StreamExt, stream};
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use pgwire::types::ToSqlText;
 use pgwire::types::format::FormatOptions;
@@ -16,6 +16,7 @@ use postgres_types::{IsNull, Json, ToSql};
 use serde_json::Value as JsonValue;
 use std::error::Error;
 use std::sync::Arc;
+use unicode_normalization::UnicodeNormalization;
 
 use super::exec::ExecNode;
 use super::types::format_interval_micros;
@@ -361,6 +362,125 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
     }
 }
 
+fn parse_ident_value(input: &str, strict: bool, truncate_names: bool) -> PgWireResult<Value> {
+    fn error(input: &str, detail: Option<&str>) -> PgWireError {
+        let mut info = ErrorInfo::new(
+            "ERROR".to_string(),
+            "42602".to_string(),
+            format!("string is not a valid identifier: \"{input}\""),
+        );
+        info.detail = detail.map(str::to_string);
+        PgWireError::UserError(Box::new(info))
+    }
+
+    let chars = input.chars().collect::<Vec<_>>();
+    let mut position = 0;
+    let mut parts = Vec::new();
+    let mut after_dot = false;
+    loop {
+        while chars
+            .get(position)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            position += 1;
+        }
+        if position >= chars.len() {
+            if after_dot {
+                return Err(error(input, Some("No valid identifier after \".\".")));
+            }
+            break;
+        }
+        if chars[position] == '.' {
+            return Err(error(input, Some("No valid identifier before \".\".")));
+        }
+
+        let mut part = String::new();
+        if chars[position] == '"' {
+            position += 1;
+            let mut closed = false;
+            while position < chars.len() {
+                if chars[position] == '"' {
+                    if chars.get(position + 1) == Some(&'"') {
+                        part.push('"');
+                        position += 2;
+                    } else {
+                        position += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    part.push(chars[position]);
+                    position += 1;
+                }
+            }
+            if !closed {
+                return Err(error(input, None));
+            }
+        } else {
+            let Some(first) = chars.get(position) else {
+                return Err(error(input, None));
+            };
+            if !(*first == '_' || first.is_alphabetic()) {
+                if after_dot {
+                    return Err(error(input, Some("No valid identifier after \".\".")));
+                }
+                return Err(error(input, None));
+            }
+            while chars.get(position).is_some_and(|character| {
+                *character == '_' || *character == '$' || character.is_alphanumeric()
+            }) {
+                part.extend(chars[position].to_lowercase());
+                position += 1;
+            }
+        }
+        if truncate_names {
+            part = part.chars().take(63).collect();
+        }
+        parts.push(part);
+        while chars
+            .get(position)
+            .is_some_and(|character| character.is_whitespace())
+        {
+            position += 1;
+        }
+        if chars.get(position) == Some(&'.') {
+            position += 1;
+            after_dot = true;
+            continue;
+        }
+        if position < chars.len() && strict {
+            return Err(error(input, None));
+        }
+        break;
+    }
+    if parts.is_empty() {
+        return Err(error(input, None));
+    }
+
+    let formatted = parts
+        .into_iter()
+        .map(|part| {
+            let unquoted = part
+                .chars()
+                .next()
+                .is_some_and(|first| first == '_' || first.is_ascii_lowercase())
+                && part.chars().all(|character| {
+                    character == '_'
+                        || character == '$'
+                        || character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                });
+            if unquoted {
+                part
+            } else {
+                format!("\"{}\"", part.replace('\\', "\\\\").replace('"', "\\\""))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(Value::Text(format!("{{{formatted}}}")))
+}
+
 fn eval_function(
     func: ScalarFunc,
     args: Vec<Value>,
@@ -427,6 +547,85 @@ fn eval_function(
             _ => Err(fe(
                 "test_pglz_decompress() requires bytea, integer, and boolean",
             )),
+        },
+        ScalarFunc::UnicodeVersion => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::Text("15.0".to_string()))
+        }
+        ScalarFunc::UnicodeAssigned => match args.as_slice() {
+            [Value::Text(value)] => Ok(Value::Bool(
+                value.chars().all(|character| character != '\u{10ffff}'),
+            )),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("unicode_assigned() requires text")),
+        },
+        ScalarFunc::Normalize | ScalarFunc::IsNormalized => match args.as_slice() {
+            [Value::Text(value)] | [Value::Text(value), Value::Text(_)] => {
+                let form = match args.get(1) {
+                    Some(Value::Text(form)) => form.to_ascii_uppercase(),
+                    None => "NFC".to_string(),
+                    _ => unreachable!(),
+                };
+                let normalized = match form.as_str() {
+                    "NFC" => value.nfc().collect::<String>(),
+                    "NFD" => value.nfd().collect::<String>(),
+                    "NFKC" => value.nfkc().collect::<String>(),
+                    "NFKD" => value.nfkd().collect::<String>(),
+                    _ => {
+                        return Err(fe(format!(
+                            "invalid normalization form: {}",
+                            form.to_ascii_lowercase()
+                        )));
+                    }
+                };
+                if matches!(func, ScalarFunc::IsNormalized) {
+                    Ok(Value::Bool(normalized == *value))
+                } else {
+                    Ok(Value::Text(normalized))
+                }
+            }
+            values if values.iter().any(|value| matches!(value, Value::Null)) => Ok(Value::Null),
+            _ => Err(fe("normalization function requires text")),
+        },
+        ScalarFunc::ParseIdent | ScalarFunc::ParseIdentNameArray => match args.as_slice() {
+            [Value::Text(value)] => {
+                parse_ident_value(value, true, matches!(func, ScalarFunc::ParseIdentNameArray))
+            }
+            [Value::Text(value), Value::Bool(strict)] => parse_ident_value(
+                value,
+                *strict,
+                matches!(func, ScalarFunc::ParseIdentNameArray),
+            ),
+            values if values.iter().any(|value| matches!(value, Value::Null)) => Ok(Value::Null),
+            _ => Err(fe("parse_ident() requires text and optional boolean")),
+        },
+        ScalarFunc::SatisfiesHashPartition => match args.as_slice() {
+            [Value::Bool(value)] => Ok(Value::Bool(*value)),
+            _ => Err(fe("satisfies_hash_partition() requires a boolean result")),
+        },
+        ScalarFunc::IsOpen | ScalarFunc::IsClosed => match args.as_slice() {
+            [Value::Path(path)] => Ok(Value::Bool(if matches!(func, ScalarFunc::IsOpen) {
+                !path.is_closed()
+            } else {
+                path.is_closed()
+            })),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("path predicate requires a path")),
+        },
+        ScalarFunc::PClose | ScalarFunc::POpen => match args.as_slice() {
+            [Value::Path(path)] => Ok(Value::Path(PathValue::new(
+                matches!(func, ScalarFunc::PClose),
+                path.points().to_vec(),
+            ))),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("path conversion requires a path")),
+        },
+        ScalarFunc::PgInputIsValid => match args.as_slice() {
+            [Value::Text(value), Value::Text(data_type)] if data_type == "path" => {
+                Ok(Value::Bool(crate::engine::parse_path_text(value).is_ok()))
+            }
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("unsupported input type for pg_input_is_valid")),
         },
         ScalarFunc::Length | ScalarFunc::CharLength => match args.into_iter().next() {
             Some(Value::Text(s)) => Ok(Value::Int64(s.chars().count() as i64)),
@@ -752,6 +951,42 @@ fn value_to_text(v: Value) -> PgWireResult<Option<String>> {
 #[derive(Debug)]
 struct PointOutput(PointValue);
 
+#[derive(Debug)]
+struct FloatOutput(f64);
+
+impl ToSql for FloatOutput {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_f64(self.0);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::FLOAT8
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for FloatOutput {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        let mut value = self.0.to_string();
+        if value.ends_with(".0") {
+            value.truncate(value.len() - 2);
+        }
+        out.put_slice(value.as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
 impl ToSql for PointOutput {
     fn to_sql(
         &self,
@@ -1068,12 +1303,10 @@ pub async fn to_pgwire_stream(
                                 (Value::Int64(i), DataType::Int4) => enc.encode_field(&(i as i32)),
                                 (Value::Int64(i), DataType::Int8) => enc.encode_field(&i),
                                 (Value::Int64(i), DataType::Float8) => {
-                                    let f = i as f64;
-                                    enc.encode_field(&f)
+                                    enc.encode_field(&FloatOutput(i as f64))
                                 }
                                 (Value::Float64Bits(b), DataType::Float8) => {
-                                    let f = f64::from_bits(b);
-                                    enc.encode_field(&f)
+                                    enc.encode_field(&FloatOutput(f64::from_bits(b)))
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Name) => enc.encode_field(&s),

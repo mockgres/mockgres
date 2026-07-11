@@ -171,6 +171,18 @@ pub enum ScalarFunc {
     Decode,
     TestPglzCompress,
     TestPglzDecompress,
+    UnicodeVersion,
+    UnicodeAssigned,
+    Normalize,
+    IsNormalized,
+    ParseIdent,
+    ParseIdentNameArray,
+    SatisfiesHashPartition,
+    IsOpen,
+    IsClosed,
+    PClose,
+    POpen,
+    PgInputIsValid,
     CurrentSchema,
     CurrentSchemas,
     CurrentDatabase,
@@ -291,6 +303,7 @@ pub enum JoinType {
 #[derive(Clone, Debug)]
 pub struct AliasSpec {
     pub alias: String,
+    pub column_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

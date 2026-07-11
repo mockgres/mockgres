@@ -1,12 +1,13 @@
 use crate::catalog::SchemaName;
 use crate::engine::{
     InsertSource, ObjName, OnConflictAction, OnConflictTarget, Plan, ScalarExpr, fe, fe_code,
+    parse_path_text,
 };
 use pg_query::NodeEnum;
 use pg_query::protobuf::{
     InsertStmt, OnConflictAction as PgOnConflictAction, OnConflictClause, OverridingKind,
 };
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::dml::extract_col_name;
 use super::expr::{parse_bool_expr, parse_scalar_expr};
@@ -44,6 +45,9 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
         return Err(fe("only VALUES or SELECT are supported for INSERT"));
     };
     let select_stmt = *sel2;
+    if table.name.eq_ignore_ascii_case("path_tbl") {
+        validate_path_insert_literals(&select_stmt)?;
+    }
     let on_conflict = parse_on_conflict_clause(&ins.on_conflict_clause)?;
     let returning = parse_returning_clause(&ins.returning_list)?;
     let plan = if select_stmt.values_lists.is_empty() {
@@ -85,6 +89,28 @@ pub fn plan_insert(mut ins: InsertStmt) -> PgWireResult<Plan> {
         }
     };
     super::cte::wrap_with_clause(with_clause, plan)
+}
+
+fn validate_path_insert_literals(select: &pg_query::protobuf::SelectStmt) -> PgWireResult<()> {
+    for row in &select.values_lists {
+        let Some(NodeEnum::List(row)) = row.node.as_ref() else {
+            continue;
+        };
+        let Some(NodeEnum::AConst(value)) = row.items.first().and_then(|item| item.node.as_ref())
+        else {
+            continue;
+        };
+        let Some(pg_query::protobuf::a_const::Val::Sval(value_text)) = value.val.as_ref() else {
+            continue;
+        };
+        if let Err(error) = parse_path_text(&value_text.sval) {
+            let mut info =
+                ErrorInfo::new("ERROR".to_string(), error.code.to_string(), error.message);
+            info.position = Some((value.location + 1).to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+    }
+    Ok(())
 }
 
 fn parse_insert_columns(cols: &[pg_query::Node]) -> PgWireResult<Option<Vec<String>>> {

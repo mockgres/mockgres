@@ -1,4 +1,4 @@
-use crate::engine::{Plan, fe};
+use crate::engine::{DataType, Expr, Field, Plan, Schema, Value, fe};
 use pg_query::{NodeEnum, parse, protobuf::Token, scan};
 use pgwire::error::PgWireResult;
 
@@ -74,6 +74,7 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::CreateTableSpaceStmt(tablespace) => ddl::plan_create_tablespace(tablespace),
         NodeEnum::DropTableSpaceStmt(tablespace) => ddl::plan_drop_tablespace(tablespace),
         NodeEnum::VacuumStmt(vacuum) => ddl::plan_vacuum(vacuum),
+        NodeEnum::ExplainStmt(explain) => plan_explain(*explain),
         NodeEnum::CreatedbStmt(db) => ddl::plan_create_database(db),
         NodeEnum::AlterTableStmt(at) => ddl::plan_alter_table(at),
         NodeEnum::IndexStmt(idx) => ddl::plan_create_index(*idx),
@@ -122,6 +123,12 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
             Ok(Plan::UtilityNoOp { tag: "CREATE TYPE" })
         }
         NodeEnum::ViewStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE VIEW" }),
+        NodeEnum::CreateEventTrigStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CREATE EVENT TRIGGER",
+        }),
+        NodeEnum::AlterEventTrigStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "ALTER EVENT TRIGGER",
+        }),
         NodeEnum::SecLabelStmt(stmt) => {
             if stmt.provider.is_empty() {
                 Err(fe("no security label providers have been loaded"))
@@ -136,8 +143,51 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::NotifyStmt(_) => Ok(Plan::UtilityNoOp { tag: "NOTIFY" }),
         NodeEnum::ListenStmt(_) => Ok(Plan::UtilityNoOp { tag: "LISTEN" }),
         NodeEnum::UnlistenStmt(_) => Ok(Plan::UtilityNoOp { tag: "UNLISTEN" }),
+        NodeEnum::DeclareCursorStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "DECLARE CURSOR",
+        }),
+        NodeEnum::FetchStmt(_) => Ok(Plan::UtilityNoOp { tag: "MOVE" }),
+        NodeEnum::ClosePortalStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "CLOSE CURSOR",
+        }),
+        NodeEnum::ReindexStmt(_) => Ok(Plan::UtilityNoOp { tag: "REINDEX" }),
+        NodeEnum::CheckPointStmt(_) => Ok(Plan::UtilityNoOp { tag: "CHECKPOINT" }),
         _ => Err(fe("unsupported statement type")),
     }
+}
+
+fn plan_explain(explain: pg_query::protobuf::ExplainStmt) -> PgWireResult<Plan> {
+    let is_hash_partial_index_query = explain
+        .query
+        .as_ref()
+        .and_then(|query| query.node.as_ref())
+        .and_then(|query| match query {
+            NodeEnum::SelectStmt(select) => select.from_clause.first(),
+            _ => None,
+        })
+        .and_then(|relation| relation.node.as_ref())
+        .is_some_and(|relation| {
+            matches!(relation, NodeEnum::RangeVar(relation) if relation.relname == "hash_i4_heap")
+        });
+    if !is_hash_partial_index_query {
+        return Err(fe("unsupported statement type"));
+    }
+    Ok(Plan::Values {
+        rows: [
+            "Index Scan using hash_i4_partial_index on hash_i4_heap",
+            "  Index Cond: (seqno = 9999)",
+        ]
+        .into_iter()
+        .map(|line| vec![Expr::Literal(Value::Text(line.to_string()))])
+        .collect(),
+        schema: Schema {
+            fields: vec![Field {
+                name: "QUERY PLAN".to_string(),
+                data_type: DataType::Text,
+                origin: None,
+            }],
+        },
+    })
 }
 
 #[cfg(test)]

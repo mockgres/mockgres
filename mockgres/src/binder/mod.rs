@@ -394,8 +394,9 @@ fn bind_with_search_path(
             let mut fields = Vec::with_capacity(child.schema().fields.len());
             let mut exprs = Vec::with_capacity(child.schema().fields.len());
             for (idx, f) in child.schema().fields.iter().enumerate() {
+                let name = alias.column_names.get(idx).unwrap_or(&f.name);
                 fields.push(Field {
-                    name: f.name.clone(),
+                    name: name.clone(),
                     data_type: f.data_type.clone(),
                     origin: Some(FieldOrigin {
                         schema: None,
@@ -403,7 +404,7 @@ fn bind_with_search_path(
                         alias: Some(alias.alias.clone()),
                     }),
                 });
-                exprs.push((ScalarExpr::ColumnIdx(idx), f.name.clone()));
+                exprs.push((ScalarExpr::ColumnIdx(idx), name.clone()));
             }
             Ok(Plan::Projection {
                 input: Box::new(child),

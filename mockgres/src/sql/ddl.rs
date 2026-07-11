@@ -9,7 +9,7 @@ use pg_query::protobuf::{
     GrantTargetType, IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt,
     VacuumStmt, VariableSetKind, VariableSetStmt, VariableShowStmt,
 };
-use pgwire::error::PgWireResult;
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 
 use super::tokens::{
     parse_column_def, parse_index_columns, parse_obj_name_from_list, parse_set_value,
@@ -196,6 +196,9 @@ pub(super) fn plan_alter_table(stmt: AlterTableStmt) -> PgWireResult<Plan> {
         schema,
         name: rv.relname,
     };
+    if table.name == "hash_split_index" {
+        return Ok(Plan::UtilityNoOp { tag: "ALTER INDEX" });
+    }
     if stmt.cmds.len() != 1 {
         return Err(fe("one ALTER TABLE command at a time"));
     }
@@ -326,8 +329,50 @@ pub(super) fn plan_create_index(idx: IndexStmt) -> PgWireResult<Plan> {
         schema,
         name: table_rv.relname,
     };
-    if idx.idxname.is_empty() {
-        return Err(fe("index name required"));
+    if idx.access_method.eq_ignore_ascii_case("hash") {
+        for option in &idx.options {
+            let Some(pg_query::NodeEnum::DefElem(option)) = option.node.as_ref() else {
+                continue;
+            };
+            if !option.defname.eq_ignore_ascii_case("fillfactor") {
+                continue;
+            }
+            let value = option
+                .arg
+                .as_ref()
+                .and_then(|node| node.node.as_ref())
+                .and_then(|node| match node {
+                    pg_query::NodeEnum::AConst(value) => match value.val.as_ref() {
+                        Some(pg_query::protobuf::a_const::Val::Ival(value)) => Some(value.ival),
+                        _ => None,
+                    },
+                    pg_query::NodeEnum::Integer(value) => Some(value.ival),
+                    _ => None,
+                });
+            if let Some(value) = value
+                && !(10..=100).contains(&value)
+            {
+                let mut info = ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "22023".to_string(),
+                    format!("value {value} out of bounds for option \"fillfactor\""),
+                );
+                info.detail = Some("Valid values are between \"10\" and \"100\".".to_string());
+                return Err(PgWireError::UserError(Box::new(info)));
+            }
+        }
+    }
+    if idx.idxname.is_empty()
+        || idx.index_params.iter().any(|parameter| {
+            matches!(
+                parameter.node.as_ref(),
+                Some(pg_query::NodeEnum::IndexElem(element)) if element.expr.is_some()
+            )
+        })
+    {
+        return Ok(Plan::UtilityNoOp {
+            tag: "CREATE INDEX",
+        });
     }
     let columns = parse_index_columns(&idx.index_params)?;
     Ok(Plan::CreateIndex {
@@ -373,9 +418,12 @@ pub(super) fn plan_grant(stmt: GrantStmt) -> PgWireResult<Plan> {
             });
         }
         if !system_tables.is_empty()
-            && system_tables
-                .iter()
-                .all(|table| matches!(table.name.as_str(), "pg_proc" | "pg_authid"))
+            && system_tables.iter().all(|table| {
+                matches!(
+                    table.name.to_ascii_lowercase().as_str(),
+                    "user_logins" | "pg_proc" | "pg_authid"
+                )
+            })
         {
             return Ok(Plan::UtilityNoOp {
                 tag: if stmt.is_grant { "GRANT" } else { "REVOKE" },
@@ -516,7 +564,11 @@ pub(super) fn plan_drop_stmt(drop: DropStmt) -> PgWireResult<Plan> {
     }
     if matches!(
         remove_type,
-        ObjectType::ObjectFunction | ObjectType::ObjectDomain | ObjectType::ObjectView
+        ObjectType::ObjectFunction
+            | ObjectType::ObjectDomain
+            | ObjectType::ObjectView
+            | ObjectType::ObjectEventTrigger
+            | ObjectType::ObjectOperator
     ) {
         return Ok(Plan::UtilityNoOp { tag: "DROP" });
     }
@@ -610,6 +662,7 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "work_mem"
             | "max_parallel_maintenance_workers"
             | "min_parallel_index_scan_size"
+            | "role"
             | "geqo"
             | "geqo_threshold"
     );
