@@ -251,7 +251,7 @@ while IFS= read -r test_name; do
 
   set +e
   if [ -n "$timeout_bin" ]; then
-    "$timeout_bin" "${test_timeout}s" "$psql_bin" \
+    "$timeout_bin" --kill-after=2s "${test_timeout}s" "$psql_bin" \
       -X -a -q -d regression \
       -v HIDE_TABLEAM=on \
       -v HIDE_TOAST_COMPRESSION=on \
@@ -312,7 +312,7 @@ while IFS= read -r test_name; do
     status=CRASHED
   elif ! "$psql_bin" -X -d postgres -Atqc 'select 1' </dev/null >/dev/null 2>&1; then
     status=CRASHED
-  elif [ "$psql_exit" -eq 124 ]; then
+  elif [ "$psql_exit" -eq 124 ] || [ "$psql_exit" -eq 137 ]; then
     status=TIMEOUT
   elif [ "$psql_exit" -ne 0 ]; then
     status=PSQL_FAIL
@@ -330,7 +330,7 @@ while IFS= read -r test_name; do
     sed -n "1,${diff_preview_lines}p" "$diff_file" >&2
   fi
 
-  if [ "$status" = "CRASHED" ] || [ "$status" = "TIMEOUT" ]; then
+  if [ "$status" = "CRASHED" ]; then
     aborted=yes
     break
   fi

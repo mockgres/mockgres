@@ -294,6 +294,8 @@ pub struct NestedLoopJoinExec {
     built: bool,
 }
 
+const MAX_NESTED_LOOP_CANDIDATES: usize = 1_000_000;
+
 impl NestedLoopJoinExec {
     pub fn new(
         schema: Schema,
@@ -339,6 +341,16 @@ impl NestedLoopJoinExec {
             right_rows.push(row);
         }
         right.close().await?;
+
+        let candidate_count = left_rows.len().saturating_mul(right_rows.len());
+        if candidate_count > MAX_NESTED_LOOP_CANDIDATES {
+            return Err(crate::engine::fe_code(
+                "54000",
+                format!(
+                    "nested-loop join would examine {candidate_count} row pairs; limit is {MAX_NESTED_LOOP_CANDIDATES}"
+                ),
+            ));
+        }
 
         let mut rows = Vec::new();
         match self.join_type {

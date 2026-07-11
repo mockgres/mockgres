@@ -164,11 +164,19 @@ async fn create_database_is_rejected_inside_transaction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn drop_and_alter_database_are_rejected() {
+async fn database_metadata_changes_are_accepted_for_regression_compatibility() {
     let ctx = common::start().await;
 
-    expect_feature_not_supported(&ctx.client, "drop database foo", "DROP DATABASE").await;
-    expect_feature_not_supported(&ctx.client, "alter database foo", "ALTER DATABASE").await;
+    for statement in [
+        "create database metadata_target",
+        "alter database metadata_target connection_limit 5",
+        "drop database metadata_target",
+    ] {
+        ctx.client
+            .execute(statement, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{statement}: {error}"));
+    }
 }
 
 async fn connect_client(addr: SocketAddr, database: &str) -> (Client, tokio::task::JoinHandle<()>) {
@@ -196,19 +204,4 @@ async fn first_cell(client: &Client, sql: &str) -> String {
             _ => None,
         })
         .expect("first cell")
-}
-
-async fn expect_feature_not_supported(client: &Client, sql: &str, snippet: &str) {
-    let err = client
-        .batch_execute(sql)
-        .await
-        .expect_err("statement should fail");
-    let db_err = err.as_db_error().expect("db error");
-    assert_eq!(db_err.code(), &SqlState::FEATURE_NOT_SUPPORTED);
-    assert!(
-        db_err.message().contains(snippet),
-        "message '{}' did not contain expected snippet '{}'",
-        db_err.message(),
-        snippet
-    );
 }

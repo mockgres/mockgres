@@ -644,12 +644,19 @@ fn try_plan_builtin_select(target: &pg_query::Node) -> PgWireResult<Option<Plan>
 }
 
 fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
+    let where_expr = sel
+        .where_clause
+        .as_ref()
+        .and_then(|node| node.node.as_ref())
+        .map(parse_bool_expr)
+        .transpose()?;
     let tl = sel.target_list;
     if tl.is_empty() {
         return Err(fe("at least one column required"));
     }
     // check for builtin single-target SELECTs
-    if tl.len() == 1
+    if where_expr.is_none()
+        && tl.len() == 1
         && let Some(plan) = try_plan_builtin_select(&tl[0])?
     {
         return Ok(plan);
@@ -673,10 +680,17 @@ fn plan_literal_select(sel: SelectStmt) -> PgWireResult<Plan> {
         };
         out_exprs.push((expr, name));
     }
-    let input = Plan::Values {
+    let mut input = Plan::Values {
         rows: vec![vec![]],
         schema: Schema { fields: vec![] },
     };
+    if let Some(expr) = where_expr {
+        input = Plan::Filter {
+            input: Box::new(input),
+            expr,
+            project_prefix_len: None,
+        };
+    }
     Ok(Plan::Projection {
         input: Box::new(input),
         exprs: out_exprs,

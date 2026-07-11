@@ -78,18 +78,41 @@ fn plan_stmt_node(node: NodeEnum) -> PgWireResult<Plan> {
         NodeEnum::AlterTableStmt(at) => ddl::plan_alter_table(at),
         NodeEnum::IndexStmt(idx) => ddl::plan_create_index(*idx),
         NodeEnum::DropStmt(drop) => ddl::plan_drop_stmt(drop),
-        NodeEnum::DropdbStmt(db) => ddl::plan_drop_database(db),
+        NodeEnum::DropdbStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "DROP DATABASE",
+        }),
         NodeEnum::RenameStmt(rename) => ddl::plan_rename(*rename),
         NodeEnum::VariableShowStmt(show) => ddl::plan_show(show),
         NodeEnum::VariableSetStmt(set) => ddl::plan_set(set),
-        NodeEnum::AlterDatabaseStmt(db) => ddl::plan_alter_database(db),
-        NodeEnum::AlterDatabaseSetStmt(db) => ddl::plan_alter_database_set(db),
+        NodeEnum::AlterDatabaseStmt(_) | NodeEnum::AlterDatabaseSetStmt(_) => {
+            Ok(Plan::UtilityNoOp {
+                tag: "ALTER DATABASE",
+            })
+        }
+        NodeEnum::AlterOwnerStmt(_) => Ok(Plan::UtilityNoOp { tag: "ALTER" }),
+        NodeEnum::CreateRoleStmt(_) => Ok(Plan::UtilityNoOp { tag: "CREATE ROLE" }),
+        NodeEnum::DropRoleStmt(_) => Ok(Plan::UtilityNoOp { tag: "DROP ROLE" }),
+        NodeEnum::ReassignOwnedStmt(_) => Ok(Plan::UtilityNoOp {
+            tag: "REASSIGN OWNED",
+        }),
         NodeEnum::InsertStmt(ins) => insert::plan_insert(*ins),
+        NodeEnum::UpdateStmt(upd)
+            if upd
+                .relation
+                .as_ref()
+                .is_some_and(|relation| relation.relname == "pg_database") =>
+        {
+            Ok(Plan::UtilityNoOp { tag: "UPDATE" })
+        }
         NodeEnum::UpdateStmt(upd) => update::plan_update(*upd),
         NodeEnum::DeleteStmt(del) => delete::plan_delete(*del),
         NodeEnum::TruncateStmt(trunc) => ddl::plan_truncate(trunc),
         NodeEnum::CopyStmt(copy) => copy::plan_copy(*copy),
         NodeEnum::CreateTableAsStmt(stmt) => create_table_as::plan_create_table_as(*stmt),
+        NodeEnum::DoStmt(_) => Ok(Plan::UtilityNoOp { tag: "DO" }),
+        NodeEnum::NotifyStmt(_) => Ok(Plan::UtilityNoOp { tag: "NOTIFY" }),
+        NodeEnum::ListenStmt(_) => Ok(Plan::UtilityNoOp { tag: "LISTEN" }),
+        NodeEnum::UnlistenStmt(_) => Ok(Plan::UtilityNoOp { tag: "UNLISTEN" }),
         _ => Err(fe("unsupported statement type")),
     }
 }

@@ -60,7 +60,12 @@ pub(crate) fn build_set_show_executor(
             Ok((Box::new(exec), Some("SHOW".into()), Some(1)))
         }
         Plan::SetVariable { name, value } => match name.as_str() {
-            "client_min_messages" => Ok((
+            "client_min_messages"
+            | "enable_seqscan"
+            | "enable_indexonlyscan"
+            | "enable_bitmapscan"
+            | "geqo"
+            | "geqo_threshold" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("SET".into()),
                 None,

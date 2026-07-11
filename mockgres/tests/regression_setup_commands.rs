@@ -224,3 +224,58 @@ async fn vacuum_and_analyze_validate_relations_and_transaction_context() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn planner_settings_and_storage_introspection_are_accepted_as_noops() {
+    let ctx = common::start().await;
+
+    ctx.client.execute("begin", &[]).await.expect("begin");
+
+    for setting in [
+        "set local enable_seqscan = false",
+        "set local enable_indexonlyscan = false",
+        "set local enable_bitmapscan = false",
+        "set geqo = on",
+        "set geqo_threshold = 2",
+    ] {
+        ctx.client
+            .execute(setting, &[])
+            .await
+            .unwrap_or_else(|error| panic!("{setting} failed: {error:?}"));
+    }
+    ctx.client.execute("rollback", &[]).await.expect("rollback");
+
+    let row = ctx
+        .client
+        .query_one("select pg_relation_size('mock_index')", &[])
+        .await
+        .expect("query no-op relation size");
+    assert_eq!(row.get::<_, i64>(0), 0);
+    let row = ctx
+        .client
+        .query_one(
+            "select current_setting('max_prepared_transactions'), pg_numa_available(), getdatabaseencoding(), pg_char_to_encoding('UTF8'), 'Linux-GNU' ~* 'linux-gnu'",
+            &[],
+        )
+        .await
+        .expect("query compatibility settings");
+    assert_eq!(row.get::<_, &str>(0), "0");
+    assert!(!row.get::<_, bool>(1));
+    assert_eq!(row.get::<_, &str>(2), "UTF8");
+    assert_eq!(row.get::<_, i32>(3), 6);
+    assert!(row.get::<_, bool>(4));
+    assert!(
+        ctx.client
+            .query("select 1 where 0 != pg_relation_size('mock_index')", &[])
+            .await
+            .expect("filter a SELECT without FROM")
+            .is_empty()
+    );
+
+    ctx.client
+        .execute("do $$ begin null; end $$", &[])
+        .await
+        .expect("execute procedural no-op");
+
+    let _ = ctx.shutdown.send(());
+}

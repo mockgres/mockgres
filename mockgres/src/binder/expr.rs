@@ -616,6 +616,14 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::CurrentSchemas => Some(DataType::Text),
             ScalarFunc::PgTableIsVisible => Some(DataType::Bool),
             ScalarFunc::Version => Some(DataType::Text),
+            ScalarFunc::CurrentSetting => Some(DataType::Text),
+            ScalarFunc::PgNumaAvailable => Some(DataType::Bool),
+            ScalarFunc::GetDatabaseEncoding => Some(DataType::Text),
+            ScalarFunc::PgCharToEncoding => Some(DataType::Int4),
+            ScalarFunc::PgNotify => Some(DataType::Void),
+            ScalarFunc::PgNotificationQueueUsage => Some(DataType::Float8),
+            ScalarFunc::Md5 => Some(DataType::Text),
+            ScalarFunc::PgRelationSize => Some(DataType::Int8),
             ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::Now
             | ScalarFunc::CurrentTimestamp

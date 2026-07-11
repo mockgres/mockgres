@@ -671,6 +671,12 @@ impl Db {
         search_path: &[SchemaId],
         name: &str,
     ) -> anyhow::Result<&TableMeta> {
+        if let Some(pg_catalog_id) = self.catalog.schema_id("pg_catalog")
+            && !search_path.contains(&pg_catalog_id)
+            && let Some(table) = self.catalog.get_table("pg_catalog", name)
+        {
+            return Ok(table);
+        }
         for schema_id in search_path {
             if let Some(schema_name) = self.catalog.schema_name(*schema_id)
                 && let Some(table) = self.catalog.get_table(schema_name.as_str(), name)

@@ -53,6 +53,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
     match plan {
         Plan::With { body, .. } => command_tag(body),
         Plan::Empty => "EMPTY",
+        Plan::UtilityNoOp { tag } => tag,
         Plan::Values { .. }
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
@@ -146,6 +147,14 @@ pub fn build_executor(
             ctx,
         ),
         Plan::Empty => Err(fe("empty query")),
+        Plan::UtilityNoOp { tag } => Ok((
+            Box::new(crate::engine::ValuesExec::new(
+                crate::engine::Schema { fields: vec![] },
+                vec![],
+            )?),
+            Some((*tag).to_string()),
+            None,
+        )),
         Plan::Values { .. }
         | Plan::Projection { .. }
         | Plan::WindowRowNumber { .. }

@@ -221,29 +221,37 @@ fn eval_binary_op(op: ScalarBinaryOp, left: Value, right: Value) -> PgWireResult
         match (&left, &right) {
             (Value::TimestamptzMicros(l), Value::IntervalMicros(r)) => {
                 let res = if matches!(op, ScalarBinaryOp::Add) {
-                    l + r
+                    l.checked_add(*r)
                 } else {
-                    l - r
-                };
+                    l.checked_sub(*r)
+                }
+                .ok_or_else(|| fe_code("22008", "timestamp out of range"))?;
                 return Ok(Value::TimestamptzMicros(res));
             }
             (Value::IntervalMicros(l), Value::TimestamptzMicros(r))
                 if matches!(op, ScalarBinaryOp::Add) =>
             {
-                return Ok(Value::TimestamptzMicros(l + r));
+                let res = l
+                    .checked_add(*r)
+                    .ok_or_else(|| fe_code("22008", "timestamp out of range"))?;
+                return Ok(Value::TimestamptzMicros(res));
             }
             (Value::IntervalMicros(l), Value::IntervalMicros(r)) => {
                 let res = if matches!(op, ScalarBinaryOp::Add) {
-                    l + r
+                    l.checked_add(*r)
                 } else {
-                    l - r
-                };
+                    l.checked_sub(*r)
+                }
+                .ok_or_else(|| fe_code("22015", "interval out of range"))?;
                 return Ok(Value::IntervalMicros(res));
             }
             (Value::TimestamptzMicros(l), Value::TimestamptzMicros(r))
                 if matches!(op, ScalarBinaryOp::Sub) =>
             {
-                return Ok(Value::IntervalMicros(l - r));
+                let res = l
+                    .checked_sub(*r)
+                    .ok_or_else(|| fe_code("22015", "interval out of range"))?;
+                return Ok(Value::IntervalMicros(res));
             }
             _ => {}
         }
@@ -322,7 +330,10 @@ fn eval_unary_op(op: ScalarUnaryOp, value: Value) -> PgWireResult<Value> {
                 let f = f64::from_bits(bits);
                 Ok(Value::from_f64(-f))
             }
-            Value::IntervalMicros(v) => Ok(Value::IntervalMicros(-v)),
+            Value::IntervalMicros(v) => v
+                .checked_neg()
+                .map(Value::IntervalMicros)
+                .ok_or_else(|| fe_code("22015", "interval out of range")),
             other => Err(fe(format!("cannot negate value {:?}", other))),
         },
     }
@@ -371,6 +382,64 @@ fn eval_function(
         ScalarFunc::Version => {
             ensure_no_args(&func, &args)?;
             Ok(Value::Text(crate::server::mapping::server_version_string()))
+        }
+        ScalarFunc::CurrentSetting => match args.as_slice() {
+            [Value::Text(name)] => {
+                let value = match name.as_str() {
+                    "max_prepared_transactions" => "0",
+                    other => {
+                        return Err(fe_code(
+                            "42704",
+                            format!("unrecognized configuration parameter \"{other}\""),
+                        ));
+                    }
+                };
+                Ok(Value::Text(value.to_string()))
+            }
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("current_setting() requires one text argument")),
+        },
+        ScalarFunc::PgNumaAvailable => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::Bool(false))
+        }
+        ScalarFunc::GetDatabaseEncoding => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::Text("UTF8".to_string()))
+        }
+        ScalarFunc::PgCharToEncoding => match args.as_slice() {
+            [Value::Text(name)] => Ok(Value::Int64(match name.to_ascii_uppercase().as_str() {
+                "UTF8" | "UTF-8" => 6,
+                "WIN1252" => 24,
+                _ => -1,
+            })),
+            [Value::Null] => Ok(Value::Null),
+            _ => Err(fe("pg_char_to_encoding() requires one text argument")),
+        },
+        ScalarFunc::PgNotify => match args.as_slice() {
+            [Value::Text(channel), Value::Text(_) | Value::Null] => {
+                if channel.is_empty() {
+                    Err(fe_code("22023", "channel name cannot be empty"))
+                } else if channel.len() > 63 {
+                    Err(fe_code("22023", "channel name too long"))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            [Value::Null, _] => Err(fe_code("22023", "channel name cannot be empty")),
+            _ => Err(fe("pg_notify() requires text arguments")),
+        },
+        ScalarFunc::PgNotificationQueueUsage => {
+            ensure_no_args(&func, &args)?;
+            Ok(Value::from_f64(0.0))
+        }
+        ScalarFunc::Md5 => Err(fe("could not compute MD5 hash: unsupported")),
+        ScalarFunc::PgRelationSize => {
+            if args.len() != 1 {
+                return Err(fe("pg_relation_size() requires one argument"));
+            }
+            // Mockgres indexes and physical storage are intentionally no-ops.
+            Ok(Value::Int64(0))
         }
         ScalarFunc::Now | ScalarFunc::CurrentTimestamp | ScalarFunc::StatementTimestamp => {
             ensure_no_args(&func, &args)?;
@@ -682,15 +751,49 @@ pub fn eval_bool_expr(
         BoolExpr::Comparison { lhs, op, rhs } => {
             let lv = eval_scalar_expr(row, lhs, params, ctx)?;
             let rv = eval_scalar_expr(row, rhs, params, ctx)?;
-            let ord = compare_values(&lv, &rv);
-            ord.map(|o| match op {
-                CmpOp::Eq => o == Ordering::Equal,
-                CmpOp::Neq => o != Ordering::Equal,
-                CmpOp::Lt => o == Ordering::Less,
-                CmpOp::Lte => o != Ordering::Greater,
-                CmpOp::Gt => o == Ordering::Greater,
-                CmpOp::Gte => o != Ordering::Less,
-            })
+            if matches!(
+                op,
+                CmpOp::Regex
+                    | CmpOp::NotRegex
+                    | CmpOp::RegexInsensitive
+                    | CmpOp::NotRegexInsensitive
+            ) {
+                match (lv, rv) {
+                    (Value::Null, _) | (_, Value::Null) => None,
+                    (Value::Text(value), Value::Text(pattern)) => {
+                        let regex = regex::RegexBuilder::new(&pattern)
+                            .case_insensitive(matches!(
+                                op,
+                                CmpOp::RegexInsensitive | CmpOp::NotRegexInsensitive
+                            ))
+                            .build()
+                            .map_err(|error| fe_code("2201B", error.to_string()))?;
+                        let matched = regex.is_match(&value);
+                        Some(
+                            if matches!(op, CmpOp::NotRegex | CmpOp::NotRegexInsensitive) {
+                                !matched
+                            } else {
+                                matched
+                            },
+                        )
+                    }
+                    _ => return Err(fe("regular expression operators require text operands")),
+                }
+            } else {
+                let ord = compare_values(&lv, &rv);
+                ord.map(|o| match op {
+                    CmpOp::Eq => o == Ordering::Equal,
+                    CmpOp::Neq => o != Ordering::Equal,
+                    CmpOp::Lt => o == Ordering::Less,
+                    CmpOp::Lte => o != Ordering::Greater,
+                    CmpOp::Gt => o == Ordering::Greater,
+                    CmpOp::Gte => o != Ordering::Less,
+                    CmpOp::Regex
+                    | CmpOp::NotRegex
+                    | CmpOp::RegexInsensitive
+                    | CmpOp::NotRegexInsensitive => unreachable!(),
+                })
+            }
         }
         BoolExpr::And(exprs) => {
             let mut saw_null = false;
@@ -1086,6 +1189,24 @@ mod tests {
             expr: Box::new(lit_float(1.5)),
         };
         assert_eq!(eval(&negate).as_f64().unwrap(), -1.5);
+    }
+
+    #[test]
+    fn interval_arithmetic_overflow_returns_an_error_instead_of_panicking() {
+        assert!(format_interval_micros(i64::MIN).starts_with('-'));
+
+        let negate_min = ScalarExpr::UnaryOp {
+            op: ScalarUnaryOp::Negate,
+            expr: Box::new(ScalarExpr::Literal(Value::IntervalMicros(i64::MIN))),
+        };
+        assert!(eval_scalar_expr(&[], &negate_min, &[], &EvalContext::default()).is_err());
+
+        let add_overflow = ScalarExpr::BinaryOp {
+            op: ScalarBinaryOp::Add,
+            left: Box::new(ScalarExpr::Literal(Value::IntervalMicros(i64::MAX))),
+            right: Box::new(ScalarExpr::Literal(Value::IntervalMicros(1))),
+        };
+        assert!(eval_scalar_expr(&[], &add_overflow, &[], &EvalContext::default()).is_err());
     }
 
     #[test]

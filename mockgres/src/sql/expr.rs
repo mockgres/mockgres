@@ -257,7 +257,8 @@ fn parse_scalar_subselect(
         || sel.limit_offset.is_some()
         || !sel.locking_clause.is_empty()
     {
-        return Err(fe("unsupported scalar subquery"));
+        let plan = super::dml::plan_select(sel.clone())?;
+        return Ok(ScalarExpr::Subquery(Box::new(plan)));
     }
     if sel.target_list.len() != 1 {
         return Err(fe("scalar subquery must select exactly one column"));
@@ -790,6 +791,14 @@ fn parse_function_call(
         "log" => ScalarFunc::Log,
         "greatest" => ScalarFunc::Greatest,
         "version" => ScalarFunc::Version,
+        "current_setting" => ScalarFunc::CurrentSetting,
+        "pg_numa_available" => ScalarFunc::PgNumaAvailable,
+        "getdatabaseencoding" => ScalarFunc::GetDatabaseEncoding,
+        "pg_char_to_encoding" => ScalarFunc::PgCharToEncoding,
+        "pg_notify" => ScalarFunc::PgNotify,
+        "pg_notification_queue_usage" => ScalarFunc::PgNotificationQueueUsage,
+        "md5" => ScalarFunc::Md5,
+        "pg_relation_size" => ScalarFunc::PgRelationSize,
         "pg_table_is_visible" => ScalarFunc::PgTableIsVisible,
         "pg_advisory_lock" => ScalarFunc::PgAdvisoryLock,
         "pg_advisory_unlock" => ScalarFunc::PgAdvisoryUnlock,
@@ -831,14 +840,27 @@ fn parse_function_call(
                 return Err(fe("greatest() requires at least two arguments"));
             }
         }
-        ScalarFunc::PgTableIsVisible => {
+        ScalarFunc::PgTableIsVisible
+        | ScalarFunc::PgRelationSize
+        | ScalarFunc::CurrentSetting
+        | ScalarFunc::PgCharToEncoding => {
             if args.len() != 1 {
-                return Err(fe("pg_table_is_visible(oid) requires one argument"));
+                return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::Md5 => {
+            if args.len() != 1 {
+                return Err(fe("md5() requires one argument"));
             }
         }
         ScalarFunc::PgAdvisoryLock | ScalarFunc::PgAdvisoryUnlock => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::PgNotify => {
+            if args.len() != 2 {
+                return Err(fe("pg_notify() requires two arguments"));
             }
         }
         ScalarFunc::Now
@@ -847,7 +869,10 @@ fn parse_function_call(
         | ScalarFunc::TransactionTimestamp
         | ScalarFunc::ClockTimestamp
         | ScalarFunc::CurrentDate
-        | ScalarFunc::Version => {
+        | ScalarFunc::Version
+        | ScalarFunc::PgNumaAvailable
+        | ScalarFunc::GetDatabaseEncoding
+        | ScalarFunc::PgNotificationQueueUsage => {
             if !args.is_empty() {
                 return Err(fe("function takes no arguments"));
             }
@@ -956,7 +981,39 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::BinaryOp { .. } => "?column?".into(),
         ScalarExpr::UnaryOp { .. } => "?column?".into(),
         ScalarExpr::Cast { expr, .. } => derive_expr_name(expr),
-        ScalarExpr::Func { .. } => "?column?".into(),
+        ScalarExpr::Func { func, .. } => match func {
+            ScalarFunc::Coalesce => "coalesce",
+            ScalarFunc::Upper => "upper",
+            ScalarFunc::Lower => "lower",
+            ScalarFunc::Length => "length",
+            ScalarFunc::CurrentSchema => "current_schema",
+            ScalarFunc::CurrentSchemas => "current_schemas",
+            ScalarFunc::CurrentDatabase => "current_database",
+            ScalarFunc::Now => "now",
+            ScalarFunc::CurrentTimestamp => "current_timestamp",
+            ScalarFunc::StatementTimestamp => "statement_timestamp",
+            ScalarFunc::TransactionTimestamp => "transaction_timestamp",
+            ScalarFunc::ClockTimestamp => "clock_timestamp",
+            ScalarFunc::CurrentDate => "current_date",
+            ScalarFunc::Abs => "abs",
+            ScalarFunc::Ln => "ln",
+            ScalarFunc::Log => "log",
+            ScalarFunc::Greatest => "greatest",
+            ScalarFunc::ExtractEpoch => "extract",
+            ScalarFunc::Version => "version",
+            ScalarFunc::CurrentSetting => "current_setting",
+            ScalarFunc::PgNumaAvailable => "pg_numa_available",
+            ScalarFunc::GetDatabaseEncoding => "getdatabaseencoding",
+            ScalarFunc::PgCharToEncoding => "pg_char_to_encoding",
+            ScalarFunc::PgNotify => "pg_notify",
+            ScalarFunc::PgNotificationQueueUsage => "pg_notification_queue_usage",
+            ScalarFunc::Md5 => "md5",
+            ScalarFunc::PgRelationSize => "pg_relation_size",
+            ScalarFunc::PgTableIsVisible => "pg_table_is_visible",
+            ScalarFunc::PgAdvisoryLock => "pg_advisory_lock",
+            ScalarFunc::PgAdvisoryUnlock => "pg_advisory_unlock",
+        }
+        .into(),
         ScalarExpr::WindowRowNumber(_) => "row_number".into(),
         ScalarExpr::Predicate(_) | ScalarExpr::Subquery(_) => "?column?".into(),
         ScalarExpr::Case { .. } => "?column?".into(),
@@ -999,6 +1056,10 @@ fn parse_cmp_op(nodes: &[Node]) -> PgWireResult<CmpOp> {
                 "<=" => CmpOp::Lte,
                 ">" => CmpOp::Gt,
                 ">=" => CmpOp::Gte,
+                "~" => CmpOp::Regex,
+                "!~" => CmpOp::NotRegex,
+                "~*" => CmpOp::RegexInsensitive,
+                "!~*" => CmpOp::NotRegexInsensitive,
                 other => return Err(fe(format!("unsupported where operator: {other}"))),
             });
         }

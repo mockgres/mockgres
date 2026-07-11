@@ -226,6 +226,7 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::Empty
+        | Plan::UtilityNoOp { .. }
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }
@@ -504,6 +505,7 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             }
         }
         Plan::Empty
+        | Plan::UtilityNoOp { .. }
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::UnboundSeqScan { .. }

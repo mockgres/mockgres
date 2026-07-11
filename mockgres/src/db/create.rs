@@ -87,6 +87,54 @@ impl Db {
         init_pg_type(self);
         let _ = self
             .create_table(
+                "pg_catalog",
+                "pg_collation",
+                vec![
+                    ("collname".to_string(), DataType::Name, false, None, None),
+                    (
+                        "collprovider".to_string(),
+                        DataType::Text,
+                        false,
+                        None,
+                        None,
+                    ),
+                    (
+                        "collencoding".to_string(),
+                        DataType::Int4,
+                        false,
+                        None,
+                        None,
+                    ),
+                ],
+                None,
+                Vec::new(),
+                &[],
+            )
+            .expect("create pg_catalog.pg_collation");
+        let _ = self
+            .create_table(
+                "pg_catalog",
+                "pg_init_privs",
+                vec![("privtype".to_string(), DataType::Text, false, None, None)],
+                None,
+                Vec::new(),
+                &[],
+            )
+            .expect("create pg_catalog.pg_init_privs");
+        let ctx = EvalContext::new(SessionTimeZone::Utc);
+        self.insert_full_rows(
+            "pg_catalog",
+            "pg_init_privs",
+            vec![vec![super::CellInput::Value(Value::Text("i".to_string()))]],
+            false,
+            SYSTEM_TXID,
+            &[],
+            &ctx,
+            None,
+        )
+        .expect("seed pg_catalog.pg_init_privs");
+        let _ = self
+            .create_table(
                 "information_schema",
                 "tables",
                 vec![

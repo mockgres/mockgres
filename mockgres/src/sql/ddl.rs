@@ -4,11 +4,10 @@ use crate::engine::{
     UniqueSpec, fe, fe_code,
 };
 use pg_query::protobuf::{
-    AlterDatabaseSetStmt, AlterDatabaseStmt, AlterTableStmt, AlterTableType, Constraint,
-    CreateSchemaStmt, CreateStmt, CreateTableSpaceStmt, CreatedbStmt, DropBehavior, DropStmt,
-    DropTableSpaceStmt, DropdbStmt, GrantStmt, GrantTargetType, IndexStmt, ObjectType, RangeVar,
-    RenameStmt, TransactionStmt, TruncateStmt, VacuumStmt, VariableSetKind, VariableSetStmt,
-    VariableShowStmt,
+    AlterTableStmt, AlterTableType, Constraint, CreateSchemaStmt, CreateStmt, CreateTableSpaceStmt,
+    CreatedbStmt, DropBehavior, DropStmt, DropTableSpaceStmt, GrantStmt, GrantTargetType,
+    IndexStmt, ObjectType, RangeVar, RenameStmt, TransactionStmt, TruncateStmt, VacuumStmt,
+    VariableSetKind, VariableSetStmt, VariableShowStmt,
 };
 use pgwire::error::PgWireResult;
 
@@ -360,6 +359,28 @@ pub(super) fn plan_grant(stmt: GrantStmt) -> PgWireResult<Plan> {
         GrantTargetType::try_from(stmt.targtype).map_err(|_| fe("unknown GRANT target type"))?;
     let object_type =
         ObjectType::try_from(stmt.objtype).map_err(|_| fe("unknown GRANT object type"))?;
+    if target == GrantTargetType::AclTargetObject && object_type == ObjectType::ObjectTable {
+        let mut system_tables = Vec::with_capacity(stmt.objects.len());
+        for object in &stmt.objects {
+            let node = object
+                .node
+                .as_ref()
+                .ok_or_else(|| fe("invalid table name in GRANT or REVOKE"))?;
+            system_tables.push(match node {
+                pg_query::NodeEnum::RangeVar(table) => range_var_to_obj_name(table),
+                _ => parse_obj_name_from_list(node)?,
+            });
+        }
+        if !system_tables.is_empty()
+            && system_tables
+                .iter()
+                .all(|table| matches!(table.name.as_str(), "pg_proc" | "pg_authid"))
+        {
+            return Ok(Plan::UtilityNoOp {
+                tag: if stmt.is_grant { "GRANT" } else { "REVOKE" },
+            });
+        }
+    }
     if target != GrantTargetType::AclTargetObject || object_type != ObjectType::ObjectSchema {
         return Err(fe_code(
             "0A000",
@@ -423,21 +444,6 @@ pub(super) fn plan_vacuum(stmt: VacuumStmt) -> PgWireResult<Plan> {
 pub(super) fn plan_create_database(stmt: CreatedbStmt) -> PgWireResult<Plan> {
     let name = require_database_name(&stmt.dbname)?;
     Ok(Plan::CreateDatabase { name })
-}
-
-pub(super) fn plan_drop_database(stmt: DropdbStmt) -> PgWireResult<Plan> {
-    let name = require_database_name(&stmt.dbname)?;
-    Ok(Plan::DropDatabase { name })
-}
-
-pub(super) fn plan_alter_database(stmt: AlterDatabaseStmt) -> PgWireResult<Plan> {
-    let name = require_database_name(&stmt.dbname)?;
-    Ok(Plan::AlterDatabase { name })
-}
-
-pub(super) fn plan_alter_database_set(stmt: AlterDatabaseSetStmt) -> PgWireResult<Plan> {
-    let name = require_database_name(&stmt.dbname)?;
-    Ok(Plan::AlterDatabase { name })
 }
 
 fn require_database_name(name: &str) -> PgWireResult<String> {
@@ -535,6 +541,11 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "lock_timeout"
             | "transaction_isolation"
             | "default_transaction_isolation"
+            | "enable_seqscan"
+            | "enable_indexonlyscan"
+            | "enable_bitmapscan"
+            | "geqo"
+            | "geqo_threshold"
     );
     if !supported {
         return Err(fe_code("0A000", format!("SET {} not supported", set.name)));
@@ -592,6 +603,9 @@ pub(super) fn plan_rename(stmt: RenameStmt) -> PgWireResult<Plan> {
                 new_name: stmt.newname,
             })
         }
+        ObjectType::ObjectDatabase => Ok(Plan::UtilityNoOp {
+            tag: "ALTER DATABASE",
+        }),
         _ => Err(fe("only ALTER SCHEMA/TABLE ... RENAME TO is supported")),
     }
 }

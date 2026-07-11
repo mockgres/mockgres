@@ -10,6 +10,10 @@ pub enum CmpOp {
     Lte,
     Gt,
     Gte,
+    Regex,
+    NotRegex,
+    RegexInsensitive,
+    NotRegexInsensitive,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +171,14 @@ pub enum ScalarFunc {
     Greatest,
     ExtractEpoch,
     Version,
+    CurrentSetting,
+    PgNumaAvailable,
+    GetDatabaseEncoding,
+    PgCharToEncoding,
+    PgNotify,
+    PgNotificationQueueUsage,
+    Md5,
+    PgRelationSize,
     PgTableIsVisible,
     PgAdvisoryLock,
     PgAdvisoryUnlock,
@@ -329,6 +341,9 @@ pub type ColumnSpec = (
 #[derive(Clone, Debug)]
 pub enum Plan {
     Empty,
+    UtilityNoOp {
+        tag: &'static str,
+    },
     With {
         ctes: Vec<CommonTableExprPlan>,
         body: Box<Plan>,
@@ -621,7 +636,7 @@ pub enum CountExpr {
 impl Plan {
     pub fn schema(&self) -> &Schema {
         match self {
-            Plan::Empty => {
+            Plan::Empty | Plan::UtilityNoOp { .. } => {
                 static EMPTY: Schema = Schema { fields: vec![] };
                 &EMPTY
             }

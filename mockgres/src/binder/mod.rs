@@ -238,6 +238,11 @@ fn bind_with_search_path(
             selection,
             lock,
         } => {
+            if table.name == "pg_shmem_allocations_numa" {
+                return Err(fe(
+                    "libnuma initialization failed or NUMA is not supported on this platform",
+                ));
+            }
             if table.schema.is_none()
                 && let Some(cte) = cte_scope.get(&table.name)
             {

@@ -777,7 +777,7 @@ pub fn parse_interval_literal(input: &str) -> Result<i64, String> {
 
 pub fn format_interval_micros(micros: i64) -> String {
     let sign = if micros < 0 { "-" } else { "" };
-    let mut remaining = micros.abs();
+    let mut remaining = micros.unsigned_abs();
     let days = remaining / 86_400_000_000;
     remaining -= days * 86_400_000_000;
     let hours = remaining / 3_600_000_000;

@@ -16,7 +16,7 @@ use crate::txn::{TransactionManager, TxId, VisibilityContext};
 use super::locks::wrap_with_lock_apply;
 pub(crate) mod subquery;
 use crate::server::exec_builder::{assert_supported_aggs, build_executor, schema_or_public};
-use subquery::materialize_in_subqueries;
+use subquery::{materialize_in_subqueries, materialize_scalar_subqueries};
 
 type ExecResult = PgWireResult<(Box<dyn ExecNode>, Option<String>, Option<usize>)>;
 
@@ -57,11 +57,28 @@ pub fn build_read_executor(
                 params.clone(),
                 ctx,
             )?;
+            let materialized_exprs = exprs
+                .iter()
+                .map(|(expr, name)| {
+                    Ok((
+                        materialize_scalar_subqueries(
+                            expr,
+                            db,
+                            txn_manager,
+                            session,
+                            snapshot_xid,
+                            params.clone(),
+                            ctx,
+                        )?,
+                        name.clone(),
+                    ))
+                })
+                .collect::<PgWireResult<Vec<_>>>()?;
             Ok((
                 Box::new(ProjectExec::new(
                     schema.clone(),
                     child,
-                    exprs.clone(),
+                    materialized_exprs,
                     params.clone(),
                     ctx.clone(),
                 )),
