@@ -3,6 +3,11 @@ use super::*;
 mod catalog;
 mod regression;
 mod regression_cursor;
+mod regression_dependency;
+mod regression_encoding;
+mod regression_plancache;
+mod regression_prepare;
+mod regression_role;
 
 impl Mockgres {
     pub(super) async fn execute_builtin_statement(
@@ -33,6 +38,36 @@ impl Mockgres {
         let Plan::CallBuiltin { name, schema, .. } = plan else {
             return Ok(None);
         };
+
+        if let Some(response) = self
+            .execute_regression_dependency_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+
+        if let Some(response) = self
+            .execute_regression_encoding_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+        if let Some(response) = self
+            .execute_regression_plancache_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+        if let Some(response) = self
+            .execute_regression_prepare_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+
+        if let Some(response) = self.execute_regression_role_builtin(session, name).await? {
+            return Ok(Some(response));
+        }
 
         if let Some(response) = self
             .execute_regression_builtin(session, name, schema, format)

@@ -110,7 +110,7 @@ impl Mockgres {
                 .split_once(':')
                 .ok_or_else(|| fe("invalid positioned regression error"))?;
             let (message, hint) = rest
-                .split_once('|')
+                .rsplit_once('|')
                 .ok_or_else(|| fe("invalid positioned regression hint"))?;
             let mut info = ErrorInfo::new(
                 "ERROR".to_string(),

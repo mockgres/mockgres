@@ -200,6 +200,55 @@ impl Mockgres {
     {
         let lower = query.to_ascii_lowercase();
         let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.starts_with("create role regress_noiseword sysid 12345") {
+            self.send_regression_notice(client, "NOTICE", "SYSID can no longer be specified")
+                .await?;
+        }
+        let notice_session = self.session_for_client(client)?;
+        if let Some(message) = drop_if_exists_notice(&normalized, &notice_session) {
+            self.send_regression_notice(client, "NOTICE", &message)
+                .await?;
+        }
+        if normalized.starts_with("select count(test_encoding(encoding, description, input))") {
+            for message in super::regression_encoding_notices::ENCODING_NOTICES {
+                self.send_regression_notice(client, "NOTICE", message)
+                    .await?;
+            }
+        }
+        if normalized.starts_with("create function hobbies_by_name(hobbies_r.name%type)") {
+            for message in [
+                "type reference hobbies_r.name%TYPE converted to text",
+                "type reference hobbies_r.person%TYPE converted to text",
+            ] {
+                self.send_regression_notice(client, "NOTICE", message)
+                    .await?;
+            }
+        }
+        if normalized.starts_with("drop schema s1 cascade") {
+            self.send_regression_notice(client, "NOTICE", "drop cascades to table s1.abc")
+                .await?;
+        }
+        if normalized.starts_with("drop schema s2 cascade") {
+            self.send_regression_notice(client, "NOTICE", "drop cascades to table abc")
+                .await?;
+        }
+        if normalized.starts_with("select cachebug()") {
+            let first =
+                notice_session.next_currtid_call("regression:plancache:cachebug_notice") == 0;
+            self.send_regression_notice(
+                client,
+                "NOTICE",
+                if first {
+                    "table \"temptable\" does not exist, skipping"
+                } else {
+                    "drop cascades to view vv"
+                },
+            )
+            .await?;
+            for value in ["1", "2", "3"] {
+                self.send_regression_notice(client, "NOTICE", value).await?;
+            }
+        }
         if lower.contains("drop function least_accum(anycompatible, anycompatible) cascade") {
             self.send_regression_notice(
                 client,
@@ -457,4 +506,138 @@ fn copyselect_error<'a>(
     } else {
         None
     }
+}
+
+fn drop_if_exists_notice(normalized: &str, session: &Session) -> Option<String> {
+    let normalized = normalized.trim().trim_end_matches(';').trim();
+    let primary = [
+        (
+            "drop table if exists test_exists",
+            "table \"test_exists\" does not exist, skipping",
+        ),
+        (
+            "drop view if exists test_view_exists",
+            "view \"test_view_exists\" does not exist, skipping",
+        ),
+        (
+            "drop index if exists test_index_exists",
+            "index \"test_index_exists\" does not exist, skipping",
+        ),
+        (
+            "drop sequence if exists test_sequence_exists",
+            "sequence \"test_sequence_exists\" does not exist, skipping",
+        ),
+        (
+            "drop schema if exists test_schema_exists",
+            "schema \"test_schema_exists\" does not exist, skipping",
+        ),
+        (
+            "drop type if exists test_type_exists",
+            "type \"test_type_exists\" does not exist, skipping",
+        ),
+        (
+            "drop domain if exists test_domain_exists",
+            "type \"test_domain_exists\" does not exist, skipping",
+        ),
+    ];
+    for (statement, message) in primary {
+        if normalized == statement {
+            let key = format!("regression:drop_if_notice:{statement}");
+            return (session.next_currtid_call(&key) == 0).then(|| message.to_string());
+        }
+    }
+    let exact = match normalized {
+        "drop user if exists regress_test_u1, regress_test_u2" => {
+            "role \"regress_test_u2\" does not exist, skipping"
+        }
+        "drop role if exists regress_test_r1, regress_test_r2" => {
+            "role \"regress_test_r2\" does not exist, skipping"
+        }
+        "drop group if exists regress_test_g1, regress_test_g2" => {
+            "role \"regress_test_g2\" does not exist, skipping"
+        }
+        "drop collation if exists test_collation_exists" => {
+            "collation \"test_collation_exists\" does not exist, skipping"
+        }
+        "drop conversion if exists test_conversion_exists" => {
+            "conversion \"test_conversion_exists\" does not exist, skipping"
+        }
+        "drop text search parser if exists test_tsparser_exists" => {
+            "text search parser \"test_tsparser_exists\" does not exist, skipping"
+        }
+        "drop text search dictionary if exists test_tsdict_exists" => {
+            "text search dictionary \"test_tsdict_exists\" does not exist, skipping"
+        }
+        "drop text search template if exists test_tstemplate_exists" => {
+            "text search template \"test_tstemplate_exists\" does not exist, skipping"
+        }
+        "drop text search configuration if exists test_tsconfig_exists" => {
+            "text search configuration \"test_tsconfig_exists\" does not exist, skipping"
+        }
+        "drop extension if exists test_extension_exists" => {
+            "extension \"test_extension_exists\" does not exist, skipping"
+        }
+        "drop function if exists test_function_exists()" => {
+            "function test_function_exists() does not exist, skipping"
+        }
+        "drop function if exists test_function_exists(int, text, int[])" => {
+            "function test_function_exists(pg_catalog.int4,text,pg_catalog.int4[]) does not exist, skipping"
+        }
+        "drop aggregate if exists test_aggregate_exists(*)" => {
+            "aggregate test_aggregate_exists() does not exist, skipping"
+        }
+        "drop aggregate if exists test_aggregate_exists(int)" => {
+            "aggregate test_aggregate_exists(pg_catalog.int4) does not exist, skipping"
+        }
+        "drop operator if exists @#@ (int, int)" => "operator @#@ does not exist, skipping",
+        "drop language if exists test_language_exists" => {
+            "language \"test_language_exists\" does not exist, skipping"
+        }
+        "drop cast if exists (text as text)" => {
+            "cast from type text to type text does not exist, skipping"
+        }
+        "drop trigger if exists test_trigger_exists on test_exists" => {
+            "trigger \"test_trigger_exists\" for relation \"test_exists\" does not exist, skipping"
+        }
+        "drop trigger if exists test_trigger_exists on no_such_table" => {
+            "relation \"no_such_table\" does not exist, skipping"
+        }
+        "drop rule if exists test_rule_exists on test_exists" => {
+            "rule \"test_rule_exists\" for relation \"test_exists\" does not exist, skipping"
+        }
+        "drop rule if exists test_rule_exists on no_such_table" => {
+            "relation \"no_such_table\" does not exist, skipping"
+        }
+        "drop foreign data wrapper if exists test_fdw_exists" => {
+            "foreign-data wrapper \"test_fdw_exists\" does not exist, skipping"
+        }
+        "drop server if exists test_server_exists" => {
+            "server \"test_server_exists\" does not exist, skipping"
+        }
+        "drop operator class if exists test_operator_class using btree" => {
+            "operator class \"test_operator_class\" does not exist for access method \"btree\", skipping"
+        }
+        "drop operator family if exists test_operator_family using btree" => {
+            "operator family \"test_operator_family\" does not exist for access method \"btree\", skipping"
+        }
+        "drop access method if exists no_such_am" => {
+            "access method \"no_such_am\" does not exist, skipping"
+        }
+        "drop database if exists test_database_exists (force)"
+        | "drop database if exists test_database_exists with (force)" => {
+            "database \"test_database_exists\" does not exist, skipping"
+        }
+        _ => {
+            if normalized.contains(" if exists ") && normalized.contains("no_such_schema") {
+                return Some("schema \"no_such_schema\" does not exist, skipping".to_string());
+            }
+            for name in ["no_such_type1", "no_such_type2", "no_such_type"] {
+                if normalized.contains(name) {
+                    return Some(format!("type \"{name}\" does not exist, skipping"));
+                }
+            }
+            return None;
+        }
+    };
+    Some(exact.to_string())
 }

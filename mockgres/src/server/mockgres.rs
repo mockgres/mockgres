@@ -55,6 +55,7 @@ use super::params::{build_params_for_portal, statement_plan_parameter_types};
 use super::statement_plan::StatementPlan;
 
 mod builtins;
+mod regression_encoding_notices;
 mod regression_protocol;
 mod runtime;
 

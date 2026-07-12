@@ -254,17 +254,32 @@ impl ToSqlText for FloatOutput {
         _format_options: &FormatOptions,
     ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
         let mut value =
-            if self.extra_float_digits < 0 && self.value.is_finite() && self.value != 0.0 {
+            if self.extra_float_digits <= 0 && self.value.is_finite() && self.value != 0.0 {
                 let exponent = self.value.abs().log10().floor() as i32;
-                let decimals = (13 - exponent).max(0) as usize;
-                let formatted = format!("{:.*}", decimals, self.value);
-                formatted
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string()
+                let precision = if self.extra_float_digits < 0 { 13 } else { 14 };
+                if !(-4..15).contains(&exponent) {
+                    let formatted = format!("{:.*e}", precision, self.value);
+                    let (mantissa, exponent) =
+                        formatted.split_once('e').unwrap_or((&formatted, "0"));
+                    let mantissa = mantissa.trim_end_matches('0').trim_end_matches('.');
+                    let exponent = exponent.parse::<i32>().unwrap_or(0);
+                    format!("{mantissa}e{exponent:+}")
+                } else {
+                    let decimals = (precision as i32 - exponent).max(0) as usize;
+                    let formatted = format!("{:.*}", decimals, self.value);
+                    formatted
+                        .trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .to_string()
+                }
             } else {
                 self.value.to_string()
             };
+        value = match value.as_str() {
+            "inf" => "Infinity".to_string(),
+            "-inf" => "-Infinity".to_string(),
+            _ => value,
+        };
         if value.ends_with(".0") {
             value.truncate(value.len() - 2);
         }
