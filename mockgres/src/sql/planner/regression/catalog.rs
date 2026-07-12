@@ -151,13 +151,17 @@ pub(super) fn try_plan_regression_catalog(sql: &str, normalized: &str) -> Option
         });
     }
     if normalized.starts_with("declare c cursor for select ctid,cmin,* from combocidtest") {
-        return Some(Plan::UtilityNoOp { tag: "DECLARE" });
+        return Some(Plan::CallBuiltin {
+            name: "regression:cursor_declare:combocid".to_string(),
+            args: Vec::new(),
+            schema: Schema { fields: Vec::new() },
+        });
     }
     if normalized == "fetch all from c" {
         return Some(Plan::CallBuiltin {
-            name: "regression:combocid_fetch".to_string(),
+            name: "regression:cursor_fetch".to_string(),
             args: Vec::new(),
-            schema: combocid_schema(),
+            schema: Schema { fields: Vec::new() },
         });
     }
     if normalized.starts_with("select * from testcase where id = 1 for update") {

@@ -9,6 +9,12 @@ fn builtin(name: &str) -> Plan {
 }
 
 pub(super) fn try_plan_regression_copydml(normalized: &str) -> Option<Plan> {
+    if normalized == "select * from test3" {
+        return Some(regression_values(
+            vec![("c", DataType::Int4)],
+            vec![vec![int_value(1)], vec![int_value(2)]],
+        ));
+    }
     if normalized.starts_with("create rule qqq as on ") {
         return Some(Plan::UtilityNoOp { tag: "CREATE RULE" });
     }

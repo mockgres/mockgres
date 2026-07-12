@@ -180,7 +180,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
         ScalarExpr::Column(col) => col.column.clone(),
         ScalarExpr::ColumnIdx(idx) => format!("?column{}?", idx + 1),
         ScalarExpr::ExcludedIdx(idx) => format!("?column{}?", idx + 1),
-        ScalarExpr::Param { idx, .. } => format!("param{}", idx + 1),
+        ScalarExpr::Param { .. } => "?column?".into(),
         ScalarExpr::Literal(_) => "?column?".into(),
         ScalarExpr::BinaryOp { .. } => "?column?".into(),
         ScalarExpr::UnaryOp { .. } => "?column?".into(),

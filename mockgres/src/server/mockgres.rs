@@ -16,6 +16,7 @@ use pgwire::api::{
         protocol_negotiation, save_startup_parameters_to_metadata,
     },
     cancel::CancelHandler,
+    copy::CopyHandler,
     portal::PortalExecutionState,
     query::{ExtendedQueryHandler, SimpleQueryHandler},
     query::{send_execution_response, send_query_response},
@@ -39,7 +40,9 @@ use crate::advisory_locks::AdvisoryLockRegistry;
 use crate::binder::bind;
 use crate::db::{Db, LockOwner};
 use crate::engine::exec::ValuesExec;
-use crate::engine::{DataType, EvalContext, Plan, Value, fe, fe_code, to_pgwire_stream};
+use crate::engine::{
+    DataType, EvalContext, Field, Plan, Schema, Value, fe, fe_code, to_pgwire_stream,
+};
 use crate::session::{Session, SessionManager, now_utc_micros};
 use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
@@ -260,7 +263,7 @@ impl SimpleQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if self.try_handle_regression_copydml(client, query).await? {
+        if self.try_handle_regression_copy(client, query).await? {
             return Ok(Vec::new());
         }
         if query
@@ -793,7 +796,7 @@ impl PgWireServerHandlers for Mockgres {
         Arc::new(self.clone())
     }
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(self.clone())
     }
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
         Arc::new(NoopHandler)
@@ -882,6 +885,39 @@ where
                 break;
             }
             Some(Ok(msg)) => {
+                let mockgres = (&handlers as &dyn Any)
+                    .downcast_ref::<Mockgres>()
+                    .or_else(|| {
+                        (&handlers as &dyn Any)
+                            .downcast_ref::<Arc<Mockgres>>()
+                            .map(Arc::as_ref)
+                    });
+                let regression_session = mockgres
+                    .and_then(|server| server.session_for_client(socket).ok())
+                    .filter(|session| {
+                        session.currtid_call_count("regression:copyselect_copy_active") == 1
+                    });
+                if let Some(session) = regression_session {
+                    match msg {
+                        PgWireFrontendMessage::CopyData(data) => {
+                            copy_handler.on_copy_data(socket, data).await?;
+                            continue;
+                        }
+                        PgWireFrontendMessage::CopyDone(done) => {
+                            copy_handler.on_copy_done(socket, done).await?;
+                            if session.currtid_call_count("regression:copyselect_copy_in") >= 2 {
+                                socket
+                                    .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                                        TransactionStatus::Idle,
+                                    )))
+                                    .await?;
+                                socket.set_state(PgWireConnectionState::ReadyForQuery);
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let is_extended_query = match socket.state() {
                     PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
                     _ => msg.is_extended_query(),

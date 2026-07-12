@@ -102,7 +102,7 @@ pub(crate) fn build_insert_executor(
                     ),
                 ));
             }
-            None if row.len() != table_meta.columns.len() => {
+            None if row.len() > table_meta.columns.len() => {
                 return Err(fe_code(
                     "21P01",
                     format!(

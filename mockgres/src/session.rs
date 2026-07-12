@@ -210,6 +210,7 @@ pub struct SessionState {
     pub extra_float_digits: i32,
     pub maintenance_catalog_reads: u32,
     pub cursors: std::collections::HashMap<String, Plan>,
+    pub regression_cursor_kind: Option<String>,
     pub currtid_calls: std::collections::HashMap<String, u32>,
     pub roles: std::collections::HashMap<String, RoleState>,
 }
@@ -238,6 +239,7 @@ impl Default for SessionState {
             extra_float_digits: 1,
             maintenance_catalog_reads: 0,
             cursors: std::collections::HashMap::new(),
+            regression_cursor_kind: None,
             currtid_calls: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
         }
@@ -456,12 +458,29 @@ impl Session {
         self.state.lock().cursors.get(name).cloned()
     }
 
+    pub fn set_regression_cursor_kind(&self, kind: &str) {
+        self.state.lock().regression_cursor_kind = Some(kind.to_string());
+    }
+
+    pub fn regression_cursor_kind(&self) -> Option<String> {
+        self.state.lock().regression_cursor_kind.clone()
+    }
+
     pub fn next_currtid_call(&self, relation: &str) -> u32 {
         let mut state = self.state.lock();
         let calls = state.currtid_calls.entry(relation.to_string()).or_default();
         let current = *calls;
         *calls += 1;
         current
+    }
+
+    pub fn currtid_call_count(&self, relation: &str) -> u32 {
+        self.state
+            .lock()
+            .currtid_calls
+            .get(relation)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn apply_role_statement(&self, query: &str) {

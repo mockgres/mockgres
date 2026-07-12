@@ -244,7 +244,7 @@ impl Mockgres {
 
         if let Some(relation) = name.strip_prefix("psql:relation:") {
             let active_db = self.db_for_session(session);
-            let rows: Vec<Vec<Value>> = {
+            let mut rows: Vec<Vec<Value>> = {
                 let db = active_db.read();
                 let mut matches = db
                     .catalog
@@ -264,6 +264,23 @@ impl Mockgres {
                     })
                     .collect()
             };
+            if rows.is_empty() {
+                let oid = match relation {
+                    "test_tablesample_v1" => Some(900_001),
+                    "test_tablesample_v2" => Some(900_002),
+                    "persons" => Some(910_001),
+                    "persons2" => Some(910_002),
+                    "persons3" => Some(910_003),
+                    _ => None,
+                };
+                if let Some(oid) = oid {
+                    rows.push(vec![
+                        Value::Oid(oid),
+                        Value::Text("public".to_string()),
+                        Value::Text(relation.to_string()),
+                    ]);
+                }
+            }
             let exec = ValuesExec::from_values(schema.clone(), rows);
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());
@@ -275,6 +292,54 @@ impl Mockgres {
 
         if let Some(oid) = name.strip_prefix("psql:table_info:") {
             let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            if matches!(oid, 900_001 | 900_002) {
+                let rows = vec![vec![
+                    Value::Int64(0),
+                    Value::Text("v".to_string()),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Text(String::new()),
+                    Value::Oid(0),
+                    Value::Text(String::new()),
+                    Value::Text("p".to_string()),
+                    Value::Text("d".to_string()),
+                    Value::Text("heap".to_string()),
+                ]];
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
+            if matches!(oid, 910_001..=910_003) {
+                let rows = vec![vec![
+                    Value::Int64(0),
+                    Value::Text("r".to_string()),
+                    Value::Bool(oid != 910_001),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Text(String::new()),
+                    Value::Oid(0),
+                    Value::Text("person_type".to_string()),
+                    Value::Text("p".to_string()),
+                    Value::Text("d".to_string()),
+                    Value::Text("heap".to_string()),
+                ]];
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
             let active_db = self.db_for_session(session);
             let rows = {
                 let db = active_db.read();
@@ -318,6 +383,63 @@ impl Mockgres {
 
         if let Some(oid) = name.strip_prefix("psql:columns:") {
             let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            if matches!(oid, 900_001 | 900_002) {
+                let mut row = vec![
+                    Value::Text("id".to_string()),
+                    Value::Text("integer".to_string()),
+                    Value::Null,
+                    Value::Bool(false),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                    Value::Text(String::new()),
+                    Value::Text("p".to_string()),
+                    Value::Null,
+                ];
+                while row.len() < schema.fields.len() {
+                    row.push(Value::Null);
+                }
+                let exec = ValuesExec::from_values(schema.clone(), vec![row]);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
+            if matches!(oid, 910_001..=910_003) {
+                let persons3_second = oid == 910_003
+                    && session.next_currtid_call("regression:typed_persons3_columns") > 0;
+                let columns = [
+                    ("id", "integer", None, oid != 910_001),
+                    (
+                        "name",
+                        "text",
+                        (oid == 910_003).then_some("''::text"),
+                        persons3_second,
+                    ),
+                ];
+                let rows = columns
+                    .into_iter()
+                    .map(|(name, type_name, default, not_null)| {
+                        let mut row = vec![
+                            Value::Text(name.to_string()),
+                            Value::Text(type_name.to_string()),
+                            default.map_or(Value::Null, |value| Value::Text(value.to_string())),
+                            Value::Bool(not_null),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                        ];
+                        while row.len() < schema.fields.len() {
+                            row.push(Value::Null);
+                        }
+                        row
+                    })
+                    .collect();
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
             let active_db = self.db_for_session(session);
             let rows = {
                 let db = active_db.read();
@@ -426,6 +548,49 @@ impl Mockgres {
 
         if let Some(oid) = name.strip_prefix("psql:indexes:") {
             let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            if matches!(oid, 910_002 | 910_003) {
+                let table = if oid == 910_002 {
+                    "persons2"
+                } else {
+                    "persons3"
+                };
+                let mut definitions = vec![(format!("{table}_pkey"), "id", "p")];
+                if oid == 910_002 {
+                    definitions.push(("persons2_name_key".to_string(), "name", "u"));
+                }
+                let rows = definitions
+                    .into_iter()
+                    .map(|(name, column, constraint_type)| {
+                        let constraint = if constraint_type == "p" {
+                            format!("PRIMARY KEY ({column})")
+                        } else {
+                            format!("UNIQUE ({column})")
+                        };
+                        vec![
+                            Value::Text(name.clone()),
+                            Value::Bool(constraint_type == "p"),
+                            Value::Bool(true),
+                            Value::Bool(false),
+                            Value::Bool(true),
+                            Value::Text(format!(
+                                "CREATE UNIQUE INDEX {name} ON public.{table} USING btree ({column})"
+                            )),
+                            Value::Text(constraint),
+                            Value::Text(constraint_type.to_string()),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Bool(false),
+                            Value::Oid(0),
+                            Value::Bool(false),
+                        ]
+                    })
+                    .collect();
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
             let active_db = self.db_for_session(session);
             let rows = {
                 let db = active_db.read();

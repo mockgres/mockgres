@@ -100,7 +100,7 @@ pub(super) fn bind_write_plan(
             let expected_len = column_positions.len();
             let mut bound_rows = Vec::with_capacity(rows.len());
             for row in rows {
-                if row.len() != expected_len {
+                if row.len() != expected_len && (columns.is_some() || row.len() > expected_len) {
                     let msg = if columns.is_some() {
                         format!(
                             "INSERT has {} target columns but {} expressions",

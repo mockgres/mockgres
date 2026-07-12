@@ -2,6 +2,7 @@ use super::*;
 
 mod catalog;
 mod regression;
+mod regression_cursor;
 
 impl Mockgres {
     pub(super) async fn execute_builtin_statement(

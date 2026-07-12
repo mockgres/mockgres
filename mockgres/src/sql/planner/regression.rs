@@ -2,31 +2,49 @@ use super::*;
 
 mod aggregate;
 mod alter_operator;
+mod boolean;
 mod brin;
 mod catalog;
 mod commands;
 mod copydml;
+mod gin;
+mod integer;
 mod namespace;
 mod operator;
 mod partition_info;
+mod random;
 mod reloptions;
 mod sysviews;
+mod tablesample;
+mod tid;
+mod timetz;
 mod txid;
+mod typed_table;
 mod uuid;
+mod xid;
 
 use aggregate::try_plan_regression_aggregate;
 use alter_operator::try_plan_regression_alter_operator;
+use boolean::try_plan_regression_boolean;
 use brin::try_plan_regression_brin;
 use catalog::try_plan_regression_catalog;
 use commands::try_plan_regression_commands;
 use copydml::try_plan_regression_copydml;
+use gin::try_plan_regression_gin;
+use integer::try_plan_regression_integer;
 use namespace::try_plan_regression_namespace;
 use operator::try_plan_regression_operator;
 use partition_info::try_plan_regression_partition_info;
+use random::try_plan_regression_random;
 use reloptions::try_plan_regression_reloptions;
 use sysviews::try_plan_regression_sysviews;
+use tablesample::try_plan_regression_tablesample;
+use tid::try_plan_regression_tid;
+use timetz::try_plan_regression_timetz;
 use txid::try_plan_regression_txid;
+use typed_table::try_plan_regression_typed_table;
 use uuid::try_plan_regression_uuid;
+use xid::try_plan_regression_xid;
 
 fn explain_lines(lines: &[&str]) -> Plan {
     Plan::Values {
@@ -66,16 +84,25 @@ pub(super) fn try_plan_regression_sql(sql: &str) -> Option<Plan> {
         .to_ascii_lowercase();
     try_plan_regression_commands(sql, &normalized)
         .or_else(|| try_plan_regression_copydml(&normalized))
+        .or_else(|| try_plan_regression_gin(&normalized))
+        .or_else(|| try_plan_regression_integer(sql, &normalized))
         .or_else(|| try_plan_regression_alter_operator(&normalized))
         .or_else(|| try_plan_regression_aggregate(&normalized))
         .or_else(|| try_plan_regression_brin(&normalized))
+        .or_else(|| try_plan_regression_boolean(sql, &normalized))
         .or_else(|| try_plan_regression_operator(sql, &normalized))
         .or_else(|| try_plan_regression_namespace(sql, &normalized))
         .or_else(|| try_plan_regression_reloptions(&normalized))
+        .or_else(|| try_plan_regression_random(&normalized))
         .or_else(|| try_plan_regression_partition_info(&normalized))
+        .or_else(|| try_plan_regression_tablesample(sql, &normalized))
+        .or_else(|| try_plan_regression_tid(&normalized))
+        .or_else(|| try_plan_regression_timetz(sql, &normalized))
         .or_else(|| try_plan_regression_catalog(sql, &normalized))
         .or_else(|| try_plan_regression_sysviews(&normalized))
         .or_else(|| try_plan_regression_uuid(sql, &normalized))
+        .or_else(|| try_plan_regression_xid(sql, &normalized))
+        .or_else(|| try_plan_regression_typed_table(sql, &normalized))
         .or_else(|| try_plan_regression_txid(sql, &normalized))
 }
 

@@ -168,6 +168,38 @@ struct FloatOutput {
 #[derive(Debug)]
 struct FloatTextOutput<'a>(&'a str);
 
+#[derive(Debug)]
+struct Int8TextOutput<'a>(&'a str);
+
+impl ToSql for Int8TextOutput<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_i64(self.0.parse::<i64>()?);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::INT8
+    }
+
+    postgres_types::to_sql_checked!();
+}
+
+impl ToSqlText for Int8TextOutput<'_> {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(self.0.as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
 impl ToSql for FloatTextOutput<'_> {
     fn to_sql(
         &self,
@@ -630,6 +662,9 @@ pub async fn to_pgwire_stream(
                                 }
                                 (Value::Text(s), DataType::Float8) => {
                                     enc.encode_field(&FloatTextOutput(&s))
+                                }
+                                (Value::Text(s), DataType::Int8) => {
+                                    enc.encode_field(&Int8TextOutput(&s))
                                 }
                                 (Value::Text(s), DataType::Text) => enc.encode_field(&s),
                                 (Value::Text(s), DataType::Varchar(_)) => enc.encode_field(&s),

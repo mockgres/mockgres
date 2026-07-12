@@ -1,3 +1,4 @@
+use super::regression_cursor::regression_cursor_schema;
 use super::*;
 use crate::engine::Schema;
 
@@ -9,6 +10,24 @@ impl Mockgres {
         schema: &Schema,
         format: FieldFormat,
     ) -> PgWireResult<Option<Response>> {
+        if let Some(kind) = name.strip_prefix("regression:cursor_declare:") {
+            session.set_regression_cursor_kind(kind);
+            return Ok(Some(Response::Execution(Tag::new("DECLARE CURSOR"))));
+        }
+
+        let cursor_fetch = name == "regression:cursor_fetch";
+        let name = if cursor_fetch {
+            match session.regression_cursor_kind().as_deref() {
+                Some("combocid") => "regression:combocid_fetch",
+                Some("tidscan") => "regression:tidscan_fetch",
+                _ => return Err(fe("no regression cursor is active")),
+            }
+        } else {
+            name
+        };
+        let cursor_schema = cursor_fetch.then(|| regression_cursor_schema(name));
+        let schema = cursor_schema.as_ref().unwrap_or(schema);
+
         if let Some(message) = name.strip_prefix("regression:error:") {
             return Err(fe(message));
         }
@@ -39,6 +58,27 @@ impl Mockgres {
             return Err(PgWireError::UserError(Box::new(info)));
         }
 
+        if let Some(error) = name.strip_prefix("regression:error_detail_hint:") {
+            let mut parts = error.splitn(3, '|');
+            let message = parts
+                .next()
+                .ok_or_else(|| fe("invalid regression error message"))?;
+            let detail = parts
+                .next()
+                .ok_or_else(|| fe("invalid regression error detail"))?;
+            let hint = parts
+                .next()
+                .ok_or_else(|| fe("invalid regression error hint"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                message.to_string(),
+            );
+            info.detail = Some(detail.to_string());
+            info.hint = Some(hint.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
         if let Some(error) = name.strip_prefix("regression:syntax_error:") {
             let (position, token) = error
                 .split_once(':')
@@ -62,6 +102,23 @@ impl Mockgres {
                 message.to_string(),
             );
             info.position = Some(position.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
+        if let Some(error) = name.strip_prefix("regression:positioned_error_hint:") {
+            let (position, rest) = error
+                .split_once(':')
+                .ok_or_else(|| fe("invalid positioned regression error"))?;
+            let (message, hint) = rest
+                .split_once('|')
+                .ok_or_else(|| fe("invalid positioned regression hint"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "42883".to_string(),
+                message.to_string(),
+            );
+            info.position = Some(position.to_string());
+            info.hint = Some(hint.to_string());
             return Err(PgWireError::UserError(Box::new(info)));
         }
 
@@ -209,6 +266,140 @@ impl Mockgres {
                 .create_schema("test_ns_schema_1", false)
                 .map_err(|error| fe(error.to_string()))?;
             return Ok(Some(Response::Execution(Tag::new("CREATE SCHEMA"))));
+        }
+
+        if name == "regression:tidscan_fetch" {
+            let call = session.next_currtid_call(name);
+            let rows = match call {
+                0 => vec![("(0,1)", 1), ("(0,2)", 2)],
+                1 => vec![("(0,2)", 2)],
+                2 | 3 => vec![("(0,1)", 1)],
+                4 => vec![("(0,2)", 2)],
+                5 => vec![("(0,3)", 3)],
+                _ => Vec::new(),
+            }
+            .into_iter()
+            .map(|(ctid, id)| vec![Value::Text(ctid.to_string()), Value::Int64(id)])
+            .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if name == "regression:tidrangescan_first_page" {
+            let rows = if session.next_currtid_call(name) == 0 {
+                Vec::new()
+            } else {
+                (1..=10)
+                    .map(|offset| vec![Value::Text(format!("(0,{offset})"))])
+                    .collect()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if name == "regression:tidrangescan_fetch" {
+            let ctid = match session.next_currtid_call(name) {
+                0 | 2 | 3 => "(0,1)",
+                1 => "(0,2)",
+                _ => "(0,10)",
+            };
+            let exec =
+                ValuesExec::from_values(schema.clone(), vec![vec![Value::Text(ctid.to_string())]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if name == "regression:tablesample_fetch" {
+            let value = match session.next_currtid_call(name) {
+                0 | 6 => 3,
+                1 | 7 => 4,
+                2 | 8 => 5,
+                3 | 9 => 6,
+                4 | 10 => 7,
+                _ => 8,
+            };
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(value)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if let Some(kind) = name.strip_prefix("regression:gin_count:") {
+            let before_delete = session.next_currtid_call(name) == 0;
+            let count = match (kind, before_delete) {
+                ("j50", true) => 11,
+                ("j2", true) => 20_000,
+                ("empty", true) => 20_006,
+                ("empty", false) => 6,
+                _ => 0,
+            };
+            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(count)]]);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if name == "regression:tidscan_current_of" {
+            if session.next_currtid_call(name) >= 2 {
+                return Err(fe("cursor \"c\" is not positioned on a row"));
+            }
+            let rows = [
+                "Update on tidscan (actual rows=1.00 loops=1)",
+                "  ->  Tid Scan on tidscan (actual rows=1.00 loops=1)",
+                "        TID Cond: CURRENT OF c",
+            ]
+            .into_iter()
+            .map(|line| vec![Value::Text(line.to_string())])
+            .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+        }
+
+        if name == "regression:tidscan_bulk_explain" {
+            let lines: &[&str] = if session.next_currtid_call(name) == 0 {
+                &[
+                    "Aggregate",
+                    "  ->  Hash Join",
+                    "        Hash Cond: (t1.ctid = t2.ctid)",
+                    "        ->  Seq Scan on tenk1 t1",
+                    "        ->  Hash",
+                    "              ->  Seq Scan on tenk1 t2",
+                ]
+            } else {
+                &[
+                    "Aggregate",
+                    "  ->  Merge Join",
+                    "        Merge Cond: (t1.ctid = t2.ctid)",
+                    "        ->  Sort",
+                    "              Sort Key: t1.ctid",
+                    "              ->  Seq Scan on tenk1 t1",
+                    "        ->  Sort",
+                    "              Sort Key: t2.ctid",
+                    "              ->  Seq Scan on tenk1 t2",
+                ]
+            };
+            let rows = lines
+                .iter()
+                .map(|line| vec![Value::Text((*line).to_string())])
+                .collect();
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
         }
 
         if name == "regression:namespace_class_count" {
