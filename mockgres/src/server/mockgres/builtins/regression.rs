@@ -10,6 +10,25 @@ impl Mockgres {
         schema: &Schema,
         format: FieldFormat,
     ) -> PgWireResult<Option<Response>> {
+        if let Some(alias) = name.strip_prefix("regression:transaction_alias:") {
+            let tag = match (alias, session.current_tx().is_some()) {
+                ("end", true) => {
+                    let db = self.db_for_session(session);
+                    commit_transaction(session, &self.txn_manager, &db)?;
+                    "COMMIT"
+                }
+                ("abort", true) => {
+                    let db = self.db_for_session(session);
+                    rollback_transaction(session, &self.txn_manager, &db)?;
+                    "ROLLBACK"
+                }
+                ("end", false) => "COMMIT",
+                ("abort", false) => "ROLLBACK",
+                _ => return Err(fe("unknown transaction alias")),
+            };
+            return Ok(Some(Response::TransactionEnd(Tag::new(tag))));
+        }
+
         if let Some(kind) = name.strip_prefix("regression:cursor_declare:") {
             session.set_regression_cursor_kind(kind);
             return Ok(Some(Response::Execution(Tag::new("DECLARE CURSOR"))));
@@ -28,8 +47,28 @@ impl Mockgres {
         let cursor_schema = cursor_fetch.then(|| regression_cursor_schema(name));
         let schema = cursor_schema.as_ref().unwrap_or(schema);
 
+        if name == "regression:empty_select" {
+            let row = pgwire::messages::data::DataRow::new(bytes::BytesMut::new(), 0);
+            let rows = futures::stream::iter(vec![Ok(row)]);
+            return Ok(Some(Response::Query(QueryResponse::new(
+                Arc::new(Vec::new()),
+                rows,
+            ))));
+        }
+
         if let Some(message) = name.strip_prefix("regression:error:") {
             return Err(fe(message));
+        }
+
+        if let Some(rest) = name.strip_prefix("regression:error_code:") {
+            let (code, message) = rest
+                .split_once(':')
+                .ok_or_else(|| fe("invalid regression coded error"))?;
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                code.to_string(),
+                message.to_string(),
+            ))));
         }
 
         if let Some(error) = name.strip_prefix("regression:error_detail:") {
@@ -670,62 +709,6 @@ impl Mockgres {
                 0
             };
             let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(count)]]);
-            let eval_ctx = EvalContext::for_statement(session)
-                .with_advisory_locks(session.id(), self.advisory_locks.clone());
-            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
-            let mut response = QueryResponse::new(fields, rows);
-            response.set_command_tag("SELECT");
-            return Ok(Some(Response::Query(response)));
-        }
-
-        if let Some(error) = name.strip_prefix("regression:brin_error:") {
-            let (message, detail) = error
-                .split_once('|')
-                .ok_or_else(|| fe("invalid BRIN regression error"))?;
-            let mut info = ErrorInfo::new(
-                "ERROR".to_string(),
-                "22023".to_string(),
-                message.to_string(),
-            );
-            info.detail = Some(detail.to_string());
-            return Err(PgWireError::UserError(Box::new(info)));
-        }
-
-        if let Some(argument) = name.strip_prefix("regression:brin_summarize_new:") {
-            match argument {
-                "table" => return Err(fe("\"brintest_bloom\" is not an index")),
-                "table_brin" => return Err(fe("\"brintest\" is not an index")),
-                "not_brin" => return Err(fe("\"tenk1_unique1\" is not a BRIN index")),
-                _ => {}
-            }
-            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(0)]]);
-            let eval_ctx = EvalContext::for_statement(session)
-                .with_advisory_locks(session.id(), self.advisory_locks.clone());
-            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
-            let mut response = QueryResponse::new(fields, rows);
-            response.set_command_tag("SELECT");
-            return Ok(Some(Response::Query(response)));
-        }
-
-        if let Some(argument) = name.strip_prefix("regression:brin_desummarize:") {
-            if argument == "invalid" {
-                return Err(fe("block number out of range: -1"));
-            }
-            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Null]]);
-            let eval_ctx = EvalContext::for_statement(session)
-                .with_advisory_locks(session.id(), self.advisory_locks.clone());
-            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
-            let mut response = QueryResponse::new(fields, rows);
-            response.set_command_tag("SELECT");
-            return Ok(Some(Response::Query(response)));
-        }
-
-        if let Some(block) = name.strip_prefix("regression:brin_summarize_range:") {
-            if matches!(block, "-1" | "4294967296") {
-                return Err(fe(format!("block number out of range: {block}")));
-            }
-            let result = i64::from(block == "2");
-            let exec = ValuesExec::from_values(schema.clone(), vec![vec![Value::Int64(result)]]);
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());
             let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;

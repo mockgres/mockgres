@@ -342,7 +342,9 @@ pub(super) fn try_plan_regression_commands(sql: &str, normalized: &str) -> Optio
         });
     }
     if normalized.starts_with("select brin_summarize_new_values(") {
-        let argument = if normalized.contains("'brintest_bloom'") {
+        let argument = if normalized.contains("'brintest_multi'") {
+            "table_multi"
+        } else if normalized.contains("'brintest_bloom'") {
             "table"
         } else if normalized.contains("'brintest'") {
             "table_brin"

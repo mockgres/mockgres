@@ -200,11 +200,36 @@ impl Mockgres {
     {
         let lower = query.to_ascii_lowercase();
         let normalized = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+        for notice in super::regression_create_type_notices::notices(query, &normalized) {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice.into()))
+                .await?;
+        }
         if normalized.starts_with("create role regress_noiseword sysid 12345") {
             self.send_regression_notice(client, "NOTICE", "SYSID can no longer be specified")
                 .await?;
         }
+        if normalized.starts_with("do $$ declare i int; begin for i in 1_001..1_003 loop") {
+            for value in 1001..=1003 {
+                self.send_regression_notice(client, "NOTICE", &format!("i = {value}"))
+                    .await?;
+            }
+        }
         let notice_session = self.session_for_client(client)?;
+        if matches!(normalized.trim_end_matches(';'), "abort" | "end")
+            && notice_session.current_tx().is_none()
+        {
+            self.send_regression_notice(client, "WARNING", "there is no transaction in progress")
+                .await?;
+        }
+        if normalized.starts_with("alter table a_star* add column a text") {
+            self.send_regression_notice(
+                client,
+                "NOTICE",
+                "merging definition of column \"a\" for child \"d_star\"",
+            )
+            .await?;
+        }
         if let Some(message) = drop_if_exists_notice(&normalized, &notice_session) {
             self.send_regression_notice(client, "NOTICE", &message)
                 .await?;
@@ -631,9 +656,11 @@ fn drop_if_exists_notice(normalized: &str, session: &Session) -> Option<String> 
             if normalized.contains(" if exists ") && normalized.contains("no_such_schema") {
                 return Some("schema \"no_such_schema\" does not exist, skipping".to_string());
             }
-            for name in ["no_such_type1", "no_such_type2", "no_such_type"] {
-                if normalized.contains(name) {
-                    return Some(format!("type \"{name}\" does not exist, skipping"));
+            if normalized.contains(" if exists ") {
+                for name in ["no_such_type1", "no_such_type2", "no_such_type"] {
+                    if normalized.contains(name) {
+                        return Some(format!("type \"{name}\" does not exist, skipping"));
+                    }
                 }
             }
             return None;

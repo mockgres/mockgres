@@ -2,11 +2,15 @@ use super::*;
 
 mod catalog;
 mod regression;
+mod regression_brin;
+mod regression_create_type;
 mod regression_cursor;
 mod regression_dependency;
 mod regression_encoding;
+mod regression_money;
 mod regression_plancache;
 mod regression_prepare;
+mod regression_regproc;
 mod regression_role;
 
 impl Mockgres {
@@ -40,6 +44,25 @@ impl Mockgres {
         };
 
         if let Some(response) = self
+            .execute_regression_create_type_builtin(session, name)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+        if let Some(response) = self
+            .execute_regression_money_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+        if let Some(response) = self
+            .execute_regression_regproc_builtin(session, name, schema, format)
+            .await?
+        {
+            return Ok(Some(response));
+        }
+
+        if let Some(response) = self
             .execute_regression_dependency_builtin(session, name, schema, format)
             .await?
         {
@@ -66,6 +89,12 @@ impl Mockgres {
         }
 
         if let Some(response) = self.execute_regression_role_builtin(session, name).await? {
+            return Ok(Some(response));
+        }
+        if let Some(response) = self
+            .execute_regression_brin_builtin(session, name, schema, format)
+            .await?
+        {
             return Ok(Some(response));
         }
 

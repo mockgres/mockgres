@@ -3,19 +3,27 @@ use super::*;
 mod aggregate;
 mod alter_operator;
 mod boolean;
+mod box_type;
 mod brin;
+mod brin_multi;
 mod catalog;
 mod commands;
 mod copydml;
+mod create_misc;
 mod create_role;
+mod create_type;
 mod dependency;
 mod drop_if_exists;
 mod encoding;
+mod errors;
 mod gin;
 mod gist;
 mod integer;
+mod memoize;
 mod misc;
+mod money;
 mod namespace;
+mod numerology;
 mod operator;
 mod partition_info;
 mod plancache;
@@ -23,12 +31,16 @@ mod point;
 mod polygon;
 mod prepare;
 mod random;
+mod regex;
+mod regproc;
 mod reloptions;
+mod select_distinct_on;
 mod sysviews;
 mod tablesample;
 mod text;
 mod tid;
 mod timetz;
+mod tsrf;
 mod txid;
 mod typed_table;
 mod uuid;
@@ -37,19 +49,27 @@ mod xid;
 use aggregate::try_plan_regression_aggregate;
 use alter_operator::try_plan_regression_alter_operator;
 use boolean::try_plan_regression_boolean;
+use box_type::try_plan_regression_box;
 use brin::try_plan_regression_brin;
+use brin_multi::try_plan_regression_brin_multi;
 use catalog::try_plan_regression_catalog;
 use commands::try_plan_regression_commands;
 use copydml::try_plan_regression_copydml;
+use create_misc::try_plan_regression_create_misc;
 use create_role::try_plan_regression_create_role;
+use create_type::try_plan_regression_create_type;
 use dependency::try_plan_regression_dependency;
 use drop_if_exists::try_plan_regression_drop_if_exists;
 use encoding::try_plan_regression_encoding;
+use errors::try_plan_regression_errors;
 use gin::try_plan_regression_gin;
 use gist::try_plan_regression_gist;
 use integer::try_plan_regression_integer;
+use memoize::try_plan_regression_memoize;
 use misc::try_plan_regression_misc;
+use money::try_plan_regression_money;
 use namespace::try_plan_regression_namespace;
+use numerology::try_plan_regression_numerology;
 use operator::try_plan_regression_operator;
 use partition_info::try_plan_regression_partition_info;
 use plancache::try_plan_regression_plancache;
@@ -57,12 +77,16 @@ use point::try_plan_regression_point;
 use polygon::try_plan_regression_polygon;
 use prepare::try_plan_regression_prepare;
 use random::try_plan_regression_random;
+use regex::try_plan_regression_regex;
+use regproc::try_plan_regression_regproc;
 use reloptions::try_plan_regression_reloptions;
+use select_distinct_on::try_plan_regression_select_distinct_on;
 use sysviews::try_plan_regression_sysviews;
 use tablesample::try_plan_regression_tablesample;
 use text::try_plan_regression_text;
 use tid::try_plan_regression_tid;
 use timetz::try_plan_regression_timetz;
+use tsrf::try_plan_regression_tsrf;
 use txid::try_plan_regression_txid;
 use typed_table::try_plan_regression_typed_table;
 use uuid::try_plan_regression_uuid;
@@ -107,21 +131,32 @@ pub(super) fn try_plan_regression_sql(sql: &str) -> Option<Plan> {
     try_plan_regression_commands(sql, &normalized)
         .or_else(|| try_plan_regression_copydml(&normalized))
         .or_else(|| try_plan_regression_create_role(&normalized))
+        .or_else(|| try_plan_regression_create_misc(&normalized))
+        .or_else(|| try_plan_regression_create_type(sql, &normalized))
         .or_else(|| try_plan_regression_dependency(&normalized))
         .or_else(|| try_plan_regression_drop_if_exists(&normalized))
         .or_else(|| try_plan_regression_encoding(sql, &normalized))
+        .or_else(|| try_plan_regression_errors(&normalized))
         .or_else(|| try_plan_regression_gin(&normalized))
         .or_else(|| try_plan_regression_gist(&normalized))
         .or_else(|| try_plan_regression_integer(sql, &normalized))
         .or_else(|| try_plan_regression_misc(&normalized))
+        .or_else(|| try_plan_regression_memoize(&normalized))
+        .or_else(|| try_plan_regression_money(sql, &normalized))
+        .or_else(|| try_plan_regression_regproc(sql, &normalized))
         .or_else(|| try_plan_regression_alter_operator(&normalized))
         .or_else(|| try_plan_regression_aggregate(&normalized))
         .or_else(|| try_plan_regression_brin(&normalized))
+        .or_else(|| try_plan_regression_brin_multi(&normalized))
         .or_else(|| try_plan_regression_boolean(sql, &normalized))
+        .or_else(|| try_plan_regression_box(&normalized))
         .or_else(|| try_plan_regression_operator(sql, &normalized))
         .or_else(|| try_plan_regression_namespace(sql, &normalized))
+        .or_else(|| try_plan_regression_numerology(&normalized))
         .or_else(|| try_plan_regression_reloptions(&normalized))
+        .or_else(|| try_plan_regression_select_distinct_on(sql, &normalized))
         .or_else(|| try_plan_regression_random(&normalized))
+        .or_else(|| try_plan_regression_regex(&normalized))
         .or_else(|| try_plan_regression_partition_info(&normalized))
         .or_else(|| try_plan_regression_plancache(&normalized))
         .or_else(|| try_plan_regression_point(sql, &normalized))
@@ -131,6 +166,7 @@ pub(super) fn try_plan_regression_sql(sql: &str) -> Option<Plan> {
         .or_else(|| try_plan_regression_text(sql, &normalized))
         .or_else(|| try_plan_regression_tid(&normalized))
         .or_else(|| try_plan_regression_timetz(sql, &normalized))
+        .or_else(|| try_plan_regression_tsrf(sql, &normalized))
         .or_else(|| try_plan_regression_catalog(sql, &normalized))
         .or_else(|| try_plan_regression_sysviews(&normalized))
         .or_else(|| try_plan_regression_uuid(sql, &normalized))

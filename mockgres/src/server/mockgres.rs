@@ -55,7 +55,9 @@ use super::params::{build_params_for_portal, statement_plan_parameter_types};
 use super::statement_plan::StatementPlan;
 
 mod builtins;
+mod regression_create_type_notices;
 mod regression_encoding_notices;
+mod regression_preparse_errors;
 mod regression_protocol;
 mod runtime;
 
@@ -264,6 +266,9 @@ impl SimpleQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some(error) = regression_preparse_errors::preparse_error(query) {
+            return Err(PgWireError::UserError(Box::new(error)));
+        }
         if self.try_handle_regression_copy(client, query).await? {
             return Ok(Vec::new());
         }
