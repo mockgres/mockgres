@@ -174,6 +174,38 @@ async fn for_update_nowait_errors_immediately() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn autocommit_for_update_releases_locks_after_results_are_consumed() {
+    let ctx = common::start().await;
+    ctx.client
+        .execute(
+            "create table autocommit_locks(id int primary key, value int)",
+            &[],
+        )
+        .await
+        .expect("create locks");
+    ctx.client
+        .execute("insert into autocommit_locks values (1, 10)", &[])
+        .await
+        .expect("seed locks");
+
+    let rows = ctx
+        .client
+        .query("select id from autocommit_locks for update", &[])
+        .await
+        .expect("lock row in autocommit statement");
+    assert_eq!(rows.len(), 1);
+
+    let other = ctx.new_client().await;
+    let updated = other
+        .execute("update autocommit_locks set value = 11 where id = 1", &[])
+        .await
+        .expect("autocommit row lock should be released");
+    assert_eq!(updated, 1);
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn for_update_honors_lock_timeout() {
     let ctx = common::start().await;
     ctx.client

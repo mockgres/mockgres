@@ -7,12 +7,26 @@ use crate::engine::{ExecNode, LockSpec, Schema, Value, fe};
 use crate::server::errors::map_db_err;
 use crate::storage::RowId;
 
+pub struct LockScope {
+    owner: LockOwner,
+    release_on_close: bool,
+}
+
+impl LockScope {
+    pub fn new(owner: LockOwner, release_on_close: bool) -> Self {
+        Self {
+            owner,
+            release_on_close,
+        }
+    }
+}
+
 pub fn wrap_with_lock_apply(
     schema: Schema,
     child: Box<dyn ExecNode>,
     lock_spec: LockSpec,
     row_id_idx: usize,
-    owner: LockOwner,
+    scope: LockScope,
     locks: LockHandle,
     lock_timeout: Option<Duration>,
 ) -> Box<dyn ExecNode> {
@@ -21,7 +35,7 @@ pub fn wrap_with_lock_apply(
         child,
         lock_spec,
         row_id_idx,
-        owner,
+        scope,
         locks,
         lock_timeout,
     ))
@@ -35,6 +49,8 @@ struct LockApplyExec {
     owner: LockOwner,
     locks: LockHandle,
     lock_timeout: Option<Duration>,
+    release_on_close: bool,
+    released: bool,
 }
 
 enum AcquireOutcome {
@@ -48,7 +64,7 @@ impl LockApplyExec {
         child: Box<dyn ExecNode>,
         lock_spec: LockSpec,
         row_id_idx: usize,
-        owner: LockOwner,
+        scope: LockScope,
         locks: LockHandle,
         lock_timeout: Option<Duration>,
     ) -> Self {
@@ -57,10 +73,25 @@ impl LockApplyExec {
             child,
             lock_spec,
             row_id_idx,
-            owner,
+            owner: scope.owner,
             locks,
             lock_timeout,
+            release_on_close: scope.release_on_close,
+            released: false,
         }
+    }
+
+    fn release_statement_locks(&mut self) {
+        if self.release_on_close && !self.released {
+            self.locks.release_owner(self.owner);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for LockApplyExec {
+    fn drop(&mut self) {
+        self.release_statement_locks();
     }
 }
 
@@ -126,7 +157,9 @@ impl ExecNode for LockApplyExec {
     }
 
     async fn close(&mut self) -> PgWireResult<()> {
-        self.child.close().await
+        let result = self.child.close().await;
+        self.release_statement_locks();
+        result
     }
 
     fn schema(&self) -> &Schema {

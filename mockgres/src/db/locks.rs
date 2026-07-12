@@ -191,4 +191,8 @@ impl LockHandle {
             .acquire_blocking_timeout((table_id, row_id), owner, timeout_dur)
             .await
     }
+
+    pub fn release_owner(&self, owner: LockOwner) {
+        self.inner.release_owner(owner);
+    }
 }

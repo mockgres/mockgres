@@ -13,7 +13,7 @@ use crate::server::errors::map_db_err;
 use crate::session::Session;
 use crate::txn::{TransactionManager, TxId, VisibilityContext};
 
-use super::locks::wrap_with_lock_apply;
+use super::locks::{LockScope, wrap_with_lock_apply};
 pub(crate) mod subquery;
 use crate::server::exec_builder::{assert_supported_aggs, build_executor, schema_or_public};
 use subquery::{materialize_in_subqueries, materialize_scalar_subqueries};
@@ -220,7 +220,7 @@ pub fn build_read_executor(
                 child,
                 *lock,
                 *row_id_idx,
-                owner,
+                LockScope::new(owner, session.current_tx().is_none()),
                 lock_handle,
                 session.lock_timeout(),
             );
