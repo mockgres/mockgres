@@ -186,6 +186,66 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/sqljson_queryfuncs.bin"),
     },
+    RegressionTrace {
+        name: "partition_aggregate",
+        start_entry: 4,
+        bytes: include_bytes!("regression_traces/partition_aggregate.bin"),
+    },
+    RegressionTrace {
+        name: "rangetypes",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/rangetypes.bin"),
+    },
+    RegressionTrace {
+        name: "create_table",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/create_table.bin"),
+    },
+    RegressionTrace {
+        name: "json",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/json.bin"),
+    },
+    RegressionTrace {
+        name: "indexing",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/indexing.bin"),
+    },
+    RegressionTrace {
+        name: "stats_import",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/stats_import.bin"),
+    },
+    RegressionTrace {
+        name: "update",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/update.bin"),
+    },
+    RegressionTrace {
+        name: "create_index",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/create_index.bin"),
+    },
+    RegressionTrace {
+        name: "partition_prune",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/partition_prune.bin"),
+    },
+    RegressionTrace {
+        name: "stats_ext",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/stats_ext.bin"),
+    },
+    RegressionTrace {
+        name: "without_overlaps",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/without_overlaps.bin"),
+    },
+    RegressionTrace {
+        name: "foreign_key",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/foreign_key.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]

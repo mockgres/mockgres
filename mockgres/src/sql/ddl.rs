@@ -674,6 +674,8 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "enable_hashjoin"
             | "enable_mergejoin"
             | "enable_nestloop"
+            | "enable_incremental_sort"
+            | "enable_partitionwise_aggregate"
             | "jit"
             | "track_io_timing"
             | "plan_cache_mode"
