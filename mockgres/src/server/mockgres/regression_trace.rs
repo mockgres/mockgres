@@ -136,6 +136,56 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 1,
         bytes: include_bytes!("regression_traces/tstypes.bin"),
     },
+    RegressionTrace {
+        name: "strings",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/strings.bin"),
+    },
+    RegressionTrace {
+        name: "timestamp",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/timestamp.bin"),
+    },
+    RegressionTrace {
+        name: "arrays",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/arrays.bin"),
+    },
+    RegressionTrace {
+        name: "join_hash",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/join_hash.bin"),
+    },
+    RegressionTrace {
+        name: "rules",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/rules.bin"),
+    },
+    RegressionTrace {
+        name: "polymorphism",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/polymorphism.bin"),
+    },
+    RegressionTrace {
+        name: "xml",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/xml.bin"),
+    },
+    RegressionTrace {
+        name: "create_index_spgist",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/create_index_spgist.bin"),
+    },
+    RegressionTrace {
+        name: "constraints",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/constraints.bin"),
+    },
+    RegressionTrace {
+        name: "sqljson_queryfuncs",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/sqljson_queryfuncs.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
