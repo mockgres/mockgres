@@ -43,7 +43,7 @@ use crate::engine::exec::ValuesExec;
 use crate::engine::{
     DataType, EvalContext, Field, Plan, Schema, Value, fe, fe_code, to_pgwire_stream,
 };
-use crate::session::{Session, SessionManager, now_utc_micros};
+use crate::session::{RegressionTraceCopyCompletion, Session, SessionManager, now_utc_micros};
 use crate::sql::Planner;
 use crate::txn::{TransactionManager, TxId};
 

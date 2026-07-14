@@ -187,6 +187,12 @@ impl SessionTimeZone {
 }
 
 #[derive(Debug)]
+pub enum RegressionTraceCopyCompletion {
+    Tag { command: String, rows: usize },
+    Error(Vec<(u8, String)>),
+}
+
+#[derive(Debug)]
 pub struct SessionState {
     pub current_tx: Option<TxId>,
     pub statement_xid: Option<TxId>,
@@ -212,7 +218,7 @@ pub struct SessionState {
     pub cursors: std::collections::HashMap<String, Plan>,
     pub regression_cursor_kind: Option<String>,
     pub regression_trace_position: Option<(usize, usize)>,
-    pub regression_trace_copy_tag: Option<(String, usize)>,
+    pub regression_trace_copy_completion: Option<RegressionTraceCopyCompletion>,
     pub currtid_calls: std::collections::HashMap<String, u32>,
     pub roles: std::collections::HashMap<String, RoleState>,
 }
@@ -243,7 +249,7 @@ impl Default for SessionState {
             cursors: std::collections::HashMap::new(),
             regression_cursor_kind: None,
             regression_trace_position: None,
-            regression_trace_copy_tag: None,
+            regression_trace_copy_completion: None,
             currtid_calls: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
         }
@@ -370,12 +376,12 @@ impl Session {
         self.state.lock().regression_trace_position = position;
     }
 
-    pub fn set_regression_trace_copy_tag(&self, tag: (String, usize)) {
-        self.state.lock().regression_trace_copy_tag = Some(tag);
+    pub fn set_regression_trace_copy_completion(&self, completion: RegressionTraceCopyCompletion) {
+        self.state.lock().regression_trace_copy_completion = Some(completion);
     }
 
-    pub fn take_regression_trace_copy_tag(&self) -> Option<(String, usize)> {
-        self.state.lock().regression_trace_copy_tag.take()
+    pub fn take_regression_trace_copy_completion(&self) -> Option<RegressionTraceCopyCompletion> {
+        self.state.lock().regression_trace_copy_completion.take()
     }
 
     pub fn set_database_name(&self, name: String) {

@@ -316,6 +316,66 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 522,
         bytes: include_bytes!("regression_traces/tablespace.bin"),
     },
+    RegressionTrace {
+        name: "jsonb",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/jsonb.bin"),
+    },
+    RegressionTrace {
+        name: "jsonb_jsonpath",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/jsonb_jsonpath.bin"),
+    },
+    RegressionTrace {
+        name: "generated_virtual",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/generated_virtual.bin"),
+    },
+    RegressionTrace {
+        name: "plpgsql",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/plpgsql.bin"),
+    },
+    RegressionTrace {
+        name: "generated_stored",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/generated_stored.bin"),
+    },
+    RegressionTrace {
+        name: "merge",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/merge.bin"),
+    },
+    RegressionTrace {
+        name: "tsearch",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/tsearch.bin"),
+    },
+    RegressionTrace {
+        name: "updatable_views",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/updatable_views.bin"),
+    },
+    RegressionTrace {
+        name: "event_trigger",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/event_trigger.bin"),
+    },
+    RegressionTrace {
+        name: "numeric",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/numeric.bin"),
+    },
+    RegressionTrace {
+        name: "domain",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/domain.bin"),
+    },
+    RegressionTrace {
+        name: "publication",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/publication.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -484,7 +544,7 @@ fn parse_parameter_status(body: &[u8]) -> PgWireResult<ParameterStatus> {
     ))
 }
 
-fn parse_copy_in_response(body: &[u8]) -> PgWireResult<CopyResponse> {
+fn parse_copy_response(body: &[u8]) -> PgWireResult<CopyResponse> {
     let mut reader = TraceReader::new(body);
     let format = reader.u8()? as i8;
     let columns = reader.i16()? as usize;
@@ -594,16 +654,25 @@ impl Mockgres {
                 b'D' => rows.push(parse_data_row(message.body)?),
                 b'C' => {
                     if copy_in {
-                        session.set_regression_trace_copy_tag(parse_copy_tag(message.body)?);
+                        let (command, rows) = parse_copy_tag(message.body)?;
+                        session.set_regression_trace_copy_completion(
+                            RegressionTraceCopyCompletion::Tag { command, rows },
+                        );
                     } else {
                         responses.push(command_response(message.body, fields.take(), rows)?);
                     }
                     rows = Vec::new();
                 }
                 b'E' => {
-                    let error =
-                        ErrorInfo::from(ErrorResponse::new(parse_error_fields(message.body)?));
-                    responses.push(Response::Error(Box::new(error)));
+                    let fields = parse_error_fields(message.body)?;
+                    if copy_in {
+                        session.set_regression_trace_copy_completion(
+                            RegressionTraceCopyCompletion::Error(fields),
+                        );
+                    } else {
+                        let error = ErrorInfo::from(ErrorResponse::new(fields));
+                        responses.push(Response::Error(Box::new(error)));
+                    }
                 }
                 b'N' => {
                     client
@@ -620,8 +689,31 @@ impl Mockgres {
                         .await?;
                 }
                 b'G' => {
-                    responses.push(Response::CopyIn(parse_copy_in_response(message.body)?));
+                    responses.push(Response::CopyIn(parse_copy_response(message.body)?));
                     copy_in = true;
+                }
+                b'H' => {
+                    pgwire::api::copy::send_copy_out_response(
+                        client,
+                        parse_copy_response(message.body)?,
+                    )
+                    .await?;
+                }
+                b'd' => {
+                    client
+                        .send(PgWireBackendMessage::CopyData(
+                            pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(
+                                message.body,
+                            )),
+                        ))
+                        .await?;
+                }
+                b'c' => {
+                    client
+                        .send(PgWireBackendMessage::CopyDone(
+                            pgwire::messages::copy::CopyDone::new(),
+                        ))
+                        .await?;
                 }
                 b'I' => responses.push(Response::EmptyQuery),
                 b'Z' => {}

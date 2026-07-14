@@ -26,8 +26,19 @@ impl pgwire::api::copy::CopyHandler for Mockgres {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = self.session_for_client(client)?;
-        if let Some((command, rows)) = session.take_regression_trace_copy_tag() {
-            send_execution_response(client, Tag::new(&command).with_rows(rows)).await?;
+        if let Some(completion) = session.take_regression_trace_copy_completion() {
+            match completion {
+                RegressionTraceCopyCompletion::Tag { command, rows } => {
+                    send_execution_response(client, Tag::new(&command).with_rows(rows)).await?;
+                }
+                RegressionTraceCopyCompletion::Error(fields) => {
+                    client
+                        .send(PgWireBackendMessage::ErrorResponse(
+                            pgwire::messages::response::ErrorResponse::new(fields),
+                        ))
+                        .await?;
+                }
+            }
             return Ok(());
         }
         send_execution_response(client, Tag::new("COPY").with_rows(1)).await?;
