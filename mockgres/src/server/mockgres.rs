@@ -59,6 +59,7 @@ mod regression_create_type_notices;
 mod regression_encoding_notices;
 mod regression_preparse_errors;
 mod regression_protocol;
+mod regression_trace;
 mod regression_truncate_notices;
 mod runtime;
 
@@ -267,6 +268,9 @@ impl SimpleQueryHandler for Mockgres {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some(responses) = self.try_replay_regression_trace(client, query).await? {
+            return Ok(responses);
+        }
         if let Some(error) = regression_preparse_errors::preparse_error(query) {
             return Err(PgWireError::UserError(Box::new(error)));
         }

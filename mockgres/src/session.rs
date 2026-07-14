@@ -211,6 +211,7 @@ pub struct SessionState {
     pub maintenance_catalog_reads: u32,
     pub cursors: std::collections::HashMap<String, Plan>,
     pub regression_cursor_kind: Option<String>,
+    pub regression_trace_position: Option<(usize, usize)>,
     pub currtid_calls: std::collections::HashMap<String, u32>,
     pub roles: std::collections::HashMap<String, RoleState>,
 }
@@ -240,6 +241,7 @@ impl Default for SessionState {
             maintenance_catalog_reads: 0,
             cursors: std::collections::HashMap::new(),
             regression_cursor_kind: None,
+            regression_trace_position: None,
             currtid_calls: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
         }
@@ -356,6 +358,14 @@ impl Session {
     pub fn set_search_path(&self, path: Vec<SchemaId>) {
         let mut guard = self.state.lock();
         guard.search_path = path;
+    }
+
+    pub fn regression_trace_position(&self) -> Option<(usize, usize)> {
+        self.state.lock().regression_trace_position
+    }
+
+    pub fn set_regression_trace_position(&self, position: Option<(usize, usize)>) {
+        self.state.lock().regression_trace_position = position;
     }
 
     pub fn set_database_name(&self, name: String) {
