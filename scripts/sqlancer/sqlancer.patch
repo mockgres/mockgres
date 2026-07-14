@@ -1,0 +1,522 @@
+diff --git a/src/sqlancer/common/oracle/TLPWhereOracle.java b/src/sqlancer/common/oracle/TLPWhereOracle.java
+index 14834a6..e04fc30 100644
+--- a/src/sqlancer/common/oracle/TLPWhereOracle.java
++++ b/src/sqlancer/common/oracle/TLPWhereOracle.java
+@@ -25,6 +25,7 @@ public class TLPWhereOracle<Z extends Select<J, E, T, C>, J extends Join<E, T, C
+
+     private TLPWhereGenerator<Z, J, E, T, C> gen;
+     private final ExpectedErrors errors;
++    private final boolean useUnion;
+
+     private Reproducer<G> reproducer;
+     private String generatedQueryString;
+@@ -52,7 +53,8 @@ public class TLPWhereOracle<Z extends Select<J, E, T, C>, J extends Join<E, T, C
+             try {
+                 List<String> combinedString1 = new ArrayList<>();
+                 List<String> secondResultSet1 = ComparatorHelper.getCombinedResultSet(firstQueryString,
+-                        secondQueryString, thirdQueryString, combinedString1, !orderBy, globalState, errors);
++                        secondQueryString, thirdQueryString, combinedString1,
++                        !orderBy && useUnion, globalState, errors);
+                 ComparatorHelper.assumeResultSetsAreEqual(resultSet, secondResultSet1, originalQueryString,
+                         combinedString1, globalState);
+             } catch (AssertionError triggeredError) {
+@@ -64,12 +66,18 @@ public class TLPWhereOracle<Z extends Select<J, E, T, C>, J extends Join<E, T, C
+     }
+
+     public TLPWhereOracle(G state, TLPWhereGenerator<Z, J, E, T, C> gen, ExpectedErrors expectedErrors) {
++        this(state, gen, expectedErrors, true);
++    }
++
++    public TLPWhereOracle(G state, TLPWhereGenerator<Z, J, E, T, C> gen, ExpectedErrors expectedErrors,
++            boolean useUnion) {
+         if (state == null || gen == null || expectedErrors == null) {
+             throw new IllegalArgumentException("Null variables used to initialize test oracle.");
+         }
+         this.state = state;
+         this.gen = gen;
+         this.errors = expectedErrors;
++        this.useUnion = useUnion;
+     }
+
+     @Override
+@@ -108,7 +116,7 @@ public class TLPWhereOracle<Z extends Select<J, E, T, C>, J extends Join<E, T, C
+
+         List<String> combinedString = new ArrayList<>();
+         List<String> secondResultSet = ComparatorHelper.getCombinedResultSet(firstQueryString, secondQueryString,
+-                thirdQueryString, combinedString, !orderBy, state, errors);
++                thirdQueryString, combinedString, !orderBy && useUnion, state, errors);
+
+         ComparatorHelper.assumeResultSetsAreEqual(firstResultSet, secondResultSet, originalQueryString, combinedString,
+                 state);
+diff --git a/src/sqlancer/postgres/PostgresGlobalState.java b/src/sqlancer/postgres/PostgresGlobalState.java
+index 0f2c7eb..42f621b 100644
+--- a/src/sqlancer/postgres/PostgresGlobalState.java
++++ b/src/sqlancer/postgres/PostgresGlobalState.java
+@@ -31,6 +31,9 @@ public class PostgresGlobalState extends SQLGlobalState<PostgresOptions, Postgre
+     @Override
+     public void setConnection(SQLConnection con) {
+         super.setConnection(con);
++        if (PostgresProvider.mockgresMode) {
++            return;
++        }
+         try {
+             this.opClasses = getOpclasses(getConnection());
+             this.operators = getOperators(getConnection());
+diff --git a/src/sqlancer/postgres/PostgresOptions.java b/src/sqlancer/postgres/PostgresOptions.java
+index ebef13a..97fe570 100644
+--- a/src/sqlancer/postgres/PostgresOptions.java
++++ b/src/sqlancer/postgres/PostgresOptions.java
+@@ -41,6 +41,9 @@ public class PostgresOptions implements DBMSSpecificOptions<PostgresOracleFactor
+     @Parameter(names = "--extensions", description = "Specifies a comma-separated list of extension names to be created in each test database", arity = 1)
+     public String extensions = "";
+
++    @Parameter(names = "--mockgres", description = "Restrict PostgreSQL generation and catalog access to Mockgres-compatible features", arity = 1)
++    public boolean mockgres;
++
+     private static boolean determineDefaultTablespaceSupport() {
+         String osName = System.getProperty("os.name").toLowerCase();
+         if (osName.contains("linux")) {
+diff --git a/src/sqlancer/postgres/PostgresOracleFactory.java b/src/sqlancer/postgres/PostgresOracleFactory.java
+index 7c00021..d310a10 100644
+--- a/src/sqlancer/postgres/PostgresOracleFactory.java
++++ b/src/sqlancer/postgres/PostgresOracleFactory.java
+@@ -49,8 +49,11 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
+             ExpectedErrors expectedErrors = ExpectedErrors.newErrors().with(PostgresCommon.getCommonExpressionErrors())
+                     .with(PostgresCommon.getCommonFetchErrors())
+                     .withRegex(PostgresCommon.getCommonExpressionRegexErrors()).build();
++            if (PostgresProvider.mockgresMode) {
++                expectedErrors.add("unknown column");
++            }
+
+-            return new TLPWhereOracle<>(globalState, gen, expectedErrors);
++            return new TLPWhereOracle<>(globalState, gen, expectedErrors, !PostgresProvider.mockgresMode);
+         }
+
+     },
+diff --git a/src/sqlancer/postgres/PostgresProvider.java b/src/sqlancer/postgres/PostgresProvider.java
+index ec79782..8fa1ba8 100644
+--- a/src/sqlancer/postgres/PostgresProvider.java
++++ b/src/sqlancer/postgres/PostgresProvider.java
+@@ -40,6 +40,8 @@ import sqlancer.postgres.gen.PostgresDropIndexGenerator;
+ import sqlancer.postgres.gen.PostgresExplainGenerator;
+ import sqlancer.postgres.gen.PostgresIndexGenerator;
+ import sqlancer.postgres.gen.PostgresInsertGenerator;
++import sqlancer.postgres.gen.MockgresInsertGenerator;
++import sqlancer.postgres.gen.MockgresTableGenerator;
+ import sqlancer.postgres.gen.PostgresNotifyGenerator;
+ import sqlancer.postgres.gen.PostgresReindexGenerator;
+ import sqlancer.postgres.gen.PostgresSequenceGenerator;
+@@ -63,6 +65,8 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+      */
+     public static boolean generateOnlyKnown;
+
++    public static boolean mockgresMode;
++
+     protected String entryURL;
+     protected String username;
+     protected String password;
+@@ -214,7 +218,14 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+
+     @Override
+     public void generateDatabase(PostgresGlobalState globalState) throws Exception {
+-        readFunctions(globalState);
++        if (mockgresMode) {
++            globalState.addFunctionAndType("abs", PostgresGlobalState.IMMUTABLE);
++            globalState.addFunctionAndType("length", PostgresGlobalState.IMMUTABLE);
++            globalState.addFunctionAndType("lower", PostgresGlobalState.IMMUTABLE);
++            globalState.addFunctionAndType("upper", PostgresGlobalState.IMMUTABLE);
++        } else {
++            readFunctions(globalState);
++        }
+         createTables(globalState, Randomly.fromOptions(4, 5, 6));
+         prepareTables(globalState);
+
+@@ -236,6 +247,10 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+
+     @Override
+     public SQLConnection createDatabase(PostgresGlobalState globalState) throws SQLException {
++        mockgresMode = globalState.getDbmsSpecificOptions().mockgres;
++        if (mockgresMode) {
++            generateOnlyKnown = true;
++        }
+         if (globalState.getDbmsSpecificOptions().getTestOracleFactory().stream()
+                 .anyMatch((o) -> o == PostgresOracleFactory.PQS)) {
+             generateOnlyKnown = true;
+@@ -313,7 +328,7 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+         }
+
+         // Create database section
+-        createDatabaseCommand = getCreateDatabaseCommand(globalState);
++        createDatabaseCommand = mockgresMode ? "CREATE DATABASE " + databaseName : getCreateDatabaseCommand(globalState);
+         globalState.getState().logStatement(createDatabaseCommand + ";");
+         try (Statement s = con.createStatement()) {
+             s.execute(createDatabaseCommand);
+@@ -343,8 +358,9 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+         while (globalState.getSchema().getDatabaseTables().size() < numTables) {
+             try {
+                 String tableName = DBMSCommon.createTableName(globalState.getSchema().getDatabaseTables().size());
+-                SQLQueryAdapter createTable = PostgresTableGenerator.generate(tableName, globalState.getSchema(),
+-                        generateOnlyKnown, globalState);
++                SQLQueryAdapter createTable = mockgresMode ? MockgresTableGenerator.generate(tableName)
++                        : PostgresTableGenerator.generate(tableName, globalState.getSchema(), generateOnlyKnown,
++                                globalState);
+                 globalState.executeStatement(createTable);
+             } catch (IgnoreMeException e) {
+
+@@ -353,6 +369,16 @@ public class PostgresProvider extends SQLProviderAdapter<PostgresGlobalState, Po
+     }
+
+     protected void prepareTables(PostgresGlobalState globalState) throws Exception {
++        if (mockgresMode) {
++            for (PostgresSchema.PostgresTable table : globalState.getSchema().getDatabaseTables()) {
++                int inserts = globalState.getRandomly().getInteger(1,
++                        Math.max(2, globalState.getOptions().getMaxNumberInserts()));
++                for (int i = 0; i < inserts; i++) {
++                    globalState.executeStatement(MockgresInsertGenerator.insert(globalState, table));
++                }
++            }
++            return;
++        }
+         StatementExecutor<PostgresGlobalState, Action> se = new StatementExecutor<>(globalState, Action.values(),
+                 PostgresProvider::mapActions, (q) -> {
+                     if (globalState.getSchema().getDatabaseTables().isEmpty()) {
+diff --git a/src/sqlancer/postgres/PostgresSchema.java b/src/sqlancer/postgres/PostgresSchema.java
+index 8293755..606d598 100644
+--- a/src/sqlancer/postgres/PostgresSchema.java
++++ b/src/sqlancer/postgres/PostgresSchema.java
+@@ -1,9 +1,11 @@
+ package sqlancer.postgres;
+
+ import java.sql.ResultSet;
++import java.sql.ResultSetMetaData;
+ import java.sql.SQLException;
+ import java.sql.SQLIntegrityConstraintViolationException;
+ import java.sql.Statement;
++import java.sql.Types;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.HashMap;
+@@ -244,6 +246,9 @@ public class PostgresSchema extends AbstractSchema<PostgresGlobalState, Postgres
+     }
+
+     public static PostgresSchema fromConnection(SQLConnection con, String databaseName) throws SQLException {
++        if (PostgresProvider.mockgresMode) {
++            return fromMockgresConnection(con, databaseName);
++        }
+         try {
+             List<PostgresTable> databaseTables = new ArrayList<>();
+             try (Statement s = con.createStatement()) {
+@@ -278,6 +283,57 @@ public class PostgresSchema extends AbstractSchema<PostgresGlobalState, Postgres
+         }
+     }
+
++    private static PostgresSchema fromMockgresConnection(SQLConnection con, String databaseName) throws SQLException {
++        List<PostgresTable> databaseTables = new ArrayList<>();
++        try (Statement s = con.createStatement();
++                ResultSet rs = s.executeQuery("SELECT table_name, table_schema, table_type "
++                        + "FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name")) {
++            while (rs.next()) {
++                String tableName = rs.getString("table_name");
++                List<PostgresColumn> columns = getMockgresTableColumns(con, tableName);
++                PostgresTable table = new PostgresTable(tableName, columns, List.of(), TableType.STANDARD, List.of(),
++                        false, true, false);
++                for (PostgresColumn column : columns) {
++                    column.setTable(table);
++                }
++                databaseTables.add(table);
++            }
++        }
++        return new PostgresSchema(databaseTables, databaseName);
++    }
++
++    private static List<PostgresColumn> getMockgresTableColumns(SQLConnection con, String tableName)
++            throws SQLException {
++        List<PostgresColumn> columns = new ArrayList<>();
++        try (Statement s = con.createStatement();
++                ResultSet rs = s.executeQuery("SELECT * FROM " + tableName + " LIMIT 0")) {
++            ResultSetMetaData metadata = rs.getMetaData();
++            for (int i = 1; i <= metadata.getColumnCount(); i++) {
++                PostgresDataType type;
++                switch (metadata.getColumnType(i)) {
++                case Types.SMALLINT:
++                case Types.INTEGER:
++                case Types.BIGINT:
++                    type = PostgresDataType.INT;
++                    break;
++                case Types.BOOLEAN:
++                case Types.BIT:
++                    type = PostgresDataType.BOOLEAN;
++                    break;
++                case Types.CHAR:
++                case Types.VARCHAR:
++                case Types.LONGVARCHAR:
++                    type = PostgresDataType.TEXT;
++                    break;
++                default:
++                    throw new AssertionError("unsupported Mockgres JDBC type: " + metadata.getColumnTypeName(i));
++                }
++                columns.add(new PostgresColumn(metadata.getColumnName(i), type));
++            }
++        }
++        return columns;
++    }
++
+     protected static List<PostgresStatisticsObject> getStatistics(SQLConnection con) throws SQLException {
+         List<PostgresStatisticsObject> statistics = new ArrayList<>();
+         try (Statement s = con.createStatement()) {
+diff --git a/src/sqlancer/postgres/PostgresToStringVisitor.java b/src/sqlancer/postgres/PostgresToStringVisitor.java
+index 87bd3c4..c15c240 100644
+--- a/src/sqlancer/postgres/PostgresToStringVisitor.java
++++ b/src/sqlancer/postgres/PostgresToStringVisitor.java
+@@ -85,7 +85,7 @@ public final class PostgresToStringVisitor extends ToStringVisitor<PostgresExpre
+             sb.append("ONLY ");
+         }
+         sb.append(from.getTable().getName());
+-        if (!from.isOnly() && Randomly.getBoolean()) {
++        if (!from.isOnly() && !PostgresProvider.mockgresMode && Randomly.getBoolean()) {
+             sb.append("*");
+         }
+     }
+@@ -279,7 +279,8 @@ public final class PostgresToStringVisitor extends ToStringVisitor<PostgresExpre
+     public void visit(PostgresBetweenOperation op) {
+         sb.append("(");
+         visit(op.getExpr());
+-        if (PostgresProvider.generateOnlyKnown && op.getExpr().getExpressionType() == PostgresDataType.TEXT
++        if (PostgresProvider.generateOnlyKnown && !PostgresProvider.mockgresMode
++                && op.getExpr().getExpressionType() == PostgresDataType.TEXT
+                 && op.getLeft().getExpressionType() == PostgresDataType.TEXT) {
+             sb.append(" COLLATE \"C\"");
+         }
+@@ -291,7 +292,8 @@ public final class PostgresToStringVisitor extends ToStringVisitor<PostgresExpre
+         visit(op.getLeft());
+         sb.append(") AND (");
+         visit(op.getRight());
+-        if (PostgresProvider.generateOnlyKnown && op.getExpr().getExpressionType() == PostgresDataType.TEXT
++        if (PostgresProvider.generateOnlyKnown && !PostgresProvider.mockgresMode
++                && op.getExpr().getExpressionType() == PostgresDataType.TEXT
+                 && op.getRight().getExpressionType() == PostgresDataType.TEXT) {
+             sb.append(" COLLATE \"C\"");
+         }
+diff --git a/src/sqlancer/postgres/gen/MockgresInsertGenerator.java b/src/sqlancer/postgres/gen/MockgresInsertGenerator.java
+new file mode 100644
+index 0000000..c157b13
+--- /dev/null
++++ b/src/sqlancer/postgres/gen/MockgresInsertGenerator.java
+@@ -0,0 +1,30 @@
++package sqlancer.postgres.gen;
++
++import java.util.List;
++import java.util.stream.Collectors;
++
++import sqlancer.common.query.ExpectedErrors;
++import sqlancer.common.query.SQLQueryAdapter;
++import sqlancer.postgres.PostgresGlobalState;
++import sqlancer.postgres.PostgresSchema.PostgresColumn;
++import sqlancer.postgres.PostgresSchema.PostgresTable;
++import sqlancer.postgres.PostgresVisitor;
++
++public final class MockgresInsertGenerator {
++    private MockgresInsertGenerator() {
++    }
++
++    public static SQLQueryAdapter insert(PostgresGlobalState globalState, PostgresTable table) {
++        List<PostgresColumn> columns = table.getRandomNonEmptyColumnSubset();
++        String names = columns.stream().map(PostgresColumn::getName).collect(Collectors.joining(", "));
++        String values = columns.stream()
++                .map(column -> PostgresVisitor.asString(PostgresExpressionGenerator
++                        .generateConstant(globalState.getRandomly(), column.getType())))
++                .collect(Collectors.joining(", "));
++        ExpectedErrors errors = new ExpectedErrors();
++        errors.add("out of range");
++        errors.add("invalid input syntax");
++        return new SQLQueryAdapter("INSERT INTO " + table.getName() + " (" + names + ") VALUES (" + values + ")",
++                errors);
++    }
++}
+diff --git a/src/sqlancer/postgres/gen/MockgresTableGenerator.java b/src/sqlancer/postgres/gen/MockgresTableGenerator.java
+new file mode 100644
+index 0000000..bc83ee7
+--- /dev/null
++++ b/src/sqlancer/postgres/gen/MockgresTableGenerator.java
+@@ -0,0 +1,38 @@
++package sqlancer.postgres.gen;
++
++import sqlancer.Randomly;
++import sqlancer.common.DBMSCommon;
++import sqlancer.common.query.SQLQueryAdapter;
++import sqlancer.postgres.PostgresSchema.PostgresDataType;
++
++public final class MockgresTableGenerator {
++    private MockgresTableGenerator() {
++    }
++
++    public static SQLQueryAdapter generate(String tableName) {
++        StringBuilder sql = new StringBuilder("CREATE TABLE ").append(tableName).append(" (");
++        int columnCount = Randomly.smallNumber() + 1;
++        for (int i = 0; i < columnCount; i++) {
++            if (i != 0) {
++                sql.append(", ");
++            }
++            sql.append(DBMSCommon.createColumnName(i)).append(" ");
++            PostgresDataType type = PostgresDataType.getRandomType();
++            switch (type) {
++            case INT:
++                sql.append("BIGINT");
++                break;
++            case BOOLEAN:
++                sql.append("BOOLEAN");
++                break;
++            case TEXT:
++                sql.append("TEXT");
++                break;
++            default:
++                throw new AssertionError(type);
++            }
++        }
++        sql.append(")");
++        return new SQLQueryAdapter(sql.toString(), true);
++    }
++}
+diff --git a/src/sqlancer/postgres/gen/PostgresExpressionGenerator.java b/src/sqlancer/postgres/gen/PostgresExpressionGenerator.java
+index bad87af..abc17b1 100644
+--- a/src/sqlancer/postgres/gen/PostgresExpressionGenerator.java
++++ b/src/sqlancer/postgres/gen/PostgresExpressionGenerator.java
+@@ -176,12 +176,21 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+             validOptions.remove(BooleanExpression.POSIX_REGEX);
+             validOptions.remove(BooleanExpression.BINARY_RANGE_COMPARISON);
+         }
++        if (PostgresProvider.mockgresMode) {
++            validOptions.remove(BooleanExpression.FUNCTION);
++            validOptions.remove(BooleanExpression.BETWEEN);
++            validOptions.remove(BooleanExpression.LIKE);
++            validOptions.remove(BooleanExpression.CAST);
++        }
+         BooleanExpression option = Randomly.fromList(validOptions);
+         switch (option) {
+         case POSTFIX_OPERATOR:
+-            PostfixOperator random = PostfixOperator.getRandom();
+-            return PostgresPostfixOperation
+-                    .create(generateExpression(depth + 1, Randomly.fromOptions(random.getInputDataTypes())), random);
++            PostfixOperator random = PostgresProvider.mockgresMode
++                    ? Randomly.fromOptions(PostfixOperator.IS_NULL, PostfixOperator.IS_NOT_NULL)
++                    : PostfixOperator.getRandom();
++            PostgresDataType inputType = PostgresProvider.mockgresMode ? PostgresDataType.getRandomType()
++                    : Randomly.fromOptions(random.getInputDataTypes());
++            return PostgresPostfixOperation.create(generateExpression(depth + 1, inputType), random);
+         case IN_OPERATION:
+             return inOperation(depth + 1);
+         case NOT:
+@@ -255,7 +264,8 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+     private PostgresExpression getComparison(PostgresExpression leftExpr, PostgresExpression rightExpr) {
+         PostgresBinaryComparisonOperation op = new PostgresBinaryComparisonOperation(leftExpr, rightExpr,
+                 PostgresBinaryComparisonOperation.PostgresBinaryComparisonOperator.getRandom());
+-        if (PostgresProvider.generateOnlyKnown && op.getLeft().getExpressionType() == PostgresDataType.TEXT
++        if (PostgresProvider.generateOnlyKnown && !PostgresProvider.mockgresMode
++                && op.getLeft().getExpressionType() == PostgresDataType.TEXT
+                 && op.getRight().getExpressionType() == PostgresDataType.TEXT) {
+             return new PostgresCollate(op, "C");
+         }
+@@ -292,7 +302,7 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+     }
+
+     private PostgresExpression potentiallyWrapInCollate(PostgresDataType dataType, PostgresExpression exprInternal) {
+-        if (dataType == PostgresDataType.TEXT && PostgresProvider.generateOnlyKnown) {
++        if (dataType == PostgresDataType.TEXT && PostgresProvider.generateOnlyKnown && !PostgresProvider.mockgresMode) {
+             return new PostgresCollate(exprInternal, "C");
+         } else {
+             return exprInternal;
+@@ -316,6 +326,8 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+                         return createColumnOfType(dataType);
+                     }
+                 }
++            } else if (PostgresProvider.mockgresMode) {
++                return generateConstant(r, dataType);
+             } else {
+                 if (Randomly.getBoolean()) {
+                     return new PostgresCastOperation(generateExpression(depth + 1), getCompoundDataType(dataType));
+@@ -405,6 +417,10 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+         if (!globalState.getDbmsSpecificOptions().testCollations) {
+             validOptions.remove(TextExpression.COLLATE);
+         }
++        if (PostgresProvider.mockgresMode) {
++            validOptions.remove(TextExpression.COLLATE);
++            validOptions.remove(TextExpression.CAST);
++        }
+         option = Randomly.fromList(validOptions);
+
+         switch (option) {
+@@ -512,8 +528,10 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+     }
+
+     private PostgresExpression generateIntExpression(int depth) {
+-        IntExpression option;
+-        option = Randomly.fromOptions(IntExpression.values());
++        IntExpression option = PostgresProvider.mockgresMode
++                ? Randomly.fromOptions(IntExpression.UNARY_OPERATION, IntExpression.FUNCTION,
++                        IntExpression.BINARY_ARITHMETIC_EXPRESSION)
++                : Randomly.fromOptions(IntExpression.values());
+         switch (option) {
+         case CAST:
+             return new PostgresCastOperation(generateExpression(depth + 1), getCompoundDataType(PostgresDataType.INT));
+@@ -524,8 +542,13 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+         case FUNCTION:
+             return generateFunction(depth + 1, PostgresDataType.INT);
+         case BINARY_ARITHMETIC_EXPRESSION:
++            PostgresBinaryOperator operator = PostgresProvider.mockgresMode
++                    ? Randomly.fromOptions(PostgresBinaryOperator.ADDITION, PostgresBinaryOperator.SUBTRACTION,
++                            PostgresBinaryOperator.MULTIPLICATION, PostgresBinaryOperator.DIVISION,
++                            PostgresBinaryOperator.MODULO)
++                    : PostgresBinaryOperator.getRandom();
+             return new PostgresBinaryArithmeticOperation(generateExpression(depth + 1, PostgresDataType.INT),
+-                    generateExpression(depth + 1, PostgresDataType.INT), PostgresBinaryOperator.getRandom());
++                    generateExpression(depth + 1, PostgresDataType.INT), operator);
+         default:
+             throw new AssertionError();
+         }
+@@ -566,7 +589,7 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+         // }
+         switch (type) {
+         case INT:
+-            if (Randomly.getBooleanWithSmallProbability()) {
++            if (!PostgresProvider.mockgresMode && Randomly.getBooleanWithSmallProbability()) {
+                 return PostgresConstant.createTextConstant(String.valueOf(r.getInteger()));
+             } else {
+                 return PostgresConstant.createIntConstant(r.getInteger());
+@@ -683,7 +706,7 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+         if (Randomly.getBoolean()) {
+             select.setWhereClause(gen.generateExpression(0, PostgresDataType.BOOLEAN));
+         }
+-        if (Randomly.getBooleanWithRatherLowProbability()) {
++        if (!PostgresProvider.mockgresMode && Randomly.getBooleanWithRatherLowProbability()) {
+             select.setOrderByClauses(gen.generateOrderBys());
+         }
+         if (Randomly.getBoolean()) {
+@@ -756,12 +779,16 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+             PostgresExpression joinClause = generateExpression(PostgresDataType.BOOLEAN);
+             PostgresTable table = Randomly.fromList(targetTables);
+             targetTables.remove(table);
+-            PostgresJoinType options = PostgresJoinType.getRandom();
+-            PostgresJoin j = new PostgresJoin(new PostgresFromTable(table, Randomly.getBoolean()), joinClause, options);
++            PostgresJoinType options = PostgresProvider.mockgresMode
++                    ? Randomly.fromOptions(PostgresJoinType.INNER, PostgresJoinType.LEFT, PostgresJoinType.CROSS)
++                    : PostgresJoinType.getRandom();
++            PostgresJoin j = new PostgresJoin(
++                    new PostgresFromTable(table, !PostgresProvider.mockgresMode && Randomly.getBoolean()), joinClause,
++                    options);
+             joinStatements.add(j);
+         }
+         // JOIN subqueries
+-        for (int i = 0; i < Randomly.smallNumber(); i++) {
++        for (int i = 0; !PostgresProvider.mockgresMode && i < Randomly.smallNumber(); i++) {
+             PostgresTables subqueryTables = globalState.getSchema().getRandomTableNonEmptyTables();
+             PostgresSubquery subquery = createSubquery(globalState, String.format("sub%d", i), subqueryTables);
+             PostgresExpression joinClause = generateExpression(PostgresDataType.BOOLEAN);
+@@ -774,7 +801,8 @@ public class PostgresExpressionGenerator implements ExpressionGenerator<Postgres
+
+     @Override
+     public List<PostgresExpression> getTableRefs() {
+-        return targetTables.stream().map(t -> new PostgresFromTable(t, Randomly.getBoolean()))
++        return targetTables.stream()
++                .map(t -> new PostgresFromTable(t, !PostgresProvider.mockgresMode && Randomly.getBoolean()))
+                 .collect(Collectors.toList());
+     }

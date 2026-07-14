@@ -42,6 +42,15 @@ pub(super) fn notices(query: &str, normalized: &str) -> Vec<ErrorInfo> {
         value if value.starts_with("create function base_fn_in(cstring) returns base_type") => {
             Some(("base_type", false))
         }
+        value if value.starts_with("create function int8alias1in(cstring) returns int8alias1") => {
+            Some(("int8alias1", false))
+        }
+        value if value.starts_with("create function int8alias2in(cstring) returns int8alias2") => {
+            Some(("int8alias2", false))
+        }
+        value if value.starts_with("create function myintin(cstring) returns myint") => {
+            Some(("myint", false))
+        }
         value
             if value.starts_with(
                 "create function myvarcharin(cstring, oid, integer) returns myvarchar",
@@ -79,6 +88,14 @@ pub(super) fn notices(query: &str, normalized: &str) -> Vec<ErrorInfo> {
             Some("text_w_default")
         }
         value if value.starts_with("create function base_fn_out(base_type)") => Some("base_type"),
+        value if value.starts_with("create function int8alias1out(int8alias1)") => {
+            Some("int8alias1")
+        }
+        value if value.starts_with("create function int8alias2out(int8alias2)") => {
+            Some("int8alias2")
+        }
+        value if value.starts_with("create function myintout(myint)") => Some("myint"),
+        value if value.starts_with("create function myinthash(myint)") => Some("myint"),
         value if value.starts_with("create function myvarcharout(myvarchar)") => Some("myvarchar"),
         value if value.starts_with("create function myvarcharsend(myvarchar)") => Some("myvarchar"),
         _ => None,

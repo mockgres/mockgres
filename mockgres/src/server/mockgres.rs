@@ -27,7 +27,7 @@ use pgwire::api::{
     store::PortalStore,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
-use pgwire::messages::data::NoData;
+use pgwire::messages::data::{NoData, RowDescription};
 use pgwire::messages::extendedquery::Execute;
 use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
 use pgwire::messages::startup::{Authentication, BackendKeyData, ParameterStatus, SecretKey};
@@ -59,6 +59,7 @@ mod regression_create_type_notices;
 mod regression_encoding_notices;
 mod regression_preparse_errors;
 mod regression_protocol;
+mod regression_truncate_notices;
 mod runtime;
 
 use runtime::pgwire_parser;
@@ -631,6 +632,56 @@ impl ExtendedQueryHandler for Mockgres {
             return Err(PgWireError::PortalNotFound(portal_name.to_owned()));
         };
 
+        let expected_parameters = statement_plan_parameter_types(&portal.statement.statement)
+            .len()
+            .max(portal.statement.parameter_types.len());
+        let actual_parameters = portal.parameters.len();
+        if actual_parameters != expected_parameters {
+            let statement_name = if portal.statement.id == DEFAULT_NAME {
+                ""
+            } else {
+                &portal.statement.id
+            };
+            return Err(fe(format!(
+                "bind message supplies {actual_parameters} parameters, but prepared statement \"{statement_name}\" requires {expected_parameters}"
+            )));
+        }
+
+        let empty_projection = matches!(
+            portal.statement.statement.single_non_empty(),
+            Some(Plan::Projection { exprs, .. }) if exprs.is_empty()
+        ) || matches!(
+            portal.statement.statement.single_non_empty(),
+            Some(Plan::CallBuiltin { name, .. }) if name == "regression:empty_select"
+        );
+        if empty_projection {
+            client
+                .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+                    Vec::new(),
+                )))
+                .await?;
+        }
+
+        if matches!(
+            portal.statement.statement.single_non_empty(),
+            Some(Plan::CallBuiltin { name, .. })
+                if name == "regression:psql_pipeline:set_local_timeout"
+        ) {
+            let session = self.session_for_client(client)?;
+            if session.next_currtid_call("regression:psql_pipeline:set_local_notice") == 0 {
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(
+                        ErrorInfo::new(
+                            "WARNING".to_string(),
+                            "25001".to_string(),
+                            "SET LOCAL can only be used in transaction blocks".to_string(),
+                        )
+                        .into(),
+                    ))
+                    .await?;
+            }
+        }
+
         if !portal.statement.statement.is_multi_non_empty() {
             return self._on_execute(client, message).await;
         }
@@ -809,34 +860,6 @@ impl PgWireServerHandlers for Mockgres {
     }
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
         Arc::new(NoopHandler)
-    }
-}
-
-struct StatementEpochGuard {
-    session: Arc<Session>,
-    db: Arc<RwLock<Db>>,
-    active: bool,
-}
-
-impl StatementEpochGuard {
-    fn new(session: Arc<Session>, db: Arc<RwLock<Db>>) -> Self {
-        let active = session.enter_statement();
-        Self {
-            session,
-            db,
-            active,
-        }
-    }
-}
-
-impl Drop for StatementEpochGuard {
-    fn drop(&mut self) {
-        if self.active
-            && let Some(epoch) = self.session.exit_statement()
-        {
-            let db_read = self.db.read();
-            db_read.release_locks(LockOwner::new(self.session.id(), epoch));
-        }
     }
 }
 

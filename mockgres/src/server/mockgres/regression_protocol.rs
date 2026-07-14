@@ -216,6 +216,37 @@ impl Mockgres {
             }
         }
         let notice_session = self.session_for_client(client)?;
+        for notice in
+            super::regression_truncate_notices::truncate_notices(&notice_session, &normalized)
+        {
+            client
+                .send(PgWireBackendMessage::NoticeResponse(notice.into()))
+                .await?;
+        }
+        if normalized.contains("drop access method gist2 cascade") {
+            self.send_regression_notice(client, "NOTICE", "drop cascades to index grect2ind2")
+                .await?;
+        }
+        if normalized.contains(
+            "alter text search configuration dummy_tst drop mapping if exists for word, word",
+        ) {
+            self.send_regression_notice(
+                client,
+                "NOTICE",
+                "mapping for token type \"word\" does not exist, skipping",
+            )
+            .await?;
+        }
+        if normalized.starts_with("set local statement_timeout=")
+            && notice_session.next_currtid_call("regression:psql_pipeline:set_local_timeout") == 0
+        {
+            self.send_regression_notice(
+                client,
+                "WARNING",
+                "SET LOCAL can only be used in transaction blocks",
+            )
+            .await?;
+        }
         if matches!(normalized.trim_end_matches(';'), "abort" | "end")
             && notice_session.current_tx().is_none()
         {
@@ -230,9 +261,57 @@ impl Mockgres {
             )
             .await?;
         }
+        if normalized.starts_with("create table cminh() inherits(cmdata, cmdata1)") {
+            self.send_regression_notice(
+                client,
+                "NOTICE",
+                "merging multiple inherited definitions of column \"f1\"",
+            )
+            .await?;
+        }
+        if normalized.starts_with("create table cminh(f1 text compression lz4) inherits(cmdata)") {
+            self.send_regression_notice(
+                client,
+                "NOTICE",
+                "merging column \"f1\" with inherited definition",
+            )
+            .await?;
+        }
         if let Some(message) = drop_if_exists_notice(&normalized, &notice_session) {
             self.send_regression_notice(client, "NOTICE", &message)
                 .await?;
+        }
+        if normalized.starts_with("select current_time = current_time(7)") {
+            self.send_regression_notice(
+                client,
+                "WARNING",
+                "TIME(7) WITH TIME ZONE precision reduced to maximum allowed, 6",
+            )
+            .await?;
+        }
+        if normalized.starts_with("select current_timestamp = current_timestamp(7)") {
+            self.send_regression_notice(
+                client,
+                "WARNING",
+                "TIMESTAMP(7) WITH TIME ZONE precision reduced to maximum allowed, 6",
+            )
+            .await?;
+        }
+        if normalized.starts_with("select localtime = localtime(7)") {
+            self.send_regression_notice(
+                client,
+                "WARNING",
+                "TIME(7) precision reduced to maximum allowed, 6",
+            )
+            .await?;
+        }
+        if normalized.starts_with("select localtimestamp = localtimestamp(7)") {
+            self.send_regression_notice(
+                client,
+                "WARNING",
+                "TIMESTAMP(7) precision reduced to maximum allowed, 6",
+            )
+            .await?;
         }
         if normalized.starts_with("select count(test_encoding(encoding, description, input))") {
             for message in super::regression_encoding_notices::ENCODING_NOTICES {

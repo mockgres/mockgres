@@ -609,7 +609,23 @@ pub(crate) fn parse_order_clause(clause: &[pg_query::Node]) -> PgWireResult<Vec<
         let asc = match s.sortby_dir {
             1 | 2 => true,
             3 => false,
-            _ => true,
+            4 => {
+                let operator = s
+                    .use_op
+                    .iter()
+                    .filter_map(|node| match node.node.as_ref() {
+                        Some(NodeEnum::String(value)) => Some(value.sval.as_str()),
+                        _ => None,
+                    })
+                    .next_back()
+                    .ok_or_else(|| fe("ORDER BY USING requires an operator"))?;
+                match operator {
+                    "<" => true,
+                    ">" => false,
+                    _ => return Err(fe("unsupported ORDER BY USING operator")),
+                }
+            }
+            _ => return Err(fe("bad ORDER BY direction")),
         };
         let nulls_first = match s.sortby_nulls {
             2 => Some(true),

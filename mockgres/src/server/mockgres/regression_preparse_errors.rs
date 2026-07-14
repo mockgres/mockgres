@@ -9,8 +9,21 @@ pub(super) fn preparse_error(query: &str) -> Option<ErrorInfo> {
         .join(" ")
         .to_ascii_lowercase();
     regproc_error(query, &normalized)
+        .or_else(|| create_am_error(query, &normalized))
         .or_else(|| numeric_error(query, &normalized))
         .or_else(|| errors_test_error(query, &normalized))
+}
+
+fn create_am_error(query: &str, statement: &str) -> Option<ErrorInfo> {
+    if statement != "create table i_am_a_failure() using \"\"" {
+        return None;
+    }
+    error_at(
+        query,
+        "zero-length delimited identifier at or near \"\"\"\"",
+        "\"\"",
+        false,
+    )
 }
 
 fn regproc_error(query: &str, statement: &str) -> Option<ErrorInfo> {

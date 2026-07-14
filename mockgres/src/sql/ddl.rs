@@ -654,7 +654,8 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
     let normalized = name_lower.replace(' ', "_");
     let supported = matches!(
         normalized.as_str(),
-        "client_min_messages"
+        "application_name"
+            | "client_min_messages"
             | "client_encoding"
             | "extra_float_digits"
             | "synchronous_commit"
@@ -669,6 +670,14 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "enable_indexscan"
             | "enable_indexonlyscan"
             | "enable_bitmapscan"
+            | "enable_sort"
+            | "enable_hashjoin"
+            | "enable_mergejoin"
+            | "enable_nestloop"
+            | "jit"
+            | "track_io_timing"
+            | "plan_cache_mode"
+            | "compute_query_id"
             | "work_mem"
             | "max_parallel_maintenance_workers"
             | "min_parallel_index_scan_size"

@@ -128,6 +128,18 @@ async fn show_and_set_commands() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn set_application_name_is_accepted_for_client_compatibility() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .execute("set application_name = 'sqlancer'", &[])
+        .await
+        .expect("set application_name");
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn show_standard_conforming_strings() {
     let ctx = common::start().await;
     let rows = ctx

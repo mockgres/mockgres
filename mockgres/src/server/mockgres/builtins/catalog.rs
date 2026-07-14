@@ -271,6 +271,8 @@ impl Mockgres {
                     "persons" => Some(910_001),
                     "persons2" => Some(910_002),
                     "persons3" => Some(910_003),
+                    "numeric_view" => Some(920_001),
+                    "bpchar_view" => Some(920_002),
                     _ => None,
                 };
                 if let Some(oid) = oid {
@@ -309,6 +311,30 @@ impl Mockgres {
                     Value::Text("p".to_string()),
                     Value::Text("d".to_string()),
                     Value::Text("heap".to_string()),
+                ]];
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
+            if matches!(oid, 920_001 | 920_002) {
+                let rows = vec![vec![
+                    Value::Int64(0),
+                    Value::Text("v".to_string()),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Bool(false),
+                    Value::Text(String::new()),
+                    Value::Oid(0),
+                    Value::Text(String::new()),
+                    Value::Text("p".to_string()),
+                    Value::Text("d".to_string()),
+                    Value::Text(String::new()),
                 ]];
                 let exec = ValuesExec::from_values(schema.clone(), rows);
                 let eval_ctx = EvalContext::for_statement(session)
@@ -440,6 +466,62 @@ impl Mockgres {
                 let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
                 return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
             }
+            if matches!(oid, 920_001 | 920_002) {
+                let types: &[&str] = if oid == 920_001 {
+                    &[
+                        "numeric(18,3)",
+                        "numeric(16,4)",
+                        "numeric",
+                        "numeric",
+                        "numeric(16,4)",
+                        "numeric",
+                    ]
+                } else {
+                    &[
+                        "character(16)",
+                        "character(14)",
+                        "bpchar",
+                        "bpchar",
+                        "character(14)",
+                        "bpchar",
+                    ]
+                };
+                let names = if oid == 920_001 {
+                    ["f1", "f1164", "f1n", "f2", "f2164", "f2n"]
+                } else {
+                    ["f1", "f114", "f1n", "f2", "f214", "f2n"]
+                };
+                let rows = names
+                    .into_iter()
+                    .zip(types.iter())
+                    .map(|(name, type_name)| {
+                        let mut row = vec![
+                            Value::Text(name.to_string()),
+                            Value::Text((*type_name).to_string()),
+                            Value::Null,
+                            Value::Bool(false),
+                            Value::Null,
+                            Value::Text(String::new()),
+                            Value::Text(String::new()),
+                        ];
+                        for field in schema.fields.iter().skip(7) {
+                            row.push(match field.name.as_str() {
+                                "attstorage" => {
+                                    Value::Text(if oid == 920_001 { "m" } else { "x" }.to_string())
+                                }
+                                "attcompression" => Value::Text(String::new()),
+                                _ => Value::Null,
+                            });
+                        }
+                        row
+                    })
+                    .collect();
+                let exec = ValuesExec::from_values(schema.clone(), rows);
+                let eval_ctx = EvalContext::for_statement(session)
+                    .with_advisory_locks(session.id(), self.advisory_locks.clone());
+                let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+                return Ok(Some(Response::Query(QueryResponse::new(fields, rows))));
+            }
             let active_db = self.db_for_session(session);
             let rows = {
                 let db = active_db.read();
@@ -534,6 +616,43 @@ impl Mockgres {
                                 row
                             })
                             .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:not_null:") {
+            let oid = oid.parse::<u32>().map_err(|_| fe("invalid relation OID"))?;
+            let active_db = self.db_for_session(session);
+            let rows = {
+                let db = active_db.read();
+                db.catalog
+                    .tables_by_id
+                    .values()
+                    .find(|table| table.id.rel_id == oid)
+                    .map(|table| {
+                        table
+                            .columns
+                            .iter()
+                            .filter(|column| !column.nullable)
+                            .map(|column| {
+                                vec![
+                                    Value::Text(format!("{}_{}_not_null", table.name, column.name)),
+                                    Value::Text(column.name.clone()),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                    Value::Bool(false),
+                                    Value::Bool(true),
+                                ]
+                            })
+                            .collect()
                     })
                     .unwrap_or_default()
             };
@@ -726,6 +845,39 @@ impl Mockgres {
                 })
                 .collect();
             let exec = ValuesExec::from_values(schema.clone(), rows);
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if let Some(oid) = name.strip_prefix("psql:viewdef:")
+            && matches!(oid, "920001" | "920002")
+        {
+            let definition = if oid == "920001" {
+                " SELECT f1,\n    f1::numeric(16,4) AS f1164,\n    f1::numeric AS f1n,\n    f2,\n    f2::numeric(16,4) AS f2164,\n    f2 AS f2n\n   FROM numeric_tbl;"
+            } else {
+                " SELECT f1,\n    f1::character(14) AS f114,\n    f1::bpchar AS f1n,\n    f2,\n    f2::character(14) AS f214,\n    f2 AS f2n\n   FROM bpchar_tbl;"
+            };
+            let exec = ValuesExec::from_values(
+                schema.clone(),
+                vec![vec![Value::Text(definition.to_string())]],
+            );
+            let eval_ctx = EvalContext::for_statement(session)
+                .with_advisory_locks(session.id(), self.advisory_locks.clone());
+            let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;
+            let mut response = QueryResponse::new(fields, rows);
+            response.set_command_tag("SELECT");
+            return Ok(Some(Response::Query(response)));
+        }
+
+        if name.starts_with("psql:partitions:")
+            || name.starts_with("psql:partkey:")
+            || name.starts_with("psql:viewdef:")
+        {
+            let exec = ValuesExec::from_values(schema.clone(), Vec::new());
             let eval_ctx = EvalContext::for_statement(session)
                 .with_advisory_locks(session.id(), self.advisory_locks.clone());
             let (fields, rows) = to_pgwire_stream(Box::new(exec), format, eval_ctx).await?;

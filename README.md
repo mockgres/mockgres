@@ -60,6 +60,18 @@ under `target/postgres-regress`. See `scripts/postgres-regress/README.md` for
 details. The upstream suite uses a fresh shared database and does not invoke
 `mockgres_freeze()` or `mockgres_reset()`.
 
+SQLancer's TLP-WHERE oracle can exercise randomized query semantics through a
+pinned Mockgres compatibility profile:
+
+```bash
+scripts/sqlancer/run
+```
+
+The default campaign is deterministic and writes logs and reproducers under
+`target/sqlancer/runs`. Increase `SQLANCER_QUERIES` or select a different
+`SQLANCER_SEED` for longer campaigns. See `scripts/sqlancer/README.md` for the
+profile scope and prerequisites.
+
 ## Features
 - Supported SQL surface (SELECT/INSERT/UPDATE/DELETE, joins, ON CONFLICT, etc.).
 - PG wire protocol compatibility expectations.

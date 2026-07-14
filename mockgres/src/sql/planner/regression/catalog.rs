@@ -492,6 +492,29 @@ pub(super) fn try_plan_regression_catalog(sql: &str, normalized: &str) -> Option
             },
         });
     }
+    if normalized.starts_with("select c.oid::pg_catalog.regclass, c.relkind, inhdetachpending")
+        && normalized.contains("pg_catalog.pg_inherits")
+        && let Some(oid) = quoted_value_after(normalized, "i.inhparent = '")
+    {
+        let fields = [
+            ("regclass", DataType::Text),
+            ("relkind", DataType::Text),
+            ("inhdetachpending", DataType::Bool),
+            ("pg_get_expr", DataType::Text),
+        ]
+        .into_iter()
+        .map(|(name, data_type)| Field {
+            name: name.to_string(),
+            data_type,
+            origin: None,
+        })
+        .collect();
+        return Some(Plan::CallBuiltin {
+            name: format!("psql:partitions:{oid}"),
+            args: Vec::new(),
+            schema: Schema { fields },
+        });
+    }
     if normalized.contains("pg_catalog.pg_inherits") {
         return Some(Plan::Values {
             rows: Vec::new(),
@@ -516,6 +539,61 @@ pub(super) fn try_plan_regression_catalog(sql: &str, normalized: &str) -> Option
                     origin: None,
                 }],
             },
+        });
+    }
+    if normalized.starts_with("select pg_catalog.pg_get_partkeydef('")
+        && let Some(oid) = quoted_value_after(normalized, "pg_get_partkeydef('")
+    {
+        return Some(Plan::CallBuiltin {
+            name: format!("psql:partkey:{oid}"),
+            args: Vec::new(),
+            schema: Schema {
+                fields: vec![Field {
+                    name: "pg_get_partkeydef".to_string(),
+                    data_type: DataType::Text,
+                    origin: None,
+                }],
+            },
+        });
+    }
+    if normalized.starts_with("select pg_catalog.pg_get_viewdef('")
+        && let Some(oid) = quoted_value_after(normalized, "pg_get_viewdef('")
+    {
+        return Some(Plan::CallBuiltin {
+            name: format!("psql:viewdef:{oid}"),
+            args: Vec::new(),
+            schema: Schema {
+                fields: vec![Field {
+                    name: "pg_get_viewdef".to_string(),
+                    data_type: DataType::Text,
+                    origin: None,
+                }],
+            },
+        });
+    }
+    if normalized.starts_with("select c.conname, a.attname, c.connoinherit")
+        && normalized.contains("c.contype = 'n'")
+        && let Some(oid) = quoted_value_after(normalized, "c.conrelid = '")
+    {
+        let fields = [
+            ("conname", DataType::Text),
+            ("attname", DataType::Text),
+            ("connoinherit", DataType::Bool),
+            ("conislocal", DataType::Bool),
+            ("?column?", DataType::Bool),
+            ("convalidated", DataType::Bool),
+        ]
+        .into_iter()
+        .map(|(name, data_type)| Field {
+            name: name.to_string(),
+            data_type,
+            origin: None,
+        })
+        .collect();
+        return Some(Plan::CallBuiltin {
+            name: format!("psql:not_null:{oid}"),
+            args: Vec::new(),
+            schema: Schema { fields },
         });
     }
     if normalized.contains("alter table pred_parent alter a drop not null") {

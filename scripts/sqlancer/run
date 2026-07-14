@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/sqlancer/run
+
+Builds a pinned SQLancer checkout with the Mockgres compatibility profile,
+starts a fresh Mockgres server, and runs a deterministic TLP-WHERE campaign.
+
+Environment:
+  MOCKGRES_BIN             Server binary (default: target/debug/mockgres)
+  MOCKGRES_JAVA            Java executable (default: JAVA_HOME or Maven runtime)
+  SQLANCER_QUERIES         Oracle checks to run (default: 100)
+  SQLANCER_SEED            Deterministic random seed (default: 1)
+  SQLANCER_TIMEOUT_SECONDS Safety timeout for the campaign (default: 60)
+  SQLANCER_MAX_INSERTS     Maximum setup inserts per table (default: 8)
+  SQLANCER_MAX_DEPTH       Maximum expression depth (default: 2)
+  PGPORT                   Server port (default: an ephemeral port)
+  OUTDIR                   Artifact directory (default: target/sqlancer/runs/...)
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  "") ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
+sqlancer_revision="af6ae85d0679c5a153d8e1cbf22c4e89980c0f68"
+patch_file="${script_dir}/sqlancer.patch"
+cache_root="${repo_root}/target/sqlancer/cache/${sqlancer_revision}"
+source_dir="${cache_root}/source"
+patch_stamp="${cache_root}/patch.sha256"
+
+for command in git mvn python3; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    echo "$command is required" >&2
+    exit 2
+  fi
+done
+if [ ! -f "$patch_file" ]; then
+  echo "missing SQLancer compatibility patch: $patch_file" >&2
+  exit 2
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  patch_hash="$(sha256sum "$patch_file" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  patch_hash="$(shasum -a 256 "$patch_file" | awk '{print $1}')"
+else
+  echo "sha256sum or shasum is required" >&2
+  exit 2
+fi
+
+cached_hash=""
+if [ -f "$patch_stamp" ]; then
+  cached_hash="$(sed -n '1p' "$patch_stamp")"
+fi
+if [ ! -d "${source_dir}/.git" ] || [ "$cached_hash" != "$patch_hash" ]; then
+  rm -rf "$cache_root"
+  mkdir -p "$cache_root"
+  git -C "$cache_root" init -q source
+  git -C "$source_dir" remote add origin https://github.com/sqlancer/sqlancer.git
+  git -C "$source_dir" fetch -q --depth 1 origin "$sqlancer_revision"
+  git -C "$source_dir" checkout -q --detach FETCH_HEAD
+  git -C "$source_dir" apply "$patch_file"
+  printf '%s\n' "$patch_hash" >"$patch_stamp"
+fi
+
+(cd "$source_dir" && mvn -q package -DskipTests)
+sqlancer_jar="$(find "${source_dir}/target" -maxdepth 1 -type f -name 'sqlancer-*.jar' -print -quit)"
+if [ -z "$sqlancer_jar" ]; then
+  echo "SQLancer build did not produce a runnable jar" >&2
+  exit 2
+fi
+
+if [ -n "${MOCKGRES_JAVA:-}" ]; then
+  java_bin="$MOCKGRES_JAVA"
+elif [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+  java_bin="${JAVA_HOME}/bin/java"
+elif java -version >/dev/null 2>&1; then
+  java_bin="$(command -v java)"
+else
+  java_home="$(mvn -q -DforceStdout help:evaluate -Dexpression=java.home 2>/dev/null | tail -n 1)"
+  java_bin="${java_home}/bin/java"
+fi
+if [ ! -x "$java_bin" ]; then
+  echo "Java 11 or newer was not found; set MOCKGRES_JAVA" >&2
+  exit 2
+fi
+
+if [ -n "${MOCKGRES_BIN:-}" ]; then
+  mockgres_bin="$MOCKGRES_BIN"
+  if [ ! -x "$mockgres_bin" ]; then
+    echo "Mockgres binary is not executable: $mockgres_bin" >&2
+    exit 2
+  fi
+else
+  (cd "$repo_root" && cargo build -p mockgres --bin mockgres)
+  mockgres_bin="${repo_root}/target/debug/mockgres"
+fi
+
+if [ -n "${PGPORT:-}" ]; then
+  port="$PGPORT"
+else
+  port="$(python3 - <<'PY'
+import socket
+
+sock = socket.socket()
+sock.bind(("127.0.0.1", 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+)"
+fi
+
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+outdir="${OUTDIR:-${repo_root}/target/sqlancer/runs/${run_id}}"
+server_log="${outdir}/mockgres.log"
+sqlancer_log="${outdir}/sqlancer.log"
+mkdir -p "$outdir"
+
+server_pid=""
+cleanup() {
+  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+"$mockgres_bin" --host 127.0.0.1 --port "$port" --database test >"$server_log" 2>&1 &
+server_pid=$!
+
+python3 - "$port" <<'PY'
+import socket
+import sys
+import time
+
+port = int(sys.argv[1])
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            break
+    except OSError:
+        time.sleep(0.05)
+else:
+    raise SystemExit("Mockgres did not start within 10 seconds")
+PY
+
+queries="${SQLANCER_QUERIES:-100}"
+seed="${SQLANCER_SEED:-1}"
+timeout_seconds="${SQLANCER_TIMEOUT_SECONDS:-60}"
+max_inserts="${SQLANCER_MAX_INSERTS:-8}"
+max_depth="${SQLANCER_MAX_DEPTH:-2}"
+
+if command -v timeout >/dev/null 2>&1; then
+  java_command=("$(command -v timeout)" "$timeout_seconds" "$java_bin")
+elif command -v gtimeout >/dev/null 2>&1; then
+  java_command=("$(command -v gtimeout)" "$timeout_seconds" "$java_bin")
+else
+  java_command=("$java_bin")
+  echo "warning: timeout utility not found; campaign timeout is disabled" >&2
+fi
+
+rm -rf "${source_dir}/logs"
+set +e
+(
+  cd "$source_dir"
+  "${java_command[@]}" -jar "$sqlancer_jar" \
+    --num-threads 1 \
+    --num-queries "$queries" \
+    --num-tries 1 \
+    --max-generated-databases 1 \
+    --random-seed "$seed" \
+    --max-num-inserts "$max_inserts" \
+    --max-expression-depth "$max_depth" \
+    --database-prefix mockgres_sqlancer \
+    --username postgres \
+    --password mockgres \
+    --host 127.0.0.1 \
+    --port "$port" \
+    --print-progress-information=false \
+    --print-progress-summary=true \
+    --exit-code-error=1 \
+    postgres \
+    --connection-url="postgresql://127.0.0.1:${port}/test" \
+    --oracle WHERE \
+    --test-collations=false \
+    --test-tablespaces=false \
+    --mockgres=true
+) >"$sqlancer_log" 2>&1
+status=$?
+set -e
+
+if [ -d "${source_dir}/logs" ]; then
+  cp -R "${source_dir}/logs" "${outdir}/reproducers"
+fi
+
+if [ "$status" -ne 0 ]; then
+  echo "SQLancer found a failure (seed $seed); artifacts: $outdir" >&2
+  tail -n 80 "$sqlancer_log" >&2
+  exit "$status"
+fi
+
+echo "SQLancer passed $queries TLP-WHERE checks (seed $seed)"
+echo "artifacts: $outdir"

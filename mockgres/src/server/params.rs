@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::convert::TryInto;
 use std::sync::Arc;
 
-use pgwire::api::Type;
 use pgwire::api::results::FieldFormat;
+use pgwire::api::{DEFAULT_NAME, Type};
 use pgwire::error::PgWireResult;
 
 use crate::engine::types::parse_interval_literal;
@@ -32,8 +32,8 @@ pub fn plan_parameter_types(plan: &Plan) -> Vec<Type> {
     }
     let mut hints = HashMap::new();
     collect_param_hints_from_plan(plan, &mut hints);
-    indexes
-        .into_iter()
+    let count = indexes.last().map_or(0, |idx| idx + 1);
+    (0..count)
         .map(|idx| {
             hints
                 .get(&idx)
@@ -53,8 +53,8 @@ pub fn statement_plan_parameter_types(statement: &StatementPlan) -> Vec<Type> {
                 collect_param_indexes(plan, &mut indexes);
                 collect_param_hints_from_plan(plan, &mut hints);
             }
-            indexes
-                .into_iter()
+            let count = indexes.last().map_or(0, |idx| idx + 1);
+            (0..count)
                 .map(|idx| {
                     hints
                         .get(&idx)
@@ -71,6 +71,21 @@ pub fn build_params_for_portal<S>(
     portal: &pgwire::api::portal::Portal<S>,
     tz: &SessionTimeZone,
 ) -> PgWireResult<Arc<Vec<Value>>> {
+    let expected = plan_parameter_types(plan)
+        .len()
+        .max(portal.statement.parameter_types.len());
+    let actual = portal.parameters.len();
+    if actual != expected {
+        let statement_name = if portal.statement.id == DEFAULT_NAME {
+            ""
+        } else {
+            &portal.statement.id
+        };
+        return Err(fe(format!(
+            "bind message supplies {actual} parameters, but prepared statement \"{}\" requires {expected}",
+            statement_name
+        )));
+    }
     let mut hints = HashMap::new();
     collect_param_hints_from_plan(plan, &mut hints);
 
@@ -229,6 +244,11 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
                 }
             }
         }
+        Plan::CallBuiltin { args, .. } => {
+            for arg in args {
+                collect_param_hints_from_scalar(arg, out);
+            }
+        }
         Plan::Empty
         | Plan::UtilityNoOp { .. }
         | Plan::SeqScan { .. }
@@ -262,7 +282,6 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
         | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
-        | Plan::CallBuiltin { .. }
         | Plan::DeclareCursor { .. }
         | Plan::FetchCursor { .. }
         | Plan::BeginTransaction
@@ -510,6 +529,11 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
                 }
             }
         }
+        Plan::CallBuiltin { args, .. } => {
+            for arg in args {
+                collect_param_indexes_from_scalar(arg, out);
+            }
+        }
         Plan::Empty
         | Plan::UtilityNoOp { .. }
         | Plan::SeqScan { .. }
@@ -543,7 +567,6 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
         | Plan::UnsupportedDbDDL { .. }
         | Plan::ShowVariable { .. }
         | Plan::SetVariable { .. }
-        | Plan::CallBuiltin { .. }
         | Plan::DeclareCursor { .. }
         | Plan::FetchCursor { .. }
         | Plan::BeginTransaction

@@ -60,6 +60,19 @@ impl Mockgres {
             return Err(fe(message));
         }
 
+        if let Some(error) = name.strip_prefix("regression:error_context:") {
+            let (message, context) = error
+                .split_once('|')
+                .ok_or_else(|| fe("invalid regression error context"))?;
+            let mut info = ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                message.to_string(),
+            );
+            info.where_context = Some(context.to_string());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+
         if let Some(rest) = name.strip_prefix("regression:error_code:") {
             let (code, message) = rest
                 .split_once(':')

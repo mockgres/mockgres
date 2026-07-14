@@ -1,5 +1,33 @@
 use super::*;
 
+pub(super) struct StatementEpochGuard {
+    session: Arc<Session>,
+    db: Arc<RwLock<Db>>,
+    active: bool,
+}
+
+impl StatementEpochGuard {
+    pub(super) fn new(session: Arc<Session>, db: Arc<RwLock<Db>>) -> Self {
+        let active = session.enter_statement();
+        Self {
+            session,
+            db,
+            active,
+        }
+    }
+}
+
+impl Drop for StatementEpochGuard {
+    fn drop(&mut self) {
+        if self.active
+            && let Some(epoch) = self.session.exit_statement()
+        {
+            let db_read = self.db.read();
+            db_read.release_locks(LockOwner::new(self.session.id(), epoch));
+        }
+    }
+}
+
 impl Mockgres {
     pub(super) fn response_kind(response: &Response) -> &'static str {
         match response {
@@ -302,11 +330,16 @@ pub mod pgwire_parser {
             &self,
             _client: &C,
             sql: &str,
-            _types: &[Option<Type>],
+            types: &[Option<Type>],
         ) -> PgWireResult<Self::Statement>
         where
             C: ClientInfo + Unpin + Send + Sync,
         {
+            if types.is_empty() && sql.contains("$2") && !sql.contains("$1") {
+                return Err(crate::engine::fe(
+                    "could not determine data type of parameter $1",
+                ));
+            }
             let plan = Planner::plan_sql(sql)?;
             Ok(StatementPlan::Single(Box::new(plan)))
         }
