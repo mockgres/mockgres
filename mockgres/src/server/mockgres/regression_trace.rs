@@ -376,6 +376,61 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/publication.bin"),
     },
+    RegressionTrace {
+        name: "multirangetypes",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/multirangetypes.bin"),
+    },
+    RegressionTrace {
+        name: "horology",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/horology.bin"),
+    },
+    RegressionTrace {
+        name: "inherit",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/inherit.bin"),
+    },
+    RegressionTrace {
+        name: "select_distinct",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/select_distinct.bin"),
+    },
+    RegressionTrace {
+        name: "subselect",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/subselect.bin"),
+    },
+    RegressionTrace {
+        name: "union",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/union.bin"),
+    },
+    RegressionTrace {
+        name: "aggregates",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/aggregates.bin"),
+    },
+    RegressionTrace {
+        name: "btree_index",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/btree_index.bin"),
+    },
+    RegressionTrace {
+        name: "rowsecurity",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/rowsecurity.bin"),
+    },
+    RegressionTrace {
+        name: "groupingsets",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/groupingsets.bin"),
+    },
+    RegressionTrace {
+        name: "incremental_sort",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/incremental_sort.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
