@@ -617,10 +617,31 @@ pub(super) fn bind_with_search_path(
                 time_ctx,
                 cte_scope,
             )?;
-            let mut plan = Plan::Filter {
-                input: Box::new(child),
-                expr: bound_expr,
-                project_prefix_len: None,
+            let mut plan = match child {
+                Plan::Join {
+                    left,
+                    right,
+                    on,
+                    join_type: JoinType::Inner,
+                    schema,
+                } => {
+                    let on = Some(match on {
+                        Some(existing) => BoolExpr::And(vec![existing, bound_expr]),
+                        None => bound_expr,
+                    });
+                    Plan::Join {
+                        left,
+                        right,
+                        on,
+                        join_type: JoinType::Inner,
+                        schema,
+                    }
+                }
+                child => Plan::Filter {
+                    input: Box::new(child),
+                    expr: bound_expr,
+                    project_prefix_len: None,
+                },
             };
             if let Some(n) = project_prefix_len {
                 if n == 0 {

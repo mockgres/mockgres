@@ -179,11 +179,13 @@ impl Db {
             ));
         };
         table.rows_by_key.clear();
+        table.row_order.clear();
         if let Some(pk_map) = table.pk_map.as_mut() {
             pk_map.clear();
         }
         table.fk_rev.clear();
         table.unique_maps.clear();
+        table.lookup_maps.clear();
         table.next_rowid = 1;
         Ok(())
     }

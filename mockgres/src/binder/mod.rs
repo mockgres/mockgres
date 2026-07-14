@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::catalog::{SchemaId, TableMeta};
 use crate::db::Db;
 use crate::engine::{
-    AggCall, AggFunc, ColumnSpec, DataType, DbDdlKind, Expr, Field, FieldOrigin, InsertSource,
-    LockSpec, ObjName, OnConflictAction, Plan, ScalarExpr, Schema, Selection, SortKey, SqlError,
-    UpdateSet, WindowSpec, fe, fe_code,
+    AggCall, AggFunc, BoolExpr, ColumnSpec, DataType, DbDdlKind, Expr, Field, FieldOrigin,
+    InsertSource, JoinType, LockSpec, ObjName, OnConflictAction, Plan, ScalarExpr, Schema,
+    Selection, SortKey, SqlError, UpdateSet, WindowSpec, fe, fe_code,
 };
 use crate::session::Session;
 use anyhow::Error;

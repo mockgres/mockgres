@@ -5,9 +5,9 @@ use pgwire::error::PgWireResult;
 
 use crate::db::{Db, LockOwner};
 use crate::engine::{
-    CountExec, CountExpr, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinType,
-    LimitExec, NestedLoopJoinExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec,
-    Value, ValuesExec, WindowRowNumberExec, eval_scalar_expr, fe,
+    CountExec, CountExpr, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinExec, JoinType,
+    LimitExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, Value, ValuesExec,
+    WindowRowNumberExec, coerce_value_to_type, eval_scalar_expr, fe,
 };
 use crate::server::errors::map_db_err;
 use crate::session::Session;
@@ -142,6 +142,29 @@ pub fn build_read_executor(
             ))
         }
         Plan::CountRows { input, schema } => {
+            if let Plan::SeqScan {
+                table, lock: None, ..
+            } = input.as_ref()
+            {
+                let schema_name = schema_or_public(&table.schema);
+                let current_tx = session.current_tx();
+                let visibility =
+                    VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+                let count = db
+                    .read()
+                    .count_visible_rows(schema_name, &table.name, &visibility)
+                    .map_err(map_db_err)?;
+                let count =
+                    i64::try_from(count).map_err(|_| fe("row count exceeds bigint range"))?;
+                return Ok((
+                    Box::new(ValuesExec::from_values(
+                        schema.clone(),
+                        vec![vec![Value::Int64(count)]],
+                    )),
+                    None,
+                    Some(1),
+                ));
+            }
             let (child, _tag, _cnt) = build_executor(
                 db,
                 txn_manager,
@@ -171,8 +194,8 @@ pub fn build_read_executor(
             let positions: Vec<usize> = cols.iter().map(|(i, _)| *i).collect();
             let current_tx = session.current_tx();
             let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
-            let (mut rows, _cols, row_ids) = if positions.is_empty() && schema.fields.is_empty() {
-                (vec![], vec![], Vec::new())
+            let (mut rows, row_ids) = if positions.is_empty() && schema.fields.is_empty() {
+                (vec![], Vec::new())
             } else {
                 db_read
                     .scan_bound_positions(schema_name, &table.name, &positions, &visibility)
@@ -240,15 +263,30 @@ pub fn build_read_executor(
                 params.clone(),
                 ctx,
             )?;
-            let (child, _tag, _cnt) = build_executor(
+            let indexed_child = try_build_indexed_scan(
                 db,
                 txn_manager,
                 session,
                 snapshot_xid,
                 input,
-                params.clone(),
+                &materialized_expr,
+                &params,
                 ctx,
             )?;
+            let child = if let Some(child) = indexed_child {
+                child
+            } else {
+                build_executor(
+                    db,
+                    txn_manager,
+                    session,
+                    snapshot_xid,
+                    input,
+                    params.clone(),
+                    ctx,
+                )?
+                .0
+            };
             let child_schema = child.schema().clone();
             let mut node: Box<dyn ExecNode> = Box::new(FilterExec::new(
                 child_schema.clone(),
@@ -366,7 +404,7 @@ pub fn build_read_executor(
                 _ => None,
             };
             Ok((
-                Box::new(NestedLoopJoinExec::new(
+                Box::new(JoinExec::new(
                     schema.clone(),
                     left_exec,
                     right_exec,
@@ -380,6 +418,107 @@ pub fn build_read_executor(
             ))
         }
         _ => Err(fe("unsupported plan for read executor")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_build_indexed_scan(
+    db: &Arc<RwLock<Db>>,
+    txn_manager: &Arc<TransactionManager>,
+    session: &Arc<Session>,
+    snapshot_xid: TxId,
+    input: &Plan,
+    filter: &crate::engine::BoolExpr,
+    params: &[Value],
+    ctx: &EvalContext,
+) -> PgWireResult<Option<Box<dyn ExecNode>>> {
+    let Plan::SeqScan {
+        table,
+        cols,
+        schema,
+        lock,
+    } = input
+    else {
+        return Ok(None);
+    };
+    let mut logical_equalities = Vec::new();
+    collect_index_equalities(filter, params, ctx, &mut logical_equalities);
+    if logical_equalities.is_empty() {
+        return Ok(None);
+    }
+    let equalities = logical_equalities
+        .into_iter()
+        .filter_map(|(logical_column, value)| {
+            cols.get(logical_column)
+                .and_then(|(physical_column, field)| {
+                    coerce_value_to_type(value, &field.data_type, &ctx.time_zone)
+                        .ok()
+                        .map(|value| (*physical_column, value))
+                })
+        })
+        .collect::<Vec<_>>();
+    if equalities.is_empty() {
+        return Ok(None);
+    }
+
+    let schema_name = schema_or_public(&table.schema);
+    let positions = cols
+        .iter()
+        .map(|(position, _)| *position)
+        .collect::<Vec<_>>();
+    let current_tx = session.current_tx();
+    let visibility = VisibilityContext::new(txn_manager.as_ref(), snapshot_xid, current_tx);
+    let indexed = db
+        .read()
+        .scan_bound_positions_indexed(
+            schema_name,
+            &table.name,
+            &positions,
+            &equalities,
+            &visibility,
+        )
+        .map_err(map_db_err)?;
+    let Some((mut rows, row_ids)) = indexed else {
+        return Ok(None);
+    };
+    if lock.is_some() {
+        for (row, row_id) in rows.iter_mut().zip(row_ids) {
+            row.push(Value::Int64(row_id as i64));
+        }
+    }
+    Ok(Some(Box::new(SeqScanExec::new(schema.clone(), rows))))
+}
+
+fn collect_index_equalities(
+    expr: &crate::engine::BoolExpr,
+    params: &[Value],
+    ctx: &EvalContext,
+    out: &mut Vec<(usize, Value)>,
+) {
+    match expr {
+        crate::engine::BoolExpr::Comparison {
+            lhs,
+            op: crate::engine::CmpOp::Eq,
+            rhs,
+        } => {
+            if let ScalarExpr::ColumnIdx(column) = lhs
+                && let Ok(value) = eval_scalar_expr(&[], rhs, params, ctx)
+                && !matches!(value, Value::Null)
+            {
+                out.push((*column, value));
+            } else if let ScalarExpr::ColumnIdx(column) = rhs
+                && let Ok(value) = eval_scalar_expr(&[], lhs, params, ctx)
+                && !matches!(value, Value::Null)
+            {
+                out.push((*column, value));
+            }
+        }
+        crate::engine::BoolExpr::And(exprs) => {
+            for expr in exprs {
+                collect_index_equalities(expr, params, ctx, out);
+            }
+        }
+        _ => {}
     }
 }
 

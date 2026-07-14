@@ -104,6 +104,7 @@ fn parse_bool_expr_internal(
             _ => Err(fe("boolean literal expected")),
         },
         NodeEnum::ColumnRef(_)
+        | NodeEnum::ParamRef(_)
         | NodeEnum::FuncCall(_)
         | NodeEnum::CoalesceExpr(_)
         | NodeEnum::CaseExpr(_)
@@ -115,7 +116,7 @@ fn parse_bool_expr_internal(
                 rhs: ScalarExpr::Literal(Value::Bool(true)),
             })
         }
-        _ => Err(fe("unsupported WHERE expression")),
+        _ => Err(fe("unsupported boolean expression")),
     }
 }
 

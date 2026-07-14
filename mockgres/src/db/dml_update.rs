@@ -55,6 +55,11 @@ impl Db {
                 }
             }
             let fk_changed = fk_updates.iter().any(|f| *f);
+            let indexed_row_ids = if source_rows.is_none() {
+                filter.and_then(|filter| indexed_filter_row_ids(&table, &meta, filter, params, ctx))
+            } else {
+                None
+            };
             #[derive(Clone)]
             struct PendingUpdate {
                 key: RowKey,
@@ -68,7 +73,7 @@ impl Db {
                 return_row: Row,
             }
             let mut pending: Vec<PendingUpdate> = Vec::new();
-            for (key, versions) in table.rows_by_key.iter() {
+            for (key, versions) in table.scan_candidates(indexed_row_ids.as_deref()) {
                 let Some(idx) = select_visible_version_idx(versions, visibility) else {
                     continue;
                 };
@@ -220,6 +225,7 @@ impl Db {
                     add_fk_rev_entries(&mut table, &meta, row_id, &new_fk);
                 }
                 apply_unique_updates(&mut table, old_unique, new_unique, row_id);
+                add_lookup_entries(&mut table, row_id, &updated);
                 let touched_key = key.clone();
                 touched_ptrs.push(RowPointer {
                     table_id: meta.id,

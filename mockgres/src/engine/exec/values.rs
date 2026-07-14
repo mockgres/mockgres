@@ -63,7 +63,7 @@ impl ExecNode for ValuesExec {
         if self.idx >= self.rows.len() {
             return Ok(None);
         }
-        let row = self.rows[self.idx].clone();
+        let row = std::mem::take(&mut self.rows[self.idx]);
         self.idx += 1;
         Ok(Some(row))
     }

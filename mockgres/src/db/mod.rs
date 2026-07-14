@@ -15,6 +15,7 @@ mod create;
 mod dml_delete;
 mod dml_insert;
 mod dml_update;
+mod indexes;
 mod locks;
 mod mvcc;
 mod pg_type;
@@ -25,12 +26,13 @@ use locks::LockRegistry;
 
 pub(crate) use coerce::{coerce_value_for_column, eval_column_default};
 pub(crate) use constraints::*;
+pub(crate) use indexes::{add_lookup_entries, indexed_filter_row_ids, rebuild_lookup_maps};
 pub use locks::{LockHandle, LockOwner};
 pub(crate) use visibility::{
     row_key_to_row_id, select_visible_version, select_visible_version_idx, visible_row_clone,
 };
 
-type BoundScanResult = anyhow::Result<(Vec<Row>, Vec<(usize, String)>, Vec<RowId>)>;
+type BoundScanResult = anyhow::Result<(Vec<Row>, Vec<RowId>)>;
 
 #[derive(Clone, Debug)]
 pub enum CellInput {
@@ -334,6 +336,12 @@ impl Db {
                 .indexes
                 .retain(|index| !dropped_index_names.contains(&index.name));
         }
+        let meta_snapshot = table_meta.clone();
+        let table = self
+            .tables
+            .get_mut(&table_id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
+        rebuild_lookup_maps(table, &meta_snapshot)?;
         Ok(())
     }
 
@@ -504,6 +512,8 @@ impl Db {
             name: pk_name,
             columns: positions,
         });
+        let meta_snapshot = meta.clone();
+        rebuild_lookup_maps(table_storage, &meta_snapshot)?;
         self.refresh_pg_tables_row(schema, table);
         Ok(())
     }
@@ -542,14 +552,16 @@ impl Db {
             ));
         }
 
-        if let Some(storage) = self.tables.get_mut(&table_id) {
-            storage.pk_map = None;
-        }
         let meta = self
             .catalog
             .get_table_mut_by_id(&table_id)
             .ok_or_else(|| sql_err("42P01", format!("no such table {schema}.{table}")))?;
         meta.primary_key = None;
+        let meta_snapshot = meta.clone();
+        if let Some(storage) = self.tables.get_mut(&table_id) {
+            storage.pk_map = None;
+            rebuild_lookup_maps(storage, &meta_snapshot)?;
+        }
         self.refresh_pg_tables_row(schema, table);
         Ok(true)
     }
@@ -569,7 +581,7 @@ impl Db {
         if self.catalog.schema_entry(schema).is_none() {
             return Err(sql_err("3F000", format!("no such schema {schema}")));
         }
-        {
+        let table_id = {
             let table_meta = self
                 .catalog
                 .table_meta_mut(schema, table)
@@ -599,7 +611,14 @@ impl Db {
                 columns: col_positions,
                 unique: is_unique,
             });
-        }
+            table_meta.id
+        };
+        let meta_snapshot = self.catalog.tables_by_id[&table_id].clone();
+        let storage = self
+            .tables
+            .get_mut(&table_id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {table_id}")))?;
+        rebuild_lookup_maps(storage, &meta_snapshot)?;
         self.refresh_pg_tables_row(schema, table);
         Ok(())
     }
@@ -638,10 +657,14 @@ impl Db {
                 break;
             }
         }
-        if let Some(tid) = removed_table_id
-            && let Some(table) = self.tables.get_mut(&tid)
-        {
-            table.unique_maps.remove(index_name);
+        if let Some(tid) = removed_table_id {
+            let meta_snapshot = self.catalog.tables_by_id.get(&tid).cloned();
+            if let Some(table) = self.tables.get_mut(&tid) {
+                table.unique_maps.remove(index_name);
+                if let Some(meta) = &meta_snapshot {
+                    rebuild_lookup_maps(table, meta)?;
+                }
+            }
         }
         if let Some(tid) = removed_table_id
             && let Some(table_meta) = self.catalog.tables_by_id.get(&tid)
@@ -700,25 +723,33 @@ impl Db {
             .get(&tm.id)
             .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
 
-        let mut out_rows = Vec::new();
-        let mut row_ids = Vec::new();
-        let mut stored_rows = table.scan_all().collect::<Vec<_>>();
-        stored_rows.sort_by_key(|(key, _)| match key {
-            RowKey::RowId(row_id) => *row_id,
-            RowKey::Primary(_) => u64::MAX,
-        });
-        for (key, versions) in stored_rows {
+        let mut out_rows = Vec::with_capacity(table.row_order.len());
+        let mut row_ids = Vec::with_capacity(table.row_order.len());
+        for (key, versions) in table.scan_all() {
             if let Some(version) = select_visible_version(versions, visibility) {
                 out_rows.push(positions.iter().map(|i| version.data[*i].clone()).collect());
                 let row_id = row_key_to_row_id(key)?;
                 row_ids.push(row_id);
             }
         }
-        let cols = positions
-            .iter()
-            .map(|i| (*i, tm.columns[*i].name.clone()))
-            .collect();
-        Ok((out_rows, cols, row_ids))
+        Ok((out_rows, row_ids))
+    }
+
+    pub fn count_visible_rows(
+        &self,
+        schema: &str,
+        name: &str,
+        visibility: &VisibilityContext,
+    ) -> anyhow::Result<usize> {
+        let tm = self.resolve_table(schema, name)?;
+        let table = self
+            .tables
+            .get(&tm.id)
+            .ok_or_else(|| sql_err("XX000", format!("missing storage for table id {}", tm.id)))?;
+        Ok(table
+            .scan_all()
+            .filter(|(_, versions)| select_visible_version(versions, visibility).is_some())
+            .count())
     }
 
     fn ensure_outbound_foreign_keys(

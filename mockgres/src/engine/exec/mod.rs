@@ -5,15 +5,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::eval::{EvalContext, eval_bool_expr, eval_scalar_expr};
-use super::{
-    AggCall, AggFunc, BoolExpr, JoinType, ScalarExpr, Schema, SortKey, Value, WindowSpec, fe,
-};
+use super::{AggCall, AggFunc, BoolExpr, ScalarExpr, Schema, SortKey, Value, WindowSpec, fe};
 mod aggregate;
+mod join;
 mod order;
 
 mod values;
 
 pub use aggregate::HashAggregateExec;
+pub use join::JoinExec;
 pub use order::OrderExec;
 use order::{OrderKeySpec, compare_window_entries, resolve_order_keys};
 
@@ -201,7 +201,7 @@ impl ExecNode for WindowRowNumberExec {
         if self.pos >= self.rows.len() {
             return Ok(None);
         }
-        let row = self.rows[self.pos].clone();
+        let row = std::mem::take(&mut self.rows[self.pos]);
         self.pos += 1;
         Ok(Some(row))
     }
@@ -274,164 +274,8 @@ impl ExecNode for SeqScanExec {
         if self.idx >= self.rows.len() {
             return Ok(None);
         }
-        let row = self.rows[self.idx].clone();
+        let row = std::mem::take(&mut self.rows[self.idx]);
         self.idx += 1;
-        Ok(Some(row))
-    }
-    async fn close(&mut self) -> PgWireResult<()> {
-        Ok(())
-    }
-    fn schema(&self) -> &Schema {
-        &self.schema
-    }
-}
-
-pub struct NestedLoopJoinExec {
-    schema: Schema,
-    left: Option<Box<dyn ExecNode>>,
-    right: Option<Box<dyn ExecNode>>,
-    rows: Vec<Row>,
-    right_width: usize,
-    join_type: JoinType,
-    on: Option<BoolExpr>,
-    params: Arc<Vec<Value>>,
-    ctx: EvalContext,
-    pos: usize,
-    built: bool,
-}
-
-const MAX_NESTED_LOOP_CANDIDATES: usize = 1_000_000;
-
-impl NestedLoopJoinExec {
-    pub fn new(
-        schema: Schema,
-        left: Box<dyn ExecNode>,
-        right: Box<dyn ExecNode>,
-        join_type: JoinType,
-        on: Option<BoolExpr>,
-        params: Arc<Vec<Value>>,
-        ctx: EvalContext,
-    ) -> Self {
-        let right_width = right.schema().fields.len();
-        Self {
-            schema,
-            left: Some(left),
-            right: Some(right),
-            rows: Vec::new(),
-            right_width,
-            join_type,
-            on,
-            params,
-            ctx,
-            pos: 0,
-            built: false,
-        }
-    }
-
-    async fn ensure_materialized(&mut self) -> PgWireResult<()> {
-        if self.built {
-            return Ok(());
-        }
-        let mut left = self.left.take().expect("left exec missing");
-        let mut right = self.right.take().expect("right exec missing");
-        left.open().await?;
-        let mut left_rows = Vec::new();
-        while let Some(row) = left.next().await? {
-            left_rows.push(row);
-        }
-        left.close().await?;
-
-        right.open().await?;
-        let mut right_rows = Vec::new();
-        while let Some(row) = right.next().await? {
-            right_rows.push(row);
-        }
-        right.close().await?;
-
-        let candidate_count = left_rows.len().saturating_mul(right_rows.len());
-        if candidate_count > MAX_NESTED_LOOP_CANDIDATES {
-            return Err(crate::engine::fe_code(
-                "54000",
-                format!(
-                    "nested-loop join would examine {candidate_count} row pairs; limit is {MAX_NESTED_LOOP_CANDIDATES}"
-                ),
-            ));
-        }
-
-        let mut rows = Vec::new();
-        match self.join_type {
-            JoinType::Inner => {
-                rows.reserve(left_rows.len().saturating_mul(right_rows.len()));
-                for l in &left_rows {
-                    for r in &right_rows {
-                        let mut combined = l.clone();
-                        combined.extend(r.clone());
-                        if let Some(on_expr) = &self.on {
-                            let pass = eval_bool_expr(&combined, on_expr, &self.params, &self.ctx)?
-                                .unwrap_or(false);
-                            if !pass {
-                                continue;
-                            }
-                        }
-                        rows.push(combined);
-                    }
-                }
-            }
-            JoinType::Left => {
-                let mut null_right = Vec::with_capacity(self.right_width);
-                null_right.resize(self.right_width, Value::Null);
-                let estimated = left_rows.len().saturating_mul(right_rows.len().max(1));
-                rows.reserve(estimated);
-                for l in &left_rows {
-                    let mut matched = false;
-                    if right_rows.is_empty() {
-                        let mut combined = l.clone();
-                        combined.extend(null_right.clone());
-                        rows.push(combined);
-                        continue;
-                    }
-                    for r in &right_rows {
-                        let mut combined = l.clone();
-                        combined.extend(r.clone());
-                        if let Some(on_expr) = &self.on {
-                            let pass = eval_bool_expr(&combined, on_expr, &self.params, &self.ctx)?
-                                .unwrap_or(false);
-                            if !pass {
-                                continue;
-                            }
-                        }
-                        matched = true;
-                        rows.push(combined);
-                    }
-                    if !matched {
-                        let mut combined = l.clone();
-                        combined.extend(null_right.clone());
-                        rows.push(combined);
-                    }
-                }
-            }
-        }
-
-        self.rows = rows;
-        self.built = true;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ExecNode for NestedLoopJoinExec {
-    async fn open(&mut self) -> PgWireResult<()> {
-        self.ensure_materialized().await
-    }
-    async fn next(&mut self) -> PgWireResult<Option<Row>> {
-        if !self.built {
-            self.ensure_materialized().await?;
-        }
-        if self.pos >= self.rows.len() {
-            return Ok(None);
-        }
-        let row = self.rows[self.pos].clone();
-        self.pos += 1;
         Ok(Some(row))
     }
     async fn close(&mut self) -> PgWireResult<()> {

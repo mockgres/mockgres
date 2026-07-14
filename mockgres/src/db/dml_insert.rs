@@ -295,6 +295,7 @@ impl Db {
                 }
 
                 apply_unique_updates(table, old_unique, new_unique, existing_rowid);
+                add_lookup_entries(table, existing_rowid, &updated);
 
                 updated_ptrs.push(RowPointer { table_id, key });
                 Ok(true)
@@ -363,13 +364,14 @@ impl Db {
                         }
 
                         inserted_rows.push(row.clone());
+                        add_lookup_entries(&mut table, row_id, &row);
                         let version = VersionedRow {
                             xmin: txid,
                             xmax: None,
                             data: row,
                         };
                         let storage_key = RowKey::RowId(row_id);
-                        table.rows_by_key.insert(storage_key.clone(), vec![version]);
+                        table.insert(storage_key.clone(), version);
                         add_fk_rev_entries(&mut table, &meta, row_id, &fk_keys);
                         insert_unique_entries_owned(&mut table, unique_keys, row_id);
                         inserted_ptrs.push(RowPointer {

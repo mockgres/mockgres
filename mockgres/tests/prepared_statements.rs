@@ -1,5 +1,7 @@
 mod common;
 
+use tokio_postgres::types::Type;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prepared_select_supports_multiple_portals() {
     let mut ctx = common::start().await;
@@ -127,6 +129,42 @@ async fn prepared_update_behaves_inside_and_outside_transactions() {
         .expect("select after commit")
         .get(0);
     assert_eq!(final_qty, original + 3);
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_bool_parameter_works_in_update_case_condition() {
+    let ctx = common::start().await;
+    ctx.client
+        .batch_execute(
+            "create table case_updates (
+                 id text primary key,
+                 state text not null
+             );
+             insert into case_updates values ('1', 'ARMED');",
+        )
+        .await
+        .unwrap();
+
+    let statement = ctx
+        .client
+        .prepare(
+            "update case_updates
+                set state = case when $1 then 'ACTIVE' else state end
+              where id = '1'",
+        )
+        .await
+        .unwrap();
+    assert_eq!(statement.params(), &[Type::BOOL]);
+    assert_eq!(ctx.client.execute(&statement, &[&true]).await.unwrap(), 1);
+
+    let row = ctx
+        .client
+        .query_one("select state from case_updates where id = '1'", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "ACTIVE");
 
     let _ = ctx.shutdown.send(());
 }

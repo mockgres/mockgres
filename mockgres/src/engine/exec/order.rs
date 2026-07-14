@@ -189,7 +189,7 @@ impl ExecNode for OrderExec {
         if self.pos >= self.rows.len() {
             return Ok(None);
         }
-        let row = self.rows[self.pos].0.clone();
+        let (row, _) = std::mem::take(&mut self.rows[self.pos]);
         self.pos += 1;
         Ok(Some(row))
     }

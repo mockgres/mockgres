@@ -296,7 +296,7 @@ impl ExecNode for HashAggregateExec {
         if self.pos >= self.groups.len() {
             return Ok(None);
         }
-        let row = self.groups[self.pos].clone();
+        let row = std::mem::take(&mut self.groups[self.pos]);
 
         self.pos += 1;
         Ok(Some(row))

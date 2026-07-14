@@ -9,7 +9,7 @@ use crate::storage::{IdentityRuntime, Table};
 use crate::txn::SYSTEM_TXID;
 
 use super::pg_type::init_pg_type;
-use super::{Db, sql_err};
+use super::{Db, rebuild_lookup_maps, sql_err};
 
 type ColumnSpec = (
     String,
@@ -265,6 +265,12 @@ impl Db {
         self.catalog.insert_table(schema_id, name, tm);
 
         self.tables.insert(id, Table::with_pk(has_pk, identities));
+        let meta = self.catalog.tables_by_id[&id].clone();
+        let table = self
+            .tables
+            .get_mut(&id)
+            .expect("table storage was just inserted");
+        rebuild_lookup_maps(table, &meta)?;
         if self.catalog.get_table("pg_catalog", "pg_class").is_some()
             && !(schema == "pg_catalog" && name == "pg_class")
         {

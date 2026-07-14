@@ -32,7 +32,9 @@ impl Db {
             })?;
             let mut seeds = Vec::new();
             let mut removed_rows = Vec::new();
-            for (key, versions) in table.rows_by_key.iter() {
+            let indexed_row_ids =
+                filter.and_then(|filter| indexed_filter_row_ids(table, &meta, filter, params, ctx));
+            for (key, versions) in table.scan_candidates(indexed_row_ids.as_deref()) {
                 let Some(idx) = select_visible_version_idx(versions, visibility) else {
                     continue;
                 };
