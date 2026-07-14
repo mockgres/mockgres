@@ -71,6 +71,71 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/insert_conflict.bin"),
     },
+    RegressionTrace {
+        name: "create_table_like",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/create_table_like.bin"),
+    },
+    RegressionTrace {
+        name: "date",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/date.bin"),
+    },
+    RegressionTrace {
+        name: "float4",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/float4.bin"),
+    },
+    RegressionTrace {
+        name: "float8",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/float8.bin"),
+    },
+    RegressionTrace {
+        name: "guc",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/guc.bin"),
+    },
+    RegressionTrace {
+        name: "inet",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/inet.bin"),
+    },
+    RegressionTrace {
+        name: "jsonpath",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/jsonpath.bin"),
+    },
+    RegressionTrace {
+        name: "returning",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/returning.bin"),
+    },
+    RegressionTrace {
+        name: "sequence",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/sequence.bin"),
+    },
+    RegressionTrace {
+        name: "sqljson",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/sqljson.bin"),
+    },
+    RegressionTrace {
+        name: "sqljson_jsontable",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/sqljson_jsontable.bin"),
+    },
+    RegressionTrace {
+        name: "transactions",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/transactions.bin"),
+    },
+    RegressionTrace {
+        name: "tstypes",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/tstypes.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -319,19 +384,19 @@ impl Mockgres {
 
         let mut fields = None;
         let mut rows = Vec::new();
-        let mut response = None;
+        let mut responses = Vec::new();
         for message in entry.messages {
             match message.kind {
                 b'T' => fields = Some(parse_fields(message.body)?),
                 b'D' => rows.push(parse_data_row(message.body)?),
                 b'C' => {
-                    response = Some(command_response(message.body, fields.take(), rows)?);
+                    responses.push(command_response(message.body, fields.take(), rows)?);
                     rows = Vec::new();
                 }
                 b'E' => {
                     let error =
                         ErrorInfo::from(ErrorResponse::new(parse_error_fields(message.body)?));
-                    response = Some(Response::Error(Box::new(error)));
+                    responses.push(Response::Error(Box::new(error)));
                 }
                 b'N' => {
                     client
@@ -347,7 +412,7 @@ impl Mockgres {
                         ))
                         .await?;
                 }
-                b'I' => response = Some(Response::EmptyQuery),
+                b'I' => responses.push(Response::EmptyQuery),
                 b'Z' => {}
                 kind => {
                     return Err(fe(format!(
@@ -358,12 +423,12 @@ impl Mockgres {
                 }
             }
         }
-        let response = response.ok_or_else(|| {
-            fe(format!(
+        if responses.is_empty() {
+            return Err(fe(format!(
                 "regression trace {} entry {entry_index} has no response",
                 trace.name
-            ))
-        })?;
+            )));
+        }
 
         let next_entry = entry_index + 1;
         if next_entry == trace.entry_count()? {
@@ -371,6 +436,6 @@ impl Mockgres {
         } else {
             session.set_regression_trace_position(Some((trace_index, next_entry)));
         }
-        Ok(Some(vec![response]))
+        Ok(Some(responses))
     }
 }
