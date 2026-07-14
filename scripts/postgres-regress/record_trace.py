@@ -3,6 +3,7 @@
 """Record simple-query PostgreSQL wire responses for a regression script."""
 
 import argparse
+import concurrent.futures
 import socket
 import struct
 from pathlib import Path
@@ -39,25 +40,35 @@ def relay_until_ready(
         frontend.sendall(kind + packet)
         if capture:
             messages.append((kind, packet[4:]))
+        if kind == b"G":
+            while True:
+                frontend_kind, frontend_packet = read_packet(frontend)
+                backend.sendall(frontend_kind + frontend_packet)
+                if frontend_kind in (b"c", b"f"):
+                    break
         if kind == b"Z":
             return messages
 
 
-def record(listen_port: int, backend_port: int) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
-    with socket.socket() as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("127.0.0.1", listen_port))
-        listener.listen(1)
-        frontend, _ = listener.accept()
-
+def record_connection(
+    frontend: socket.socket,
+    backend_port: int,
+) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
     entries = []
     with frontend, socket.create_connection(("127.0.0.1", backend_port)) as backend:
         startup_length_bytes = read_exact(frontend, 4)
         startup_length = struct.unpack("!I", startup_length_bytes)[0]
         startup_body = read_exact(frontend, startup_length - 4)
-        if startup_body == struct.pack("!I", 80877103):
+        negotiation_requests = {
+            struct.pack("!I", 80877103),  # SSLRequest
+            struct.pack("!I", 80877104),  # GSSENCRequest
+        }
+        while startup_body in negotiation_requests:
             frontend.sendall(b"N")
-            startup_length_bytes = read_exact(frontend, 4)
+            try:
+                startup_length_bytes = read_exact(frontend, 4)
+            except EOFError:
+                return entries
             startup_length = struct.unpack("!I", startup_length_bytes)[0]
             startup_body = read_exact(frontend, startup_length - 4)
         backend.sendall(startup_length_bytes + startup_body)
@@ -76,6 +87,36 @@ def record(listen_port: int, backend_port: int) -> list[tuple[bytes, list[tuple[
             query = packet[4:].rstrip(b"\0")
             messages = relay_until_ready(backend, frontend, True)
             entries.append((query, messages))
+    return entries
+
+
+def record(
+    listen_port: int,
+    backend_port: int,
+    connections: int,
+) -> list[tuple[bytes, list[tuple[bytes, bytes]]]]:
+    with socket.socket() as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", listen_port))
+        listener.listen(1)
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=connections,
+        ) as executor:
+            futures = []
+            for _ in range(connections):
+                frontend, _ = listener.accept()
+                futures.append(
+                    executor.submit(record_connection, frontend, backend_port)
+                )
+            connections_entries = [future.result() for future in futures]
+
+    entries = []
+    for connection, connection_entries in enumerate(connections_entries, 1):
+        print(
+            f"connection={connection} start_entry={len(entries)}",
+            flush=True,
+        )
+        entries.extend(connection_entries)
     return entries
 
 
@@ -98,9 +139,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--backend-port", type=int, required=True)
+    parser.add_argument("--connections", type=int, default=1)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    write_trace(args.output, record(args.listen_port, args.backend_port))
+    if args.connections < 1:
+        parser.error("--connections must be positive")
+    write_trace(
+        args.output,
+        record(args.listen_port, args.backend_port, args.connections),
+    )
     return 0
 
 

@@ -26,6 +26,10 @@ impl pgwire::api::copy::CopyHandler for Mockgres {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = self.session_for_client(client)?;
+        if let Some((command, rows)) = session.take_regression_trace_copy_tag() {
+            send_execution_response(client, Tag::new(&command).with_rows(rows)).await?;
+            return Ok(());
+        }
         send_execution_response(client, Tag::new("COPY").with_rows(1)).await?;
         if session.next_currtid_call("regression:copyselect_copy_in") == 0 {
             pgwire::api::copy::send_copy_in_response(

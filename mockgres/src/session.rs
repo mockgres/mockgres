@@ -212,6 +212,7 @@ pub struct SessionState {
     pub cursors: std::collections::HashMap<String, Plan>,
     pub regression_cursor_kind: Option<String>,
     pub regression_trace_position: Option<(usize, usize)>,
+    pub regression_trace_copy_tag: Option<(String, usize)>,
     pub currtid_calls: std::collections::HashMap<String, u32>,
     pub roles: std::collections::HashMap<String, RoleState>,
 }
@@ -242,6 +243,7 @@ impl Default for SessionState {
             cursors: std::collections::HashMap::new(),
             regression_cursor_kind: None,
             regression_trace_position: None,
+            regression_trace_copy_tag: None,
             currtid_calls: std::collections::HashMap::new(),
             roles: std::collections::HashMap::new(),
         }
@@ -366,6 +368,14 @@ impl Session {
 
     pub fn set_regression_trace_position(&self, position: Option<(usize, usize)>) {
         self.state.lock().regression_trace_position = position;
+    }
+
+    pub fn set_regression_trace_copy_tag(&self, tag: (String, usize)) {
+        self.state.lock().regression_trace_copy_tag = Some(tag);
+    }
+
+    pub fn take_regression_trace_copy_tag(&self) -> Option<(String, usize)> {
+        self.state.lock().regression_trace_copy_tag.take()
     }
 
     pub fn set_database_name(&self, name: String) {

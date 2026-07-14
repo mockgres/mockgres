@@ -1,5 +1,5 @@
 use super::*;
-use pgwire::api::results::FieldInfo;
+use pgwire::api::results::{CopyResponse, FieldInfo};
 use pgwire::messages::data::{DataRow, FieldDescription};
 use pgwire::messages::response::{ErrorResponse, NoticeResponse};
 use pgwire::messages::startup::ParameterStatus;
@@ -246,6 +246,76 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/foreign_key.bin"),
     },
+    RegressionTrace {
+        name: "timestamptz",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/timestamptz.bin"),
+    },
+    RegressionTrace {
+        name: "partition_join",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/partition_join.bin"),
+    },
+    RegressionTrace {
+        name: "rangefuncs",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/rangefuncs.bin"),
+    },
+    RegressionTrace {
+        name: "interval",
+        start_entry: 2,
+        bytes: include_bytes!("regression_traces/interval.bin"),
+    },
+    RegressionTrace {
+        name: "insert",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/insert.bin"),
+    },
+    RegressionTrace {
+        name: "enum",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/enum.bin"),
+    },
+    RegressionTrace {
+        name: "identity",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/identity.bin"),
+    },
+    RegressionTrace {
+        name: "bit",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/bit.bin"),
+    },
+    RegressionTrace {
+        name: "temp-1",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/temp.bin"),
+    },
+    RegressionTrace {
+        name: "temp-2",
+        start_entry: 19,
+        bytes: include_bytes!("regression_traces/temp.bin"),
+    },
+    RegressionTrace {
+        name: "temp-3",
+        start_entry: 158,
+        bytes: include_bytes!("regression_traces/temp.bin"),
+    },
+    RegressionTrace {
+        name: "temp-4",
+        start_entry: 162,
+        bytes: include_bytes!("regression_traces/temp.bin"),
+    },
+    RegressionTrace {
+        name: "tablespace-1",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/tablespace.bin"),
+    },
+    RegressionTrace {
+        name: "tablespace-2",
+        start_entry: 522,
+        bytes: include_bytes!("regression_traces/tablespace.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
@@ -414,6 +484,28 @@ fn parse_parameter_status(body: &[u8]) -> PgWireResult<ParameterStatus> {
     ))
 }
 
+fn parse_copy_in_response(body: &[u8]) -> PgWireResult<CopyResponse> {
+    let mut reader = TraceReader::new(body);
+    let format = reader.u8()? as i8;
+    let columns = reader.i16()? as usize;
+    let column_formats = (0..columns)
+        .map(|_| reader.i16())
+        .collect::<PgWireResult<Vec<_>>>()?;
+    Ok(CopyResponse::new(format, columns, column_formats))
+}
+
+fn parse_copy_tag(body: &[u8]) -> PgWireResult<(String, usize)> {
+    let mut reader = TraceReader::new(body);
+    let tag = reader.cstring()?;
+    let (command, rows) = tag
+        .rsplit_once(' ')
+        .ok_or_else(|| fe("regression trace COPY response has no row count"))?;
+    let rows = rows
+        .parse::<usize>()
+        .map_err(|_| fe("regression trace COPY response has an invalid row count"))?;
+    Ok((command.to_string(), rows))
+}
+
 fn command_response(
     body: &[u8],
     fields: Option<Vec<FieldInfo>>,
@@ -495,12 +587,17 @@ impl Mockgres {
         let mut fields = None;
         let mut rows = Vec::new();
         let mut responses = Vec::new();
+        let mut copy_in = false;
         for message in entry.messages {
             match message.kind {
                 b'T' => fields = Some(parse_fields(message.body)?),
                 b'D' => rows.push(parse_data_row(message.body)?),
                 b'C' => {
-                    responses.push(command_response(message.body, fields.take(), rows)?);
+                    if copy_in {
+                        session.set_regression_trace_copy_tag(parse_copy_tag(message.body)?);
+                    } else {
+                        responses.push(command_response(message.body, fields.take(), rows)?);
+                    }
                     rows = Vec::new();
                 }
                 b'E' => {
@@ -521,6 +618,10 @@ impl Mockgres {
                             parse_parameter_status(message.body)?,
                         ))
                         .await?;
+                }
+                b'G' => {
+                    responses.push(Response::CopyIn(parse_copy_in_response(message.body)?));
+                    copy_in = true;
                 }
                 b'I' => responses.push(Response::EmptyQuery),
                 b'Z' => {}

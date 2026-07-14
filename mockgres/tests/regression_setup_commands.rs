@@ -237,6 +237,7 @@ async fn planner_settings_and_storage_introspection_are_accepted_as_noops() {
         "set local enable_bitmapscan = false",
         "set local enable_incremental_sort = false",
         "set local enable_partitionwise_aggregate = true",
+        "set intervalstyle = postgres",
         "set geqo = on",
         "set geqo_threshold = 2",
     ] {
