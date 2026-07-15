@@ -77,10 +77,18 @@ index ebef13a..97fe570 100644
          String osName = System.getProperty("os.name").toLowerCase();
          if (osName.contains("linux")) {
 diff --git a/src/sqlancer/postgres/PostgresOracleFactory.java b/src/sqlancer/postgres/PostgresOracleFactory.java
-index 7c00021..d310a10 100644
+index 7c00021..533c774 100644
 --- a/src/sqlancer/postgres/PostgresOracleFactory.java
 +++ b/src/sqlancer/postgres/PostgresOracleFactory.java
-@@ -49,8 +49,11 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
+@@ -17,6 +17,7 @@ import sqlancer.postgres.gen.PostgresCommon;
+ import sqlancer.postgres.gen.PostgresExpressionGenerator;
+ import sqlancer.postgres.oracle.PostgresFuzzer;
+ import sqlancer.postgres.oracle.PostgresPivotedQuerySynthesisOracle;
++import sqlancer.postgres.oracle.PostgresSubqueryOracle;
+ import sqlancer.postgres.oracle.tlp.PostgresTLPAggregateOracle;
+ import sqlancer.postgres.oracle.tlp.PostgresTLPHavingOracle;
+
+@@ -49,8 +50,11 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
              ExpectedErrors expectedErrors = ExpectedErrors.newErrors().with(PostgresCommon.getCommonExpressionErrors())
                      .with(PostgresCommon.getCommonFetchErrors())
                      .withRegex(PostgresCommon.getCommonExpressionRegexErrors()).build();
@@ -93,6 +101,20 @@ index 7c00021..d310a10 100644
          }
 
      },
+@@ -60,6 +64,13 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
+             return new PostgresTLPHavingOracle(globalState);
+         }
+
++    },
++    SUBQUERY {
++        @Override
++        public TestOracle<PostgresGlobalState> create(PostgresGlobalState globalState) throws SQLException {
++            return new PostgresSubqueryOracle(globalState);
++        }
++
+     },
+     QUERY_PARTITIONING {
+         @Override
 diff --git a/src/sqlancer/postgres/PostgresProvider.java b/src/sqlancer/postgres/PostgresProvider.java
 index ec79782..683b48d 100644
 --- a/src/sqlancer/postgres/PostgresProvider.java
@@ -667,6 +689,99 @@ index bad87af..0969d1b 100644
                  .collect(Collectors.toList());
      }
 
+diff --git a/src/sqlancer/postgres/oracle/PostgresSubqueryOracle.java b/src/sqlancer/postgres/oracle/PostgresSubqueryOracle.java
+new file mode 100644
+index 0000000..8157aad
+--- /dev/null
++++ b/src/sqlancer/postgres/oracle/PostgresSubqueryOracle.java
+@@ -0,0 +1,87 @@
++package sqlancer.postgres.oracle;
++
++import java.sql.SQLException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.stream.Collectors;
++
++import sqlancer.ComparatorHelper;
++import sqlancer.Randomly;
++import sqlancer.common.oracle.TestOracle;
++import sqlancer.common.query.ExpectedErrors;
++import sqlancer.postgres.PostgresGlobalState;
++import sqlancer.postgres.PostgresSchema.PostgresTable;
++import sqlancer.postgres.PostgresSchema.PostgresTables;
++import sqlancer.postgres.PostgresVisitor;
++import sqlancer.postgres.ast.PostgresAlias;
++import sqlancer.postgres.ast.PostgresExpression;
++import sqlancer.postgres.ast.PostgresJoin;
++import sqlancer.postgres.ast.PostgresSelect;
++import sqlancer.postgres.ast.PostgresSelect.PostgresFromTable;
++import sqlancer.postgres.gen.MockgresJoinGenerator;
++import sqlancer.postgres.gen.PostgresCommon;
++import sqlancer.postgres.gen.PostgresExpressionGenerator;
++
++public class PostgresSubqueryOracle implements TestOracle<PostgresGlobalState> {
++
++    private static final String VALUE_COLUMN = "fuzz_value";
++
++    private final PostgresGlobalState state;
++    private final ExpectedErrors errors = new ExpectedErrors();
++
++    public PostgresSubqueryOracle(PostgresGlobalState state) {
++        this.state = state;
++        PostgresCommon.addCommonExpressionErrors(errors);
++    }
++
++    @Override
++    public void check() throws SQLException {
++        String baseQuery = generateBaseQuery();
++        List<String> baseResult = execute(baseQuery);
++
++        String derivedQuery = "SELECT " + VALUE_COLUMN + " FROM (" + baseQuery + ") AS derived_q";
++        assertEquivalent(baseResult, baseQuery, derivedQuery);
++
++        String cteQuery = "WITH cte_q(" + VALUE_COLUMN + ") AS (" + baseQuery + ") SELECT " + VALUE_COLUMN
++                + " FROM cte_q";
++        assertEquivalent(baseResult, baseQuery, cteQuery);
++
++        String nonNullQuery = "SELECT " + VALUE_COLUMN + " FROM (" + baseQuery + ") AS nonnull_q WHERE "
++                + VALUE_COLUMN + " IS NOT NULL";
++        String inQuery = "SELECT " + VALUE_COLUMN + " FROM (" + baseQuery + ") AS outer_q WHERE " + VALUE_COLUMN
++                + " IN (SELECT " + VALUE_COLUMN + " FROM (" + baseQuery + ") AS inner_q)";
++        assertEquivalent(execute(nonNullQuery), nonNullQuery, inQuery);
++
++        String countQuery = "SELECT count(*) FROM (" + baseQuery + ") AS count_q";
++        String scalarQuery = "SELECT (SELECT count(*) FROM (" + baseQuery + ") AS scalar_source)";
++        assertEquivalent(execute(countQuery), countQuery, scalarQuery);
++    }
++
++    private String generateBaseQuery() {
++        PostgresTables targetTables = state.getSchema().getRandomTableNonEmptyTables();
++        List<PostgresTable> fromTables = new ArrayList<>(targetTables.getTables());
++        PostgresExpressionGenerator gen = new PostgresExpressionGenerator(state)
++                .setColumns(targetTables.getColumns());
++        List<PostgresJoin> joins = MockgresJoinGenerator.generate(state, fromTables);
++
++        PostgresSelect select = new PostgresSelect();
++        select.setFetchColumns(List.of(new PostgresAlias(gen.generateExpression(0), VALUE_COLUMN)));
++        List<PostgresExpression> fromList = fromTables.stream().map(table -> new PostgresFromTable(table, false))
++                .collect(Collectors.toList());
++        select.setFromList(fromList);
++        select.setJoinClauses(joins);
++        if (Randomly.getBoolean()) {
++            select.setWhereClause(gen.generateBooleanExpression());
++        }
++        return PostgresVisitor.asString(select);
++    }
++
++    private List<String> execute(String query) throws SQLException {
++        return ComparatorHelper.getResultSetFirstColumnAsString(query, errors, state);
++    }
++
++    private void assertEquivalent(List<String> expected, String expectedQuery, String actualQuery) throws SQLException {
++        List<String> actual = execute(actualQuery);
++        ComparatorHelper.assumeResultSetsAreEqual(expected, actual, expectedQuery, List.of(actualQuery), state);
++    }
++}
 diff --git a/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java b/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java
 index 55b5d2d..71b7e16 100644
 --- a/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java

@@ -71,3 +71,41 @@ async fn boolean_predicate_projection_is_supported() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_list_projection_deduplicates_scan_columns() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "create table in_projection(
+                 needle bigint,
+                 candidate_a bigint,
+                 candidate_b bigint,
+                 candidate_c bigint,
+                 enabled boolean
+             );
+             insert into in_projection values
+                 (1, 1, 2, 3, true),
+                 (4, 1, 2, 3, true),
+                 (2, 2, 2, 2, false);",
+        )
+        .await
+        .expect("setup IN projection table");
+
+    let rows = ctx
+        .client
+        .query(
+            "select needle in (candidate_a, candidate_b, candidate_c) as present
+             from in_projection
+             where enabled",
+            &[],
+        )
+        .await
+        .expect("project an IN predicate with a hidden filter column");
+
+    let actual: Vec<bool> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(actual, vec![true, false]);
+
+    let _ = ctx.shutdown.send(());
+}

@@ -721,6 +721,8 @@ pub(crate) fn ensure_columns_present(
     needed: Vec<String>,
     project_prefix_len: &mut Option<usize>,
 ) {
+    let mut seen = HashSet::new();
+    cols.retain(|col| seen.insert(col.clone()));
     let start_len = cols.len();
     let mut added = false;
     for col in needed {

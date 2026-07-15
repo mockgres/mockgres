@@ -4,13 +4,15 @@ This harness runs a pinned SQLancer source revision against a fresh Mockgres
 process. It applies a small compatibility profile to SQLancer rather than
 pretending Mockgres implements PostgreSQL's complete system catalog.
 
-The profile enables three complementary SQLancer oracles while restricting
+The profile enables five complementary SQLancer oracles while restricting
 generated schemas and expressions to Mockgres's supported subset:
 
 - TLP-WHERE compares a query with its true, false, and null predicate partitions
 - TLP-HAVING applies the same partitioning to grouped and aggregate queries
 - NoREC compares an optimized query with a count produced by an unoptimized form
 - pivoted query synthesis (PQS) checks that a generated query returns its pivot row
+- the Mockgres subquery oracle checks equivalent derived-table, CTE, `IN`
+  subquery, and scalar-subquery forms
 
 - two to five columns per table using `BIGINT`, `BOOLEAN`, `TEXT`, and `DOUBLE
   PRECISION` (`PQS` retains the three exactly evaluable types)
@@ -40,7 +42,7 @@ scripts/sqlancer/run
 ```
 
 The default matrix runs 1,000 checks for each combination of `WHERE`, `NOREC`,
-`PQS`, and `HAVING` with seeds `1`, `17`, `42`, `73`, and `101`: 20,000
+`PQS`, `HAVING`, and `SUBQUERY` with seeds `1`, `17`, `42`, `73`, and `101`: 25,000
 deterministic checks in all. Expressions have depth four, tables receive up to
 16 inserts, and strings grow to 32 characters. Every case gets a fresh Mockgres
 process. Use environment variables to select or reproduce a subset:
@@ -51,7 +53,7 @@ SQLANCER_ORACLES=WHERE,PQS SQLANCER_SEEDS=7,11 scripts/sqlancer/run
 ```
 
 For continuous or pre-release exploration, the soak runner covers 50 new
-consecutive seeds and 500,000 checks by default:
+consecutive seeds and 625,000 checks by default:
 
 ```bash
 scripts/sqlancer/soak
