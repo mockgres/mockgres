@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::fe_code;
 
 fn compare_rows(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
     use std::cmp::Ordering;
@@ -22,7 +23,10 @@ fn compare_rows(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
 fn eval_numeric_add(a: Value, b: Value) -> PgWireResult<Value> {
     use Value::*;
     match (a, b) {
-        (Int64(x), Int64(y)) => Ok(Int64(x + y)),
+        (Int64(x), Int64(y)) => x
+            .checked_add(y)
+            .map(Int64)
+            .ok_or_else(|| fe_code("22003", "bigint out of range")),
         (Float64Bits(bx), Float64Bits(by)) => {
             Ok(Value::from_f64(f64::from_bits(bx) + f64::from_bits(by)))
         }

@@ -101,6 +101,11 @@ fn parse_bool_expr_internal(
         }
         NodeEnum::AConst(c) => match const_to_value(c)? {
             Value::Bool(b) => Ok(BoolExpr::Literal(b)),
+            Value::Null => Ok(BoolExpr::Comparison {
+                lhs: ScalarExpr::Literal(Value::Null),
+                op: CmpOp::Eq,
+                rhs: ScalarExpr::Literal(Value::Bool(true)),
+            }),
             _ => Err(fe("boolean literal expected")),
         },
         NodeEnum::ColumnRef(_)

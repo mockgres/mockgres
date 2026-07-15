@@ -88,3 +88,19 @@ async fn cast_applies_parameter_hints() {
 
     let _ = ctx.shutdown.send(());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicitly_casts_boolean_to_integer() {
+    let ctx = common::start().await;
+
+    let row = ctx
+        .client
+        .query_one("select true::integer, false::integer", &[])
+        .await
+        .expect("cast booleans to integers");
+
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 0);
+
+    let _ = ctx.shutdown.send(());
+}

@@ -134,6 +134,7 @@ fn convert_value_to_type(
             }
             Ok(Value::Int64(v))
         }
+        (DataType::Int4, Value::Bool(value)) if !assignment => Ok(Value::Int64(i64::from(value))),
         (DataType::Int4, Value::Text(s)) => {
             parse_integer_input(&s, i32::MIN as i128, i32::MAX as i128, "integer").map(Value::Int64)
         }

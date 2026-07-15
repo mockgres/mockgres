@@ -6,17 +6,21 @@ usage() {
 usage: scripts/sqlancer/run
 
 Builds a pinned SQLancer checkout with the Mockgres compatibility profile,
-starts a fresh Mockgres server, and runs a deterministic TLP-WHERE campaign.
+starts fresh Mockgres servers, and runs a deterministic oracle matrix.
 
 Environment:
   MOCKGRES_BIN             Server binary (default: target/debug/mockgres)
   MOCKGRES_JAVA            Java executable (default: JAVA_HOME or Maven runtime)
-  SQLANCER_QUERIES         Oracle checks to run (default: 100)
-  SQLANCER_SEED            Deterministic random seed (default: 1)
-  SQLANCER_TIMEOUT_SECONDS Safety timeout for the campaign (default: 60)
-  SQLANCER_MAX_INSERTS     Maximum setup inserts per table (default: 8)
-  SQLANCER_MAX_DEPTH       Maximum expression depth (default: 2)
-  PGPORT                   Server port (default: an ephemeral port)
+  SQLANCER_QUERIES         Checks per oracle/seed case (default: 1000)
+  SQLANCER_ORACLES         Oracles (default: WHERE,NOREC,PQS,HAVING)
+  SQLANCER_SEEDS           Seeds (default: 1,17,42,73,101)
+  SQLANCER_ORACLE          Single-oracle shorthand for SQLANCER_ORACLES
+  SQLANCER_SEED            Single-seed shorthand for SQLANCER_SEEDS
+  SQLANCER_TIMEOUT_SECONDS Safety timeout per case (default: 60)
+  SQLANCER_MAX_INSERTS     Maximum setup inserts per table (default: 16)
+  SQLANCER_MAX_DEPTH       Maximum expression depth (default: 4)
+  SQLANCER_STRING_LENGTH   Maximum string constant length (default: 32)
+  PGPORT                   Reused server port (default: ephemeral per case)
   OUTDIR                   Artifact directory (default: target/sqlancer/runs/...)
 EOF
 }
@@ -109,10 +113,72 @@ else
   mockgres_bin="${repo_root}/target/debug/mockgres"
 fi
 
-if [ -n "${PGPORT:-}" ]; then
-  port="$PGPORT"
+run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+outdir="${OUTDIR:-${repo_root}/target/sqlancer/runs/${run_id}}"
+mkdir -p "$outdir"
+
+server_pid=""
+stop_server() {
+  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  server_pid=""
+}
+trap stop_server EXIT INT TERM
+
+queries="${SQLANCER_QUERIES:-1000}"
+oracle_spec="${SQLANCER_ORACLES:-${SQLANCER_ORACLE:-WHERE NOREC PQS HAVING}}"
+seed_spec="${SQLANCER_SEEDS:-${SQLANCER_SEED:-1 17 42 73 101}}"
+timeout_seconds="${SQLANCER_TIMEOUT_SECONDS:-60}"
+max_inserts="${SQLANCER_MAX_INSERTS:-16}"
+max_depth="${SQLANCER_MAX_DEPTH:-4}"
+string_length="${SQLANCER_STRING_LENGTH:-32}"
+
+case "$queries" in
+  ''|*[!0-9]*)
+    echo "SQLANCER_QUERIES must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+if [ "$queries" -eq 0 ]; then
+  echo "SQLANCER_QUERIES must be a positive integer" >&2
+  exit 2
+fi
+
+read -r -a oracles <<<"${oracle_spec//,/ }"
+read -r -a seeds <<<"${seed_spec//,/ }"
+if [ "${#oracles[@]}" -eq 0 ] || [ "${#seeds[@]}" -eq 0 ]; then
+  echo "SQLANCER_ORACLES and SQLANCER_SEEDS cannot be empty" >&2
+  exit 2
+fi
+for index in "${!oracles[@]}"; do
+  oracles[$index]="${oracles[$index]^^}"
+  case "${oracles[$index]}" in
+    WHERE|NOREC|PQS|HAVING) ;;
+    *)
+      echo "unsupported Mockgres SQLancer oracle: ${oracles[$index]}" >&2
+      echo "supported oracles: WHERE, NOREC, PQS, HAVING" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if command -v timeout >/dev/null 2>&1; then
+  java_command=("$(command -v timeout)" "$timeout_seconds" "$java_bin")
+elif command -v gtimeout >/dev/null 2>&1; then
+  java_command=("$(command -v gtimeout)" "$timeout_seconds" "$java_bin")
 else
-  port="$(python3 - <<'PY'
+  java_command=("$java_bin")
+  echo "warning: timeout utility not found; campaign timeout is disabled" >&2
+fi
+
+allocate_port() {
+  if [ -n "${PGPORT:-}" ]; then
+    printf '%s\n' "$PGPORT"
+    return
+  fi
+  python3 - <<'PY'
 import socket
 
 sock = socket.socket()
@@ -120,28 +186,10 @@ sock.bind(("127.0.0.1", 0))
 print(sock.getsockname()[1])
 sock.close()
 PY
-)"
-fi
-
-run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
-outdir="${OUTDIR:-${repo_root}/target/sqlancer/runs/${run_id}}"
-server_log="${outdir}/mockgres.log"
-sqlancer_log="${outdir}/sqlancer.log"
-mkdir -p "$outdir"
-
-server_pid=""
-cleanup() {
-  if [ -n "$server_pid" ] && kill -0 "$server_pid" 2>/dev/null; then
-    kill "$server_pid" 2>/dev/null || true
-    wait "$server_pid" 2>/dev/null || true
-  fi
 }
-trap cleanup EXIT INT TERM
 
-"$mockgres_bin" --host 127.0.0.1 --port "$port" --database test >"$server_log" 2>&1 &
-server_pid=$!
-
-python3 - "$port" <<'PY'
+wait_for_server() {
+  python3 - "$1" <<'PY'
 import socket
 import sys
 import time
@@ -157,61 +205,82 @@ while time.monotonic() < deadline:
 else:
     raise SystemExit("Mockgres did not start within 10 seconds")
 PY
+}
 
-queries="${SQLANCER_QUERIES:-100}"
-seed="${SQLANCER_SEED:-1}"
-timeout_seconds="${SQLANCER_TIMEOUT_SECONDS:-60}"
-max_inserts="${SQLANCER_MAX_INSERTS:-8}"
-max_depth="${SQLANCER_MAX_DEPTH:-2}"
+summary="${outdir}/summary.tsv"
+printf 'oracle\tseed\tqueries\tstatus\n' >"$summary"
 
-if command -v timeout >/dev/null 2>&1; then
-  java_command=("$(command -v timeout)" "$timeout_seconds" "$java_bin")
-elif command -v gtimeout >/dev/null 2>&1; then
-  java_command=("$(command -v gtimeout)" "$timeout_seconds" "$java_bin")
-else
-  java_command=("$java_bin")
-  echo "warning: timeout utility not found; campaign timeout is disabled" >&2
-fi
+run_case() {
+  local oracle="$1"
+  local seed="$2"
+  local case_name case_out port server_log sqlancer_log status
 
-rm -rf "${source_dir}/logs"
-set +e
-(
-  cd "$source_dir"
-  "${java_command[@]}" -jar "$sqlancer_jar" \
-    --num-threads 1 \
-    --num-queries "$queries" \
-    --num-tries 1 \
-    --max-generated-databases 1 \
-    --random-seed "$seed" \
-    --max-num-inserts "$max_inserts" \
-    --max-expression-depth "$max_depth" \
-    --database-prefix mockgres_sqlancer \
-    --username postgres \
-    --password mockgres \
-    --host 127.0.0.1 \
-    --port "$port" \
-    --print-progress-information=false \
-    --print-progress-summary=true \
-    --exit-code-error=1 \
-    postgres \
-    --connection-url="postgresql://127.0.0.1:${port}/test" \
-    --oracle WHERE \
-    --test-collations=false \
-    --test-tablespaces=false \
-    --mockgres=true
-) >"$sqlancer_log" 2>&1
-status=$?
-set -e
+  case_name="${oracle,,}-seed-${seed}"
+  case_out="${outdir}/${case_name}"
+  port="$(allocate_port)"
+  server_log="${case_out}/mockgres.log"
+  sqlancer_log="${case_out}/sqlancer.log"
+  mkdir -p "$case_out"
 
-if [ -d "${source_dir}/logs" ]; then
-  cp -R "${source_dir}/logs" "${outdir}/reproducers"
-fi
+  "$mockgres_bin" --host 127.0.0.1 --port "$port" --database test >"$server_log" 2>&1 &
+  server_pid=$!
+  wait_for_server "$port"
 
-if [ "$status" -ne 0 ]; then
-  echo "SQLancer found a failure (seed $seed); artifacts: $outdir" >&2
-  tail -n 80 "$sqlancer_log" >&2
-  exit "$status"
-fi
+  rm -rf "${source_dir}/logs/postgres"
+  set +e
+  (
+    cd "$source_dir"
+    "${java_command[@]}" -jar "$sqlancer_jar" \
+      --num-threads 1 \
+      --num-queries "$queries" \
+      --num-tries 1 \
+      --max-generated-databases 1 \
+      --random-seed "$seed" \
+      --max-num-inserts "$max_inserts" \
+      --max-expression-depth "$max_depth" \
+      --string-constant-max-length "$string_length" \
+      --database-prefix mockgres_sqlancer \
+      --username postgres \
+      --password mockgres \
+      --host 127.0.0.1 \
+      --port "$port" \
+      --print-progress-information=false \
+      --print-progress-summary=true \
+      --exit-code-error=1 \
+      postgres \
+      --connection-url="postgresql://127.0.0.1:${port}/test" \
+      --oracle "$oracle" \
+      --test-collations=false \
+      --test-tablespaces=false \
+      --mockgres=true
+  ) >"$sqlancer_log" 2>&1
+  status=$?
+  set -e
 
-echo "SQLancer passed $queries TLP-WHERE checks (seed $seed)"
+  if [ -d "${source_dir}/logs/postgres" ]; then
+    mkdir -p "${case_out}/reproducers"
+    cp -R "${source_dir}/logs/postgres/." "${case_out}/reproducers/"
+  fi
+  stop_server
+
+  if [ "$status" -ne 0 ]; then
+    printf '%s\t%s\t%s\tfail\n' "$oracle" "$seed" "$queries" >>"$summary"
+    echo "SQLancer $oracle failed (seed $seed); artifacts: $case_out" >&2
+    tail -n 80 "$sqlancer_log" >&2
+    exit "$status"
+  fi
+
+  printf '%s\t%s\t%s\tpass\n' "$oracle" "$seed" "$queries" >>"$summary"
+  echo "SQLancer $oracle passed $queries checks (seed $seed)"
+}
+
+for oracle in "${oracles[@]}"; do
+  for seed in "${seeds[@]}"; do
+    run_case "$oracle" "$seed"
+  done
+done
+
+campaign_count=$((${#oracles[@]} * ${#seeds[@]}))
+total_checks=$((campaign_count * queries))
+echo "SQLancer passed $total_checks checks across $campaign_count cases"
 echo "artifacts: $outdir"

@@ -60,17 +60,17 @@ under `target/postgres-regress`. See `scripts/postgres-regress/README.md` for
 details. The upstream suite uses a fresh shared database and does not invoke
 `mockgres_freeze()` or `mockgres_reset()`.
 
-SQLancer's TLP-WHERE oracle can exercise randomized query semantics through a
-pinned Mockgres compatibility profile:
+SQLancer can exercise randomized query semantics through a pinned Mockgres
+compatibility profile:
 
 ```bash
 scripts/sqlancer/run
 ```
 
-The default campaign is deterministic and writes logs and reproducers under
-`target/sqlancer/runs`. Increase `SQLANCER_QUERIES` or select a different
-`SQLANCER_SEED` for longer campaigns. See `scripts/sqlancer/README.md` for the
-profile scope and prerequisites.
+The default deterministic matrix runs TLP-WHERE, TLP-HAVING, NoREC, and pivoted
+query synthesis across five seeds for 20,000 checks, and writes per-case logs
+and reproducers under `target/sqlancer/runs`. See `scripts/sqlancer/README.md`
+for ways to select oracles and seeds, plus the profile scope and prerequisites.
 
 ## Features
 - Supported SQL surface (SELECT/INSERT/UPDATE/DELETE, joins, ON CONFLICT, etc.).

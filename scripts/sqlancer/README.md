@@ -4,13 +4,19 @@ This harness runs a pinned SQLancer source revision against a fresh Mockgres
 process. It applies a small compatibility profile to SQLancer rather than
 pretending Mockgres implements PostgreSQL's complete system catalog.
 
-The profile keeps SQLancer's TLP-WHERE oracle and result comparison, while
-restricting generated schemas and expressions to Mockgres's supported subset:
+The profile enables three complementary SQLancer oracles while restricting
+generated schemas and expressions to Mockgres's supported subset:
 
-- `BIGINT`, `BOOLEAN`, and `TEXT` columns
+- TLP-WHERE compares a query with its true, false, and null predicate partitions
+- TLP-HAVING applies the same partitioning to grouped and aggregate queries
+- NoREC compares an optimized query with a count produced by an unoptimized form
+- pivoted query synthesis (PQS) checks that a generated query returns its pivot row
+
+- two to five columns per table using `BIGINT`, `BOOLEAN`, `TEXT`, and `DOUBLE
+  PRECISION` (`PQS` retains the three exactly evaluable types)
 - deterministic single-row inserts
-- comparisons, boolean operations, null predicates, arithmetic, supported
-  scalar functions, and supported joins
+- comparisons, boolean operations, null predicates, arithmetic, nested scalar
+  functions, Cartesian products, and scope-correct `INNER`/`LEFT` joins
 - JDBC result metadata for schema discovery instead of PostgreSQL-only catalog
   queries
 
@@ -33,20 +39,37 @@ committed.
 scripts/sqlancer/run
 ```
 
-The default smoke campaign runs 100 deterministic oracle checks with seed `1`.
-Use environment variables to expand or reproduce it:
+The default matrix runs 1,000 checks for each combination of `WHERE`, `NOREC`,
+`PQS`, and `HAVING` with seeds `1`, `17`, `42`, `73`, and `101`: 20,000
+deterministic checks in all. Expressions have depth four, tables receive up to
+16 inserts, and strings grow to 32 characters. Every case gets a fresh Mockgres
+process. Use environment variables to select or reproduce a subset:
 
 ```bash
-SQLANCER_QUERIES=10000 SQLANCER_SEED=42 scripts/sqlancer/run
+SQLANCER_QUERIES=10000 SQLANCER_ORACLE=NOREC SQLANCER_SEED=42 scripts/sqlancer/run
+SQLANCER_ORACLES=WHERE,PQS SQLANCER_SEEDS=7,11 scripts/sqlancer/run
 ```
+
+For continuous or pre-release exploration, the soak runner covers 50 new
+consecutive seeds and 500,000 checks by default:
+
+```bash
+scripts/sqlancer/soak
+SQLANCER_SEED_START=2000 SQLANCER_SEED_COUNT=100 scripts/sqlancer/soak
+```
+
+The soak range is deterministic, so every failure remains reproducible. Change
+`SQLANCER_SEED_START` between runs to explore fresh space without weakening the
+repeatable default gate.
 
 Set `MOCKGRES_JAVA=/path/to/java` when Java is not available through
 `JAVA_HOME`, `PATH`, or Maven's runtime. Run `scripts/sqlancer/run --help` for
 all settings.
 
 The command exits nonzero on a SQLancer finding, setup failure, timeout, or
-server crash. Artifacts are written under `target/sqlancer/runs` and include
-the Mockgres server log, SQLancer output, and any SQLancer reproducer logs.
+server crash. Artifacts are written under `target/sqlancer/runs`; each case has
+the Mockgres server log, SQLancer output, and any reproducer logs, while
+`summary.tsv` records the matrix results.
 
 ## Updating SQLancer
 

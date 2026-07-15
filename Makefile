@@ -3,10 +3,13 @@ SHELL := /bin/bash
 VERSION_FILE := mockgres/Cargo.toml
 LOCK_FILE := Cargo.lock
 
-.PHONY: publish sqlancer
+.PHONY: publish sqlancer sqlancer-soak
 
 sqlancer:
 	scripts/sqlancer/run
+
+sqlancer-soak:
+	scripts/sqlancer/soak
 
 publish:
 	@set -euo pipefail; \

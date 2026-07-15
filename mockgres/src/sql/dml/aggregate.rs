@@ -381,6 +381,12 @@ pub(super) fn parse_group_clause(
             expr_ref
         };
         let expr = parse_scalar_expr(expr_ref)?;
+        if out
+            .iter()
+            .any(|(group, _)| group_expression_matches(group, &expr))
+        {
+            continue;
+        }
         let alias = derive_expr_name(&expr);
         out.push((expr, alias));
     }
@@ -398,7 +404,13 @@ pub(super) fn find_group_expr_index(
 
 pub(super) fn group_expression_matches(left: &ScalarExpr, right: &ScalarExpr) -> bool {
     match (left, right) {
-        (ScalarExpr::Column(left), ScalarExpr::Column(right)) => left.column == right.column,
+        (ScalarExpr::Column(left), ScalarExpr::Column(right)) => {
+            left.column == right.column
+                && (left.relation.is_none()
+                    || right.relation.is_none()
+                    || left.relation == right.relation)
+                && (left.schema.is_none() || right.schema.is_none() || left.schema == right.schema)
+        }
         (
             ScalarExpr::BinaryOp {
                 op: left_op,
@@ -479,6 +491,67 @@ pub(super) fn copy_column_locations(target: &mut ScalarExpr, source: &ScalarExpr
             }
         }
         _ => {}
+    }
+}
+
+pub(super) fn rewrite_bool_expr_for_groups(expr: &mut BoolExpr, groups: &[(ScalarExpr, String)]) {
+    match expr {
+        BoolExpr::Comparison { lhs, rhs, .. } => {
+            rewrite_scalar_expr_for_groups(lhs, groups);
+            rewrite_scalar_expr_for_groups(rhs, groups);
+        }
+        BoolExpr::And(parts) | BoolExpr::Or(parts) => {
+            for part in parts {
+                rewrite_bool_expr_for_groups(part, groups);
+            }
+        }
+        BoolExpr::Not(expr) => rewrite_bool_expr_for_groups(expr, groups),
+        BoolExpr::IsNull { expr, .. }
+        | BoolExpr::InSubquery { expr, .. }
+        | BoolExpr::InListValues { expr, .. } => rewrite_scalar_expr_for_groups(expr, groups),
+        BoolExpr::Literal(_) => {}
+    }
+}
+
+fn rewrite_scalar_expr_for_groups(expr: &mut ScalarExpr, groups: &[(ScalarExpr, String)]) {
+    if let Some(index) = find_group_expr_index(expr, groups) {
+        *expr = ScalarExpr::ColumnIdx(index);
+        return;
+    }
+
+    match expr {
+        ScalarExpr::BinaryOp { left, right, .. } => {
+            rewrite_scalar_expr_for_groups(left, groups);
+            rewrite_scalar_expr_for_groups(right, groups);
+        }
+        ScalarExpr::UnaryOp { expr, .. } | ScalarExpr::Cast { expr, .. } => {
+            rewrite_scalar_expr_for_groups(expr, groups);
+        }
+        ScalarExpr::Func { args, .. } => {
+            for argument in args {
+                rewrite_scalar_expr_for_groups(argument, groups);
+            }
+        }
+        ScalarExpr::Predicate(predicate) => rewrite_bool_expr_for_groups(predicate, groups),
+        ScalarExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (condition, result) in when_then {
+                rewrite_bool_expr_for_groups(condition, groups);
+                rewrite_scalar_expr_for_groups(result, groups);
+            }
+            if let Some(expr) = else_expr {
+                rewrite_scalar_expr_for_groups(expr, groups);
+            }
+        }
+        ScalarExpr::Column(_)
+        | ScalarExpr::ColumnIdx(_)
+        | ScalarExpr::ExcludedIdx(_)
+        | ScalarExpr::Literal(_)
+        | ScalarExpr::Param { .. }
+        | ScalarExpr::Subquery(_)
+        | ScalarExpr::WindowRowNumber(_) => {}
     }
 }
 

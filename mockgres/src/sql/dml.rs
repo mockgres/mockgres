@@ -301,6 +301,9 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
         if items.is_empty() {
             return Err(fe("SELECT list is empty"));
         }
+        if let Some(expr) = &mut having_expr {
+            rewrite_bool_expr_for_groups(expr, &group_clause_exprs);
+        }
 
         let allowed_order_names = group_clause_exprs
             .iter()
@@ -415,15 +418,8 @@ pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
             .map(|item| {
                 let expr = group_clause_exprs
                     .iter()
-                    .find(|(group_expr, _)| group_expression_matches(group_expr, &item.expr))
-                    .map(|(_, alias)| {
-                        ScalarExpr::Column(crate::engine::ColumnRefName {
-                            schema: None,
-                            relation: None,
-                            column: alias.clone(),
-                            location: None,
-                        })
-                    })
+                    .position(|(group_expr, _)| group_expression_matches(group_expr, &item.expr))
+                    .map(ScalarExpr::ColumnIdx)
                     .unwrap_or_else(|| item.expr.clone());
                 (expr, item.alias.clone())
             })

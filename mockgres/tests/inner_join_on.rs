@@ -1,6 +1,37 @@
 mod common;
 
 #[tokio::test(flavor = "multi_thread")]
+async fn bare_null_is_an_unknown_join_predicate() {
+    let ctx = common::start().await;
+
+    ctx.client
+        .batch_execute(
+            "create table null_left(id int);
+             create table null_right(id int);
+             insert into null_left values (1);
+             insert into null_right values (1);",
+        )
+        .await
+        .expect("create null join fixture");
+
+    let rows = ctx
+        .client
+        .query(
+            "select null_left.id, null_right.id
+             from null_left left join null_right on null",
+            &[],
+        )
+        .await
+        .expect("join with an unknown predicate");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, Option<i32>>(1), None);
+
+    let _ = ctx.shutdown.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn inner_join_on_selects_matching_pairs() {
     let ctx = common::start().await;
     seed_authors_and_books(&ctx).await;

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/sqlancer/soak
+
+Runs the SQLancer matrix over a deterministic range of seeds. All environment
+settings accepted by scripts/sqlancer/run are forwarded.
+
+Environment:
+  SQLANCER_SEED_START  First seed (default: 1000)
+  SQLANCER_SEED_COUNT  Number of consecutive seeds (default: 50)
+  SQLANCER_QUERIES     Checks per oracle/seed case (default: 2500)
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  "") ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+seed_start="${SQLANCER_SEED_START:-1000}"
+seed_count="${SQLANCER_SEED_COUNT:-50}"
+queries="${SQLANCER_QUERIES:-2500}"
+
+for value in "$seed_start" "$seed_count" "$queries"; do
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "seed start, seed count, and query count must be positive integers" >&2
+      exit 2
+      ;;
+  esac
+done
+if [ "$seed_count" -eq 0 ] || [ "$queries" -eq 0 ]; then
+  echo "seed count and query count must be positive integers" >&2
+  exit 2
+fi
+
+seeds=""
+for ((offset = 0; offset < seed_count; offset++)); do
+  seed=$((seed_start + offset))
+  if [ -n "$seeds" ]; then
+    seeds+=","
+  fi
+  seeds+="$seed"
+done
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export SQLANCER_SEEDS="$seeds"
+export SQLANCER_QUERIES="$queries"
+exec "${script_dir}/run"
