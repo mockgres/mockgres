@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(CDPATH= cd -- "${script_dir}/../.." && pwd)"
 image="${MOCKGRES_POSTGRES_IMAGE:-postgres:18.4}"
+mkdir -p "${repo_root}/target"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "docker is required to run containerized PostgreSQL psql" >&2
@@ -12,8 +13,10 @@ fi
 
 docker_args=(
   run --rm -i
+  --user "$(id -u):$(id -g)"
   --network host
   --volume "${repo_root}:${repo_root}:ro"
+  --volume "${repo_root}/target:${repo_root}/target"
   --workdir "$repo_root"
 )
 

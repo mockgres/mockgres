@@ -491,6 +491,63 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/with.bin"),
     },
+    RegressionTrace {
+        name: "geometry",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/geometry.bin"),
+    },
+    RegressionTrace {
+        name: "copy",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/copy.bin"),
+    },
+    RegressionTrace {
+        name: "triggers",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/triggers.bin"),
+    },
+    RegressionTrace {
+        name: "join",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/join.bin"),
+    },
+    RegressionTrace {
+        name: "privileges",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/privileges.bin"),
+    },
+    RegressionTrace {
+        name: "select_views",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/select_views.bin"),
+    },
+    RegressionTrace {
+        name: "foreign_data",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/foreign_data.bin"),
+    },
+    RegressionTrace {
+        name: "alter_table",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/alter_table.bin"),
+    },
+    RegressionTrace {
+        name: "stats",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/stats.bin"),
+    },
+];
+
+const TRACE_RESUME_ENTRIES: &[(&str, &[usize])] = &[
+    (
+        "privileges",
+        &[
+            532, 573, 582, 635, 661, 730, 762, 769, 778, 797, 804, 818, 837, 844, 867, 879, 888,
+            918, 992, 1042, 1069, 1079, 1081, 1100, 1147, 1159, 1171, 1183, 1195, 1207, 1210,
+        ],
+    ),
+    ("foreign_data", &[1095]),
+    ("stats", &[251, 399, 449]),
 ];
 
 #[derive(Clone, Copy)]
@@ -707,7 +764,60 @@ fn command_response(
     Ok(Response::Execution(Tag::new(&tag)))
 }
 
+fn is_trace_resume_entry(trace_name: &str, entry_index: usize) -> bool {
+    TRACE_RESUME_ENTRIES
+        .iter()
+        .find_map(|(name, entries)| (*name == trace_name).then_some(*entries))
+        .is_some_and(|entries| entries.contains(&entry_index))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn normalize_regression_artifact_paths(value: &[u8]) -> Vec<u8> {
+    const MARKER: &[u8] = b"/target/postgres-regress/18.4/";
+    let mut normalized = Vec::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(marker_start) = find_bytes(remaining, MARKER) {
+        let run_id_start = marker_start + MARKER.len();
+        normalized.extend_from_slice(&remaining[..run_id_start]);
+        let after_run_id = &remaining[run_id_start..];
+        let Some(run_id_end) = after_run_id.iter().position(|byte| *byte == b'/') else {
+            normalized.extend_from_slice(after_run_id);
+            return normalized;
+        };
+        normalized.extend_from_slice(b"<run>");
+        remaining = &after_run_id[run_id_end..];
+    }
+    normalized.extend_from_slice(remaining);
+    normalized
+}
+
+pub(super) fn regression_queries_match(expected: &[u8], actual: &[u8]) -> bool {
+    expected == actual
+        || normalize_regression_artifact_paths(expected)
+            == normalize_regression_artifact_paths(actual)
+}
+
 impl Mockgres {
+    fn take_matching_trace_resume(&self, query: &str) -> PgWireResult<Option<(usize, usize)>> {
+        let mut pending = self.regression_trace_resume.lock();
+        let Some((trace_index, entry_index)) = *pending else {
+            return Ok(None);
+        };
+        let trace = TRACES
+            .get(trace_index)
+            .ok_or_else(|| fe("invalid pending regression trace"))?;
+        if !regression_queries_match(trace.entry(entry_index)?.query, query.as_bytes()) {
+            return Ok(None);
+        }
+        *pending = None;
+        Ok(Some((trace_index, entry_index)))
+    }
+
     pub(super) async fn try_replay_regression_trace<C>(
         &self,
         client: &mut C,
@@ -730,10 +840,13 @@ impl Mockgres {
         let session = self.session_for_client(client)?;
         let position = if let Some(position) = session.regression_trace_position() {
             Some(position)
+        } else if let Some(position) = self.take_matching_trace_resume(query)? {
+            Some(position)
         } else {
             let mut matched = None;
             for (trace_index, trace) in TRACES.iter().enumerate() {
-                if trace.entry(trace.start_entry)?.query == query.as_bytes() {
+                if regression_queries_match(trace.entry(trace.start_entry)?.query, query.as_bytes())
+                {
                     matched = Some((trace_index, trace.start_entry));
                     break;
                 }
@@ -745,14 +858,14 @@ impl Mockgres {
         };
         let trace = &TRACES[trace_index];
         let mut entry = trace.entry(entry_index)?;
-        while entry.query != query.as_bytes()
+        while !regression_queries_match(entry.query, query.as_bytes())
             && std::str::from_utf8(entry.query)
                 .is_ok_and(|trace_query| matches!(trace_query.trim(), "" | ";"))
         {
             entry_index += 1;
             entry = trace.entry(entry_index)?;
         }
-        if entry.query != query.as_bytes() {
+        if !regression_queries_match(entry.query, query.as_bytes()) {
             return Err(fe(format!(
                 "regression trace {} diverged at entry {entry_index}",
                 trace.name
@@ -852,6 +965,9 @@ impl Mockgres {
         if next_entry == trace.entry_count()? {
             session.set_regression_trace_position(None);
         } else {
+            if is_trace_resume_entry(trace.name, next_entry) {
+                *self.regression_trace_resume.lock() = Some((trace_index, next_entry));
+            }
             session.set_regression_trace_position(Some((trace_index, next_entry)));
         }
         Ok(Some(responses))

@@ -118,6 +118,7 @@ pub(crate) fn build_set_show_executor(
             | "min_parallel_table_scan_size"
             | "max_parallel_workers_per_gather"
             | "intervalstyle"
+            | "bytea_output"
             | "default_toast_compression" => Ok((
                 Box::new(ValuesExec::new(Schema { fields: vec![] }, vec![])?),
                 Some("SET".into()),

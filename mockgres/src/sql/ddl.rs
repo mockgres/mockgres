@@ -691,6 +691,7 @@ pub(super) fn plan_set(set: VariableSetStmt) -> PgWireResult<Plan> {
             | "min_parallel_table_scan_size"
             | "max_parallel_workers_per_gather"
             | "intervalstyle"
+            | "bytea_output"
             | "default_toast_compression"
     );
     if !supported {
