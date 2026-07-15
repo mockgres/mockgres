@@ -431,6 +431,66 @@ const TRACES: &[RegressionTrace] = &[
         start_entry: 0,
         bytes: include_bytes!("regression_traces/incremental_sort.bin"),
     },
+    RegressionTrace {
+        name: "portals",
+        start_entry: 1,
+        bytes: include_bytes!("regression_traces/portals.bin"),
+    },
+    RegressionTrace {
+        name: "select_parallel",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/select_parallel.bin"),
+    },
+    RegressionTrace {
+        name: "limit",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/limit.bin"),
+    },
+    RegressionTrace {
+        name: "rowtypes",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/rowtypes.bin"),
+    },
+    RegressionTrace {
+        name: "opr_sanity",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/opr_sanity.bin"),
+    },
+    RegressionTrace {
+        name: "create_view",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/create_view.bin"),
+    },
+    RegressionTrace {
+        name: "alter_generic",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/alter_generic.bin"),
+    },
+    RegressionTrace {
+        name: "misc_functions",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/misc_functions.bin"),
+    },
+    RegressionTrace {
+        name: "window",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/window.bin"),
+    },
+    RegressionTrace {
+        name: "copy2",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/copy2.bin"),
+    },
+    RegressionTrace {
+        name: "conversion",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/conversion.bin"),
+    },
+    RegressionTrace {
+        name: "with",
+        start_entry: 0,
+        bytes: include_bytes!("regression_traces/with.bin"),
+    },
 ];
 
 #[derive(Clone, Copy)]
