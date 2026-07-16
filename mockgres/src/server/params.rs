@@ -167,6 +167,10 @@ fn collect_param_hints_from_plan(plan: &Plan, out: &mut HashMap<usize, DataType>
             }
         }
         Plan::CountRows { input, .. } => collect_param_hints_from_plan(input, out),
+        Plan::SetOperation { left, right, .. } => {
+            collect_param_hints_from_plan(left, out);
+            collect_param_hints_from_plan(right, out);
+        }
         Plan::Join {
             left, right, on, ..
         }
@@ -458,6 +462,10 @@ fn collect_param_indexes(plan: &Plan, out: &mut BTreeSet<usize>) {
             }
         }
         Plan::CountRows { input, .. } => collect_param_indexes(input, out),
+        Plan::SetOperation { left, right, .. } => {
+            collect_param_indexes(left, out);
+            collect_param_indexes(right, out);
+        }
         Plan::Join {
             left, right, on, ..
         }

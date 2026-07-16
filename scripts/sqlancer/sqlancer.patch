@@ -101,10 +101,17 @@ index 7c00021..533c774 100644
          }
 
      },
-@@ -60,6 +64,13 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
+@@ -60,6 +64,20 @@ public enum PostgresOracleFactory implements OracleFactory<PostgresGlobalState>
              return new PostgresTLPHavingOracle(globalState);
          }
 
++    },
++    AGGREGATE {
++        @Override
++        public TestOracle<PostgresGlobalState> create(PostgresGlobalState globalState) throws SQLException {
++            return new PostgresTLPAggregateOracle(globalState);
++        }
++
 +    },
 +    SUBQUERY {
 +        @Override
@@ -782,6 +789,36 @@ index 0000000..8157aad
 +        ComparatorHelper.assumeResultSetsAreEqual(expected, actual, expectedQuery, List.of(actualQuery), state);
 +    }
 +}
+diff --git a/src/sqlancer/postgres/oracle/tlp/PostgresTLPAggregateOracle.java b/src/sqlancer/postgres/oracle/tlp/PostgresTLPAggregateOracle.java
+--- a/src/sqlancer/postgres/oracle/tlp/PostgresTLPAggregateOracle.java
++++ b/src/sqlancer/postgres/oracle/tlp/PostgresTLPAggregateOracle.java
+@@ -13,6 +13,7 @@ import sqlancer.common.query.SQLQueryAdapter;
+ import sqlancer.common.query.SQLancerResultSet;
+ import sqlancer.postgres.PostgresGlobalState;
++import sqlancer.postgres.PostgresProvider;
+ import sqlancer.postgres.PostgresSchema.PostgresDataType;
+ import sqlancer.postgres.PostgresVisitor;
+ import sqlancer.postgres.ast.PostgresAggregate;
+ import sqlancer.postgres.ast.PostgresAggregate.PostgresAggregateFunction;
+@@ -45,10 +46,14 @@ public class PostgresTLPAggregateOracle extends PostgresTLPBase implements TestO
+     }
+
+     protected void aggregateCheck() throws SQLException {
+-        PostgresAggregateFunction aggregateFunction = Randomly.fromOptions(PostgresAggregateFunction.MAX,
+-                PostgresAggregateFunction.MIN, PostgresAggregateFunction.SUM, PostgresAggregateFunction.BIT_AND,
+-                PostgresAggregateFunction.BIT_OR, PostgresAggregateFunction.BOOL_AND, PostgresAggregateFunction.BOOL_OR,
+-                PostgresAggregateFunction.COUNT);
++        PostgresAggregateFunction aggregateFunction = PostgresProvider.mockgresMode
++                ? Randomly.fromOptions(PostgresAggregateFunction.MAX, PostgresAggregateFunction.MIN,
++                        PostgresAggregateFunction.SUM, PostgresAggregateFunction.BOOL_AND,
++                        PostgresAggregateFunction.COUNT)
++                : Randomly.fromOptions(PostgresAggregateFunction.MAX, PostgresAggregateFunction.MIN,
++                        PostgresAggregateFunction.SUM, PostgresAggregateFunction.BIT_AND,
++                        PostgresAggregateFunction.BIT_OR, PostgresAggregateFunction.BOOL_AND,
++                        PostgresAggregateFunction.BOOL_OR, PostgresAggregateFunction.COUNT);
+         PostgresAggregate aggregate = gen.generateArgsForAggregate(aggregateFunction.getRandomReturnType(),
+                 aggregateFunction);
+         List<PostgresExpression> fetchColumns = new ArrayList<>();
 diff --git a/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java b/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java
 index 55b5d2d..71b7e16 100644
 --- a/src/sqlancer/postgres/oracle/tlp/PostgresTLPBase.java

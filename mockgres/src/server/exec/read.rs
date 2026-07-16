@@ -6,8 +6,8 @@ use pgwire::error::PgWireResult;
 use crate::db::{Db, LockOwner};
 use crate::engine::{
     CountExec, CountExpr, EvalContext, ExecNode, FilterExec, HashAggregateExec, JoinExec, JoinType,
-    LimitExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, Value, ValuesExec,
-    WindowRowNumberExec, coerce_value_to_type, eval_scalar_expr, fe,
+    LimitExec, OrderExec, Plan, ProjectExec, ScalarExpr, Schema, SeqScanExec, SetOpExec, Value,
+    ValuesExec, WindowRowNumberExec, coerce_value_to_type, eval_scalar_expr, fe,
 };
 use crate::server::errors::map_db_err;
 use crate::session::Session;
@@ -84,6 +84,39 @@ pub fn build_read_executor(
                 )),
                 None,
                 cnt,
+            ))
+        }
+        Plan::SetOperation {
+            left,
+            right,
+            op,
+            all,
+            schema,
+        } => {
+            let left = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                left,
+                params.clone(),
+                ctx,
+            )?
+            .0;
+            let right = build_executor(
+                db,
+                txn_manager,
+                session,
+                snapshot_xid,
+                right,
+                params.clone(),
+                ctx,
+            )?
+            .0;
+            Ok((
+                Box::new(SetOpExec::new(schema.clone(), left, right, *op, *all)),
+                None,
+                None,
             ))
         }
         Plan::WindowRowNumber {

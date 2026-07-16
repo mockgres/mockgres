@@ -23,17 +23,26 @@ mod aggregate;
 mod regression_catalog;
 mod regression_functions;
 mod select;
+mod set;
 
 use aggregate::*;
 use regression_catalog::*;
 use regression_functions::*;
 pub(super) use select::*;
+use set::*;
 type ProjectionItems = Vec<(ScalarExpr, String)>;
 type ParsedSelectList = (Selection, Option<ProjectionItems>);
 type AggregateSelectList = (Vec<AggregateSelectItem>, Vec<(AggCall, String)>);
 
 pub fn plan_select(mut sel: SelectStmt) -> PgWireResult<Plan> {
     let with_clause = sel.with_clause.take();
+    if !matches!(
+        pg_query::protobuf::SetOperation::try_from(sel.op),
+        Ok(pg_query::protobuf::SetOperation::SetopNone)
+    ) {
+        let plan = plan_set_operation(sel)?;
+        return super::cte::wrap_with_clause(with_clause, plan);
+    }
     if let Some(plan) = try_plan_hash_function_select(&sel) {
         return super::cte::wrap_with_clause(with_clause, plan);
     }

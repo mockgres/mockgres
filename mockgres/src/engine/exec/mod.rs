@@ -9,6 +9,7 @@ use super::{AggCall, AggFunc, BoolExpr, ScalarExpr, Schema, SortKey, Value, Wind
 mod aggregate;
 mod join;
 mod order;
+mod set;
 
 mod values;
 
@@ -16,6 +17,7 @@ pub use aggregate::HashAggregateExec;
 pub use join::JoinExec;
 pub use order::OrderExec;
 use order::{OrderKeySpec, compare_window_entries, resolve_order_keys};
+pub use set::SetOpExec;
 
 pub use values::ValuesExec;
 

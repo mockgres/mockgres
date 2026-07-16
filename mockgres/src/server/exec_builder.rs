@@ -61,6 +61,7 @@ pub fn command_tag(plan: &Plan) -> &'static str {
         | Plan::WindowRowNumber { .. }
         | Plan::Aggregate { .. }
         | Plan::CountRows { .. }
+        | Plan::SetOperation { .. }
         | Plan::Filter { .. }
         | Plan::Order { .. }
         | Plan::Limit { .. }
@@ -174,6 +175,7 @@ pub fn build_executor(
         | Plan::WindowRowNumber { .. }
         | Plan::Aggregate { .. }
         | Plan::CountRows { .. }
+        | Plan::SetOperation { .. }
         | Plan::SeqScan { .. }
         | Plan::CteScan { .. }
         | Plan::LockRows { .. }
@@ -471,6 +473,19 @@ fn rewrite_cte_refs(plan: &Plan, ctes: &HashMap<String, MaterializedCte>) -> PgW
         } => Ok(Plan::Alias {
             input: Box::new(rewrite_cte_refs(input, ctes)?),
             alias: alias.clone(),
+            schema: schema.clone(),
+        }),
+        Plan::SetOperation {
+            left,
+            right,
+            op,
+            all,
+            schema,
+        } => Ok(Plan::SetOperation {
+            left: Box::new(rewrite_cte_refs(left, ctes)?),
+            right: Box::new(rewrite_cte_refs(right, ctes)?),
+            op: *op,
+            all: *all,
             schema: schema.clone(),
         }),
         Plan::Filter {

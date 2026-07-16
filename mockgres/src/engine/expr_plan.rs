@@ -327,6 +327,13 @@ pub enum JoinType {
     Left,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
+}
+
 #[derive(Clone, Debug)]
 pub struct AliasSpec {
     pub alias: String,
@@ -433,6 +440,13 @@ pub enum Plan {
         input: Box<Plan>,
         limit: Option<CountExpr>,
         offset: CountExpr,
+    },
+    SetOperation {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        op: SetOpKind,
+        all: bool,
+        schema: Schema,
     },
     UnboundJoin {
         left: Box<Plan>,
@@ -714,6 +728,7 @@ impl Plan {
             | Plan::Projection { schema, .. }
             | Plan::WindowRowNumber { schema, .. }
             | Plan::CountRows { schema, .. }
+            | Plan::SetOperation { schema, .. }
             | Plan::Join { schema, .. } => schema,
             Plan::ShowVariable { schema, .. } => schema,
             Plan::CallBuiltin { schema, .. } => schema,

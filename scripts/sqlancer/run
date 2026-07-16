@@ -12,7 +12,7 @@ Environment:
   MOCKGRES_BIN             Server binary (default: target/debug/mockgres)
   MOCKGRES_JAVA            Java executable (default: JAVA_HOME or Maven runtime)
   SQLANCER_QUERIES         Checks per oracle/seed case (default: 1000)
-  SQLANCER_ORACLES         Oracles (default: WHERE,NOREC,PQS,HAVING,SUBQUERY)
+  SQLANCER_ORACLES         Oracles (default: WHERE,NOREC,PQS,HAVING,AGGREGATE,SUBQUERY)
   SQLANCER_SEEDS           Seeds (default: 1,17,42,73,101)
   SQLANCER_ORACLE          Single-oracle shorthand for SQLANCER_ORACLES
   SQLANCER_SEED            Single-seed shorthand for SQLANCER_SEEDS
@@ -128,7 +128,7 @@ stop_server() {
 trap stop_server EXIT INT TERM
 
 queries="${SQLANCER_QUERIES:-1000}"
-oracle_spec="${SQLANCER_ORACLES:-${SQLANCER_ORACLE:-WHERE NOREC PQS HAVING SUBQUERY}}"
+oracle_spec="${SQLANCER_ORACLES:-${SQLANCER_ORACLE:-WHERE NOREC PQS HAVING AGGREGATE SUBQUERY}}"
 seed_spec="${SQLANCER_SEEDS:-${SQLANCER_SEED:-1 17 42 73 101}}"
 timeout_seconds="${SQLANCER_TIMEOUT_SECONDS:-60}"
 max_inserts="${SQLANCER_MAX_INSERTS:-16}"
@@ -155,10 +155,10 @@ fi
 for index in "${!oracles[@]}"; do
   oracles[$index]="${oracles[$index]^^}"
   case "${oracles[$index]}" in
-    WHERE|NOREC|PQS|HAVING|SUBQUERY) ;;
+    WHERE|NOREC|PQS|HAVING|AGGREGATE|SUBQUERY|QUERY_PARTITIONING) ;;
     *)
       echo "unsupported Mockgres SQLancer oracle: ${oracles[$index]}" >&2
-      echo "supported oracles: WHERE, NOREC, PQS, HAVING, SUBQUERY" >&2
+      echo "supported oracles: WHERE, NOREC, PQS, HAVING, AGGREGATE, SUBQUERY, QUERY_PARTITIONING" >&2
       exit 2
       ;;
   esac

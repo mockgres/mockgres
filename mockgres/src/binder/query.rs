@@ -42,6 +42,55 @@ pub(super) fn bind_with_search_path(
                 schema,
             })
         }
+        Plan::SetOperation {
+            left,
+            right,
+            op,
+            all,
+            schema: _,
+        } => {
+            let left = bind_with_search_path(
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                cte_scope,
+                *left,
+            )?;
+            let right = bind_with_search_path(
+                db,
+                search_path,
+                current_database,
+                time_ctx,
+                cte_scope,
+                *right,
+            )?;
+            if left.schema().fields.len() != right.schema().fields.len() {
+                return Err(fe_code(
+                    "42601",
+                    "each set-operation query must have the same number of columns",
+                ));
+            }
+            let mut fields = Vec::with_capacity(left.schema().fields.len());
+            for (left_field, right_field) in left.schema().fields.iter().zip(&right.schema().fields)
+            {
+                if left_field.data_type != right_field.data_type {
+                    return Err(fe_code("42804", "set-operation column types do not match"));
+                }
+                fields.push(Field {
+                    name: left_field.name.clone(),
+                    data_type: left_field.data_type.clone(),
+                    origin: None,
+                });
+            }
+            Ok(Plan::SetOperation {
+                left: Box::new(left),
+                right: Box::new(right),
+                op,
+                all,
+                schema: Schema { fields },
+            })
+        }
         Plan::With { ctes, body } => {
             let mut scoped = cte_scope.clone();
             let mut pending = ctes;
