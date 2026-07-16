@@ -175,6 +175,7 @@ pub enum ScalarFunc {
     IndirectToastRow,
     Length,
     CharLength,
+    Position,
     Repeat,
     Decode,
     TestPglzCompress,

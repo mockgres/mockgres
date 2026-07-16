@@ -684,6 +684,7 @@ pub(crate) fn scalar_expr_type(expr: &ScalarExpr, schema: &Schema) -> Option<Dat
             ScalarFunc::PgSizeBytes => Some(DataType::Int8),
             ScalarFunc::Length => Some(DataType::Int4),
             ScalarFunc::CharLength => Some(DataType::Int4),
+            ScalarFunc::Position => Some(DataType::Int4),
             ScalarFunc::Decode | ScalarFunc::TestPglzCompress | ScalarFunc::TestPglzDecompress => {
                 Some(DataType::Bytea)
             }

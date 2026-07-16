@@ -253,6 +253,7 @@ pub(super) fn parse_function_call(
         "substring" => ScalarFunc::Substring,
         "length" => ScalarFunc::Length,
         "char_length" => ScalarFunc::CharLength,
+        "position" => ScalarFunc::Position,
         "repeat" => ScalarFunc::Repeat,
         "decode" => ScalarFunc::Decode,
         "test_pglz_compress" => ScalarFunc::TestPglzCompress,
@@ -315,6 +316,11 @@ pub(super) fn parse_function_call(
         ScalarFunc::Upper | ScalarFunc::Lower | ScalarFunc::Length | ScalarFunc::CharLength => {
             if args.len() != 1 {
                 return Err(fe("function expects exactly one argument"));
+            }
+        }
+        ScalarFunc::Position => {
+            if args.len() != 2 {
+                return Err(fe("position() requires two arguments"));
             }
         }
         ScalarFunc::Trunc | ScalarFunc::MacAddr8Set7Bit => {

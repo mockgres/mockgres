@@ -298,6 +298,33 @@ pub(super) fn eval_function(
             Some(Value::Null) | None => Ok(Value::Null),
             Some(other) => Err(fe(format!("length() unsupported for {:?}", other))),
         },
+        ScalarFunc::Position => match args.as_slice() {
+            [Value::Text(haystack), Value::Text(needle)] => {
+                let position = if needle.is_empty() {
+                    1
+                } else {
+                    haystack
+                        .find(needle)
+                        .map(|byte_index| haystack[..byte_index].chars().count() as i64 + 1)
+                        .unwrap_or(0)
+                };
+                Ok(Value::Int64(position))
+            }
+            [Value::Bytes(haystack), Value::Bytes(needle)] => {
+                let position = if needle.is_empty() {
+                    1
+                } else {
+                    haystack
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                        .map(|index| index as i64 + 1)
+                        .unwrap_or(0)
+                };
+                Ok(Value::Int64(position))
+            }
+            [Value::Null, _] | [_, Value::Null] => Ok(Value::Null),
+            _ => Err(fe("position() requires matching text or bytea arguments")),
+        },
         ScalarFunc::CurrentSchema | ScalarFunc::CurrentSchemas | ScalarFunc::CurrentDatabase => {
             Err(fe("context-dependent function evaluated without binding"))
         }

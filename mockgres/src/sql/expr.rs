@@ -202,6 +202,7 @@ pub fn derive_expr_name(expr: &ScalarExpr) -> String {
             ScalarFunc::IndirectToastRow => "indirect_toast_row",
             ScalarFunc::Length => "length",
             ScalarFunc::CharLength => "char_length",
+            ScalarFunc::Position => "position",
             ScalarFunc::Repeat => "repeat",
             ScalarFunc::Decode => "decode",
             ScalarFunc::TestPglzCompress => "test_pglz_compress",
